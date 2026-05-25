@@ -896,6 +896,30 @@ export interface DailyReviewSectionSummary {
     holdings?: Array<Record<string, unknown>>
 }
 
+export interface DailyReviewStockDiagnostic {
+    symbol: string
+    name: string
+    latest_price?: number | null
+    change_pct?: number | null
+    daily_macd?: Record<string, unknown> | null
+    minute_macd_60m?: Record<string, unknown> | null
+    bollinger?: Record<string, unknown> | null
+    volume_price?: {
+        volume_ratio?: number | null
+        amount_ratio?: number | null
+        change_pct?: number | null
+        tags?: string[]
+        [key: string]: unknown
+    } | null
+    t0_plan?: {
+        pressure_zone?: Record<string, unknown> | null
+        support_zone?: Record<string, unknown> | null
+        opening_watchpoint?: string | null
+        [key: string]: unknown
+    } | null
+    data_quality?: Record<string, unknown> | null
+}
+
 export interface DailyReview {
     id: string
     user_id: string
@@ -908,6 +932,8 @@ export interface DailyReview {
     next_main_themes: DailyReviewTheme[]
     next_candidate_stocks: DailyReviewStock[]
     risk_watchpoints: DailyReviewRisk[]
+    narrative_markdown?: string | null
+    portfolio_technical_diagnostics?: DailyReviewStockDiagnostic[]
     raw_result_data?: Record<string, unknown>
     push_status?: string | null
     push_error?: string | null

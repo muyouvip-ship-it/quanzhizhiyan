@@ -833,6 +833,8 @@ def _ensure_daily_review_schema() -> None:
                     next_main_themes JSON,
                     next_candidate_stocks JSON,
                     risk_watchpoints JSON,
+                    narrative_markdown TEXT,
+                    portfolio_technical_diagnostics JSON,
                     raw_result_data JSON,
                     push_status VARCHAR(20),
                     push_error TEXT,
@@ -868,6 +870,8 @@ def _ensure_daily_review_schema() -> None:
                     ("next_main_themes", "ALTER TABLE daily_reviews ADD COLUMN next_main_themes JSON"),
                     ("next_candidate_stocks", "ALTER TABLE daily_reviews ADD COLUMN next_candidate_stocks JSON"),
                     ("risk_watchpoints", "ALTER TABLE daily_reviews ADD COLUMN risk_watchpoints JSON"),
+                    ("narrative_markdown", "ALTER TABLE daily_reviews ADD COLUMN narrative_markdown TEXT"),
+                    ("portfolio_technical_diagnostics", "ALTER TABLE daily_reviews ADD COLUMN portfolio_technical_diagnostics JSON"),
                     ("raw_result_data", "ALTER TABLE daily_reviews ADD COLUMN raw_result_data JSON"),
                     ("push_status", "ALTER TABLE daily_reviews ADD COLUMN push_status VARCHAR(20)"),
                     ("push_error", "ALTER TABLE daily_reviews ADD COLUMN push_error TEXT"),
@@ -1337,6 +1341,8 @@ class DailyReviewDB(Base):
     next_main_themes = Column(JSON, nullable=True)
     next_candidate_stocks = Column(JSON, nullable=True)
     risk_watchpoints = Column(JSON, nullable=True)
+    narrative_markdown = Column(Text, nullable=True)
+    portfolio_technical_diagnostics = Column(JSON, nullable=True)
     raw_result_data = Column(JSON, nullable=True)
     push_status = Column(String(20), nullable=True)
     push_error = Column(Text, nullable=True)

@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { AlertTriangle, CalendarDays, Clock3, History, Loader2, RefreshCcw, Send, Sparkles } from 'lucide-react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react'
+import { Activity, AlertTriangle, CalendarDays, Clock3, History, Loader2, RefreshCcw, Send, Sparkles } from 'lucide-react'
 import { api } from '@/services/api'
-import type { DailyReview, DailyReviewConfig, DailyReviewHistoryItem, DailyReviewRisk, DailyReviewStock, DailyReviewTheme } from '@/types'
+import type { DailyReview, DailyReviewConfig, DailyReviewHistoryItem, DailyReviewRisk, DailyReviewStock, DailyReviewStockDiagnostic, DailyReviewTheme } from '@/types'
+
+const MarkdownBlock = lazy(() => import('@/components/MarkdownBlock'))
 
 type LoadState = 'idle' | 'loading' | 'error'
 
@@ -10,6 +12,27 @@ function formatTime(value?: string | null) {
     const date = new Date(value)
     if (Number.isNaN(date.getTime())) return value
     return date.toLocaleString('zh-CN', { hour12: false })
+}
+
+function formatNumber(value: unknown, digits = 2) {
+    const number = Number(value)
+    if (!Number.isFinite(number)) return '--'
+    return number.toFixed(digits)
+}
+
+function formatPercent(value: unknown) {
+    const number = Number(value)
+    if (!Number.isFinite(number)) return '--'
+    return `${number > 0 ? '+' : ''}${number.toFixed(2)}%`
+}
+
+function zoneLabel(zone: Record<string, unknown> | null | undefined) {
+    const label = typeof zone?.label === 'string' ? zone.label : ''
+    if (label) return label
+    const lower = Number(zone?.lower)
+    const upper = Number(zone?.upper)
+    if (Number.isFinite(lower) && Number.isFinite(upper)) return `${lower.toFixed(2)}-${upper.toFixed(2)}`
+    return '需盘中确认'
 }
 
 function StatusBadge({ status }: { status?: string | null }) {
@@ -121,6 +144,76 @@ function RiskList({ items }: { items: DailyReviewRisk[] }) {
                         <p className="mt-2 text-sm leading-6 text-slate-600 dark:text-slate-300">{item.detail}</p>
                     </div>
                 )) : <div className="text-sm text-slate-400">暂无数据</div>}
+            </div>
+        </section>
+    )
+}
+
+function NarrativeMarkdown({ content }: { content?: string | null }) {
+    if (!content) return null
+    return (
+        <section className="card space-y-4 p-5">
+            <div className="text-base font-semibold text-slate-900 dark:text-slate-100">深度复盘长文</div>
+            <div className="prose dark:prose-invert prose-sm md:prose-base max-w-none leading-7">
+                <Suspense fallback={<div className="text-sm text-slate-400">长文加载中...</div>}>
+                    <MarkdownBlock content={content} />
+                </Suspense>
+            </div>
+        </section>
+    )
+}
+
+function TechnicalDiagnostics({ items }: { items: DailyReviewStockDiagnostic[] }) {
+    if (!items.length) return null
+    return (
+        <section className="card space-y-3 p-5">
+            <div className="flex items-center gap-2 text-base font-semibold text-slate-900 dark:text-slate-100">
+                <Activity className="h-4 w-4 text-blue-500" />
+                持仓技术诊断
+            </div>
+            <div className="grid gap-3 md:grid-cols-2">
+                {items.map((item, index) => {
+                    const pressure = item.t0_plan?.pressure_zone as Record<string, unknown> | null | undefined
+                    const support = item.t0_plan?.support_zone as Record<string, unknown> | null | undefined
+                    const bollinger = item.bollinger || {}
+                    const dailyMacd = item.daily_macd || {}
+                    const tags = item.volume_price?.tags || []
+                    const missing = Array.isArray(item.data_quality?.missing_fields) ? item.data_quality?.missing_fields as string[] : []
+                    return (
+                        <div key={`${item.symbol}-${index}`} className="rounded-2xl border border-slate-200/80 bg-white p-3 dark:border-slate-700/80 dark:bg-slate-950/40">
+                            <div className="flex items-start justify-between gap-3">
+                                <div>
+                                    <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">{item.name}</div>
+                                    <div className="text-xs text-slate-400">{item.symbol}</div>
+                                </div>
+                                <div className="text-right text-xs">
+                                    <div className="font-medium text-slate-700 dark:text-slate-200">{formatNumber(item.latest_price)}</div>
+                                    <div className={Number(item.change_pct) >= 0 ? 'text-rose-500' : 'text-emerald-500'}>{formatPercent(item.change_pct)}</div>
+                                </div>
+                            </div>
+                            <div className="mt-3 grid gap-2 text-xs text-slate-600 dark:text-slate-300">
+                                <div className="rounded-xl bg-slate-50 px-3 py-2 dark:bg-slate-900/50">
+                                    布林：{String(bollinger.track_position || '数据不足')} · 带宽 {formatNumber(bollinger.bandwidth, 4)}
+                                </div>
+                                <div className="rounded-xl bg-slate-50 px-3 py-2 dark:bg-slate-900/50">
+                                    MACD：{String(dailyMacd.zero_axis_state || '数据不足')} · {String(dailyMacd.histogram_change || '待确认')}
+                                </div>
+                                <div className="rounded-xl bg-slate-50 px-3 py-2 dark:bg-slate-900/50">
+                                    T+0：压力 {zoneLabel(pressure)} / 支撑 {zoneLabel(support)}
+                                </div>
+                                <div className="rounded-xl bg-slate-50 px-3 py-2 dark:bg-slate-900/50">
+                                    量价：{tags.length ? tags.join('、') : '待确认'}
+                                </div>
+                            </div>
+                            {item.t0_plan?.opening_watchpoint && (
+                                <p className="mt-3 text-xs leading-5 text-slate-500 dark:text-slate-400">{item.t0_plan.opening_watchpoint}</p>
+                            )}
+                            {missing.length > 0 && (
+                                <div className="mt-3 text-[11px] text-amber-600 dark:text-amber-300">缺失：{missing.join('、')}</div>
+                            )}
+                        </div>
+                    )
+                })}
             </div>
         </section>
     )
@@ -256,8 +349,10 @@ export default function DailyReviewPage() {
                 <div className="space-y-5">
                     {review ? (
                         <>
+                            <NarrativeMarkdown content={review.narrative_markdown} />
                             <SummaryBlock title="今日市场总览" summary={review.market_summary} />
                             <SummaryBlock title="我的持仓与自选复盘" summary={review.portfolio_summary} />
+                            <TechnicalDiagnostics items={review.portfolio_technical_diagnostics || []} />
                             <ThemeList title="当前主线与核心个股" items={review.current_main_themes} />
                             <StockList title="当前重点个股" items={review.current_key_stocks} />
                             <ThemeList title="次日主线与候选股" items={review.next_main_themes} />

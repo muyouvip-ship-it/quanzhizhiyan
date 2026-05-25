@@ -63,6 +63,33 @@ class TestBuildReportMessage:
         assert "量化之神 Webhook 预热" in message
         assert "测试消息" in message
 
+    def test_daily_review_message_keeps_markdown_out_and_adds_short_diagnostics(self):
+        from api.services.wecom_notification_service import build_daily_review_message
+
+        message = build_daily_review_message(
+            {
+                "trade_date": "2026-05-06",
+                "market_summary": {"headline": "市场摘要", "bullets": []},
+                "portfolio_summary": {"headline": "持仓摘要", "bullets": []},
+                "narrative_markdown": "# 很长的 Markdown 正文",
+                "portfolio_technical_diagnostics": [
+                    {
+                        "symbol": "600000.SH",
+                        "name": "浦发银行",
+                        "volume_price": {"tags": ["放量上涨"]},
+                        "t0_plan": {
+                            "pressure_zone": {"label": "10.20-10.40"},
+                            "support_zone": {"label": "9.80-9.90"},
+                        },
+                    }
+                ],
+            }
+        )
+
+        assert "# 很长的 Markdown 正文" not in message
+        assert "持仓技术提示" in message
+        assert "10.20-10.40" in message
+
 
 class TestSendMessage:
     @patch("api.services.wecom_notification_service.requests.post")

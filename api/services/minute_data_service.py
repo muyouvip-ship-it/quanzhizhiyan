@@ -511,7 +511,7 @@ def _write_minute_cache(frame: pd.DataFrame, *, trade_date: str, timeframe: str,
 
 
 def _to_pandas_rule(timeframe: str) -> str:
-    mapping = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min"}
+    mapping = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "60m": "60min"}
     return mapping.get(timeframe, "30min")
 
 

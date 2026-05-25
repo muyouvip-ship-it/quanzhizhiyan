@@ -30,6 +30,7 @@ from api.routes.market import (
 )
 from api.services.market_data_pipeline_service import preferred_daily_kline_table
 from api.services import auth_service, news_eye_service, portfolio_import_service, watchlist_service
+from api.services.daily_review_technical_diagnostics import build_portfolio_technical_diagnostics
 from api.services.qmt_market_data_service import fetch_realtime_quotes
 from api.services.wecom_notification_service import send_daily_review_message_with_retry
 from tradingagents.dataflows.trade_calendar import CN_TZ, is_cn_trading_day, previous_cn_trading_day
@@ -44,7 +45,10 @@ _POLL_SECONDS = max(int(os.getenv("DAILY_REVIEW_POLL_SECONDS", "60")), 30)
 _DEFAULT_TRIGGER_TIME = "21:10"
 _MAX_HISTORY = 120
 
-_SYSTEM_PROMPT = """你是 A 股交易复盘助手。请根据给定上下文输出严格 JSON，不要输出 markdown。
+_SYSTEM_PROMPT = """你是 Wolf's Quant（全知之眼）量化交易系统的首席总策略师。请根据给定上下文输出严格 JSON，不要在 JSON 外输出任何文字。
+你必须只基于用户注入的 market_data_json、portfolio_data_json、technical_diagnostics_json 与 rule_based 字段写作；严禁编造缺失的 MACD、布林带、分钟线、支撑位或压力位。
+如果 technical_diagnostics_json 中 minute_macd_60m 为 null，不得写 60 分钟级结论；如果支撑/压力为“需盘中确认”，不得改写成精确价格。
+
 字段要求：
 - market_summary: {"headline": string, "bullets": string[]}
 - portfolio_summary: {"headline": string, "bullets": string[]}
@@ -53,7 +57,20 @@ _SYSTEM_PROMPT = """你是 A 股交易复盘助手。请根据给定上下文输
 - next_main_themes: [{"theme": string, "summary": string, "catalyst": string}]
 - next_candidate_stocks: [{"symbol": string, "name": string, "bias": string, "reason": string, "source": string}]
 - risk_watchpoints: [{"title": string, "detail": string, "level": string}]
-保持精炼、面向 A 股、避免空泛。"""
+- narrative_markdown: string，完整 Markdown 长文，必须使用以下四段式框架：
+  ## 1. 大盘大局观与多空资金博弈 (Market Matrix)
+  ## 2. 核心 Battlefield：绝对主线与板块逻辑 (Sectors)
+  ## 3. Wolf's Quant 持仓个股硬核量化诊断 (Portfolio T+0 Strategy)
+  ## 4. 调仓风控提示与知行合一 (Risk & Action)
+
+写作要求：
+- 保持专业、直接、面向 A 股实战，写成“闭盘战报”而不是指标清单。允许有判断力度，但必须由注入数据支撑。
+- 开头必须先给出一句当天盘面的核心定性，例如“指数牛市、个股失血”“权重虹吸小票”“流动性外溢普涨修复”“主线逼空、后排掉队”等；不能用“今日大盘震荡、科技股较好”这类空泛句。
+- 叙事要有盘感：先讲指数和涨跌家数的背离，再讲成交量和涨跌停效应，再讲主线如何抽血或外溢，最后落到次日操作。不要把字段逐项机械翻译。
+- 市场段必须结合指数、涨跌家数、成交额、涨跌停效应、连板晋级率、炸板率等已有数据讨论资金虹吸/外溢和情绪周期；缺失项必须明说数据未覆盖。
+- 北向资金、具体传闻、减持名单等如果没有注入，必须写“当前数据未覆盖”，不能杜撰。
+- 持仓诊断必须逐股独立写，不要合并；每只股票必须落到 T+0 压力区、支撑区和开盘半小时观察点。
+- portfolio_technical_diagnostics 由系统计算，LLM 不需要改写，也不要杜撰未注入的指标。"""
 
 
 def _utcnow() -> datetime:
@@ -132,6 +149,8 @@ def _json_default_review() -> dict[str, Any]:
         "next_main_themes": [],
         "next_candidate_stocks": [],
         "risk_watchpoints": [],
+        "narrative_markdown": None,
+        "portfolio_technical_diagnostics": [],
     }
 
 
@@ -148,6 +167,8 @@ def _to_dict(row: DailyReviewDB) -> dict[str, Any]:
         "next_main_themes": row.next_main_themes or [],
         "next_candidate_stocks": row.next_candidate_stocks or [],
         "risk_watchpoints": row.risk_watchpoints or [],
+        "narrative_markdown": row.narrative_markdown,
+        "portfolio_technical_diagnostics": row.portfolio_technical_diagnostics or [],
         "raw_result_data": row.raw_result_data or {},
         "push_status": row.push_status,
         "push_error": row.push_error,
@@ -285,6 +306,85 @@ def _limit_down_threshold(symbol: Any) -> float:
     return -0.098
 
 
+def _row_price_change_ratio(row: Any, price_field: str) -> float | None:
+    try:
+        price = float(row.get(price_field))
+        pre_close = float(row.get("pre_close"))
+    except Exception:
+        return None
+    if pre_close <= 0:
+        return None
+    return (price - pre_close) / pre_close
+
+
+def _row_is_limit_up_close(row: Any) -> bool:
+    change_ratio = _row_price_change_ratio(row, "close")
+    return change_ratio is not None and change_ratio >= _limit_up_threshold(row.get("symbol"))
+
+
+def _row_is_limit_up_touch(row: Any) -> bool:
+    change_ratio = _row_price_change_ratio(row, "high")
+    return change_ratio is not None and change_ratio >= _limit_up_threshold(row.get("symbol"))
+
+
+def _market_symbol_key(symbol: Any) -> str:
+    return str(symbol or "").strip().upper()
+
+
+def _derive_market_sentiment_metrics(
+    rows: Iterable[Any],
+    previous_rows: Iterable[Any] | None,
+    *,
+    source: str,
+) -> dict[str, Any]:
+    current_rows = list(rows or [])
+    previous_row_list = list(previous_rows or [])
+    current_limit_up_symbols: set[str] = set()
+    limit_up_touch_count = 0
+    failed_limit_up_count = 0
+    rows_with_high = 0
+
+    for row in current_rows:
+        symbol = _market_symbol_key(row.get("symbol"))
+        if _row_is_limit_up_close(row):
+            current_limit_up_symbols.add(symbol)
+        if row.get("high") is not None:
+            rows_with_high += 1
+        if _row_is_limit_up_touch(row):
+            limit_up_touch_count += 1
+            if not _row_is_limit_up_close(row):
+                failed_limit_up_count += 1
+
+    previous_limit_up_symbols = {
+        _market_symbol_key(row.get("symbol"))
+        for row in previous_row_list
+        if _row_is_limit_up_close(row)
+    }
+    promotion_base = len(previous_limit_up_symbols)
+    promotion_count = len(previous_limit_up_symbols & current_limit_up_symbols) if promotion_base else None
+    promotion_rate = promotion_count / promotion_base * 100 if promotion_base and promotion_count is not None else None
+    failed_rate = failed_limit_up_count / limit_up_touch_count * 100 if limit_up_touch_count else (0.0 if rows_with_high else None)
+
+    missing_fields: list[str] = []
+    if not rows_with_high:
+        missing_fields.append("daily_high")
+    if not previous_row_list:
+        missing_fields.append("previous_session_limit_up_pool")
+    elif promotion_base == 0:
+        missing_fields.append("previous_session_limit_up_count_zero")
+
+    return {
+        "limit_up_touch_count": limit_up_touch_count if rows_with_high else None,
+        "failed_limit_up_count": failed_limit_up_count if rows_with_high else None,
+        "failed_limit_up_rate": round(failed_rate, 2) if failed_rate is not None else None,
+        "limit_up_promotion_base": promotion_base if previous_row_list else None,
+        "limit_up_promotion_count": promotion_count,
+        "limit_up_promotion_rate": round(promotion_rate, 2) if promotion_rate is not None else None,
+        "sentiment_source": source,
+        "sentiment_missing_fields": missing_fields,
+    }
+
+
 def _load_market_breadth(db: Session, trade_date: str | None = None) -> dict[str, Any]:
     table_name = preferred_daily_kline_table()
     try:
@@ -303,7 +403,7 @@ def _load_market_breadth(db: Session, trade_date: str | None = None) -> dict[str
         rows = db.execute(
             text(
                 f"""
-                SELECT symbol, close, pre_close, amount
+                SELECT symbol, close, high, pre_close, amount
                 FROM {table_name}
                 WHERE trade_date = :target_date
                   AND close IS NOT NULL AND pre_close IS NOT NULL AND pre_close > 0
@@ -312,18 +412,20 @@ def _load_market_breadth(db: Session, trade_date: str | None = None) -> dict[str
             {"target_date": target_date},
         ).mappings().all()
         previous_amount = None
+        previous_rows = []
         if previous_date is not None:
-            previous_amount = db.execute(
+            previous_rows = db.execute(
                 text(
                     f"""
-                    SELECT SUM(amount)
+                    SELECT symbol, close, high, pre_close, amount
                     FROM {table_name}
                     WHERE trade_date = :previous_date
-                      AND amount IS NOT NULL
+                      AND close IS NOT NULL AND pre_close IS NOT NULL AND pre_close > 0
                     """
                 ),
                 {"previous_date": previous_date},
-            ).scalar()
+            ).mappings().all()
+            previous_amount = sum(float(row.get("amount") or 0.0) for row in previous_rows)
     except Exception:
         return {}
 
@@ -366,6 +468,11 @@ def _load_market_breadth(db: Session, trade_date: str | None = None) -> dict[str
         "limit_up_count": limit_up_count,
         "limit_down_count": limit_down_count,
         "source": f"postgresql:{table_name}",
+        **_derive_market_sentiment_metrics(
+            rows,
+            previous_rows,
+            source=f"postgresql:{table_name}:daily_ohlc_estimate",
+        ),
     }
 
 
@@ -577,6 +684,377 @@ def _build_theme_candidates(news_items: list[dict[str, Any]], market: dict[str, 
     return positive, negative
 
 
+def _as_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except Exception:
+        return None
+    return number if number == number else None
+
+
+def _format_pct(value: Any) -> str:
+    number = _as_number(value)
+    return "--" if number is None else f"{number:+.2f}%"
+
+
+def _format_rate(value: Any) -> str:
+    number = _as_number(value)
+    return "--" if number is None else f"{number:.2f}%"
+
+
+def _sentiment_pressure_tone(market_stats: dict[str, Any]) -> str:
+    promotion_rate = _as_number(market_stats.get("limit_up_promotion_rate"))
+    failed_rate = _as_number(market_stats.get("failed_limit_up_rate"))
+    if promotion_rate is None and failed_rate is None:
+        return "当前数据未覆盖连板晋级率和炸板率，短线风险偏好只能由涨跌停家数粗略判断。"
+    if promotion_rate is not None and failed_rate is not None:
+        if promotion_rate >= 40 and failed_rate <= 25:
+            return "前排接力强、封板稳定，短线资金风险偏好处在主升或强修复区。"
+        if promotion_rate < 15 or failed_rate >= 45:
+            return "连板接力降温或炸板压力偏高，短线情绪处在强分歧/退潮压力区。"
+        if promotion_rate >= 25 and failed_rate <= 35:
+            return "接力情绪在修复，前排仍有溢价，但后排跟风需要看次日承接。"
+        return "接力和封板质量都不算极端，短线资金更像结构性博弈而非全面逼空。"
+    if promotion_rate is not None:
+        return "连板晋级率已有覆盖，但炸板率缺失，需结合前排封单和回封质量确认风险偏好。"
+    return "炸板率已有覆盖，但缺少上一交易日涨停池，连板晋级强度需盘后补数确认。"
+
+
+def _sentiment_metric_sentence(market_stats: dict[str, Any]) -> str:
+    promotion_rate = market_stats.get("limit_up_promotion_rate")
+    promotion_base = market_stats.get("limit_up_promotion_base")
+    promotion_count = market_stats.get("limit_up_promotion_count")
+    failed_rate = market_stats.get("failed_limit_up_rate")
+    failed_count = market_stats.get("failed_limit_up_count")
+    touch_count = market_stats.get("limit_up_touch_count")
+    parts: list[str] = []
+    if promotion_rate is not None:
+        parts.append(f"连板晋级率 {_format_rate(promotion_rate)}（{int(promotion_count or 0)}/{int(promotion_base or 0)}）")
+    else:
+        parts.append("连板晋级率当前数据未覆盖")
+    if failed_rate is not None:
+        parts.append(f"炸板率 {_format_rate(failed_rate)}（炸板 {int(failed_count or 0)} / 触板 {int(touch_count or 0)}）")
+    else:
+        parts.append("炸板率当前数据未覆盖")
+    return "；".join(parts) + "。"
+
+
+def _format_price_zone(zone: Any) -> str:
+    if not isinstance(zone, dict):
+        return "需盘中确认"
+    label = str(zone.get("label") or "").strip()
+    if label:
+        return label
+    lower = _as_number(zone.get("lower"))
+    upper = _as_number(zone.get("upper"))
+    if lower is not None and upper is not None:
+        return f"{lower:.2f}-{upper:.2f}"
+    return "需盘中确认"
+
+
+def _summarize_market_matrix(market: dict[str, Any]) -> list[str]:
+    market_stats = market.get("market_stats") or {}
+    indices = market.get("indices") or []
+    up_count = market_stats.get("up_count")
+    down_count = market_stats.get("down_count")
+    total_amount = market_stats.get("index_turnover_amount") or market_stats.get("total_amount")
+    breadth_gap: float | None = None
+    if up_count is not None and down_count is not None and (int(up_count or 0) + int(down_count or 0)) > 0:
+        breadth_gap = (int(up_count or 0) - int(down_count or 0)) / (int(up_count or 0) + int(down_count or 0)) * 100
+    index_strength = []
+    if indices:
+        for item in indices[:5]:
+            change_pct = _as_number(item.get("change_pct"))
+            if change_pct is not None:
+                index_strength.append((str(item.get("name") or item.get("symbol") or ""), change_pct))
+    pieces: list[str] = []
+    if indices:
+        pieces.append(
+            "指数表现："
+            + "、".join(f"{name} {pct:+.2f}%" for name, pct in index_strength)
+            + ("，科创/创业明显领涨" if any(name in {"科创50", "创业板指"} and pct > 2 for name, pct in index_strength) else "")
+        )
+    if up_count is not None and down_count is not None:
+        if breadth_gap is not None:
+            pieces.append(f"涨跌家数：上涨 {int(up_count or 0)} 只，下跌 {int(down_count or 0)} 只，市场广度偏负/偏正约 {breadth_gap:+.1f}%。")
+        else:
+            pieces.append(f"涨跌家数：上涨 {int(up_count or 0)} 只，下跌 {int(down_count or 0)} 只。")
+    if total_amount:
+        pieces.append(f"成交额：{_format_amount_cn(total_amount)}，量能继续放大，说明资金并非观望而是强烈换手。")
+    if market_stats.get("limit_up_count") is not None or market_stats.get("limit_down_count") is not None:
+        pieces.append(
+            f"涨跌停效应：涨停/近涨停 {int(market_stats.get('limit_up_count') or 0)} 只，"
+            f"跌停/近跌停 {int(market_stats.get('limit_down_count') or 0)} 只，"
+            + (
+                "短线情绪明显偏热。"
+                if int(market_stats.get("limit_up_count") or 0) > int(market_stats.get("limit_down_count") or 0)
+                else "短线情绪并不一致，资金分歧仍在。"
+            )
+        )
+    if (
+        market_stats.get("limit_up_promotion_rate") is not None
+        or market_stats.get("failed_limit_up_rate") is not None
+        or market_stats.get("sentiment_missing_fields")
+    ):
+        pieces.append(
+            "情绪压强："
+            + _sentiment_metric_sentence(market_stats)
+            + _sentiment_pressure_tone(market_stats)
+        )
+    return [piece for piece in pieces if piece]
+
+
+def _top_sector_names(items: list[dict[str, Any]], limit: int = 4) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for item in items[:limit]:
+        sector_name = str(item.get("sector_name") or item.get("theme") or "").strip()
+        if not sector_name:
+            continue
+        result.append(item)
+    return result
+
+
+def _sector_name_list(items: list[dict[str, Any]], limit: int = 4) -> list[str]:
+    names: list[str] = []
+    for item in items[:limit]:
+        name = str(item.get("sector_name") or item.get("theme") or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def _infer_market_mode(market: dict[str, Any]) -> str:
+    market_stats = market.get("market_stats") or {}
+    indices = market.get("indices") or []
+    up_count = _as_number(market_stats.get("up_count"))
+    down_count = _as_number(market_stats.get("down_count"))
+    limit_up_count = _as_number(market_stats.get("limit_up_count"))
+    limit_down_count = _as_number(market_stats.get("limit_down_count"))
+    promotion_rate = _as_number(market_stats.get("limit_up_promotion_rate"))
+    failed_rate = _as_number(market_stats.get("failed_limit_up_rate"))
+    leaders = set(_sector_name_list(market.get("sector_gainers") or [], limit=6))
+    positive_indices = [
+        item for item in indices
+        if (_as_number(item.get("change_pct")) or 0) > 0
+    ]
+    star_or_chinext_strong = any(
+        str(item.get("symbol") or "") in {"000688.SH", "399006.SZ"} and (_as_number(item.get("change_pct")) or 0) >= 2
+        for item in indices
+    )
+    tech_hot = bool(leaders & {"电子", "通信", "计算机", "半导体", "芯片", "消费电子"})
+
+    if failed_rate is not None and failed_rate >= 45 and (promotion_rate is None or promotion_rate < 20):
+        return "高位接力强分歧：炸板压力偏高、连板晋级偏弱，短线资金从纯情绪接力转向有辨识度的主线前排。"
+    if up_count is not None and down_count is not None and down_count > up_count and positive_indices:
+        return "指数牛市、个股失血：权重和主线大票在拉指数，非主线筹码被抽血，盘面不是无差别普涨。"
+    if promotion_rate is not None and promotion_rate >= 40 and (failed_rate is None or failed_rate <= 25):
+        return "情绪主升逼空：连板晋级顺畅、炸板压力可控，短线资金风险偏好明显打开。"
+    if star_or_chinext_strong and tech_hot:
+        return "硬科技逼空：科创/创业弹性资产领涨，资金在半导体、算力、AI硬件链条上集中抱团。"
+    if up_count is not None and down_count is not None and up_count > down_count * 1.5:
+        return "流动性外溢式普涨修复：赚钱效应扩散，但仍要看主线外的承接能否持续。"
+    if limit_up_count is not None and limit_down_count is not None and limit_up_count > max(limit_down_count * 5, 30):
+        return "短线情绪偏热：涨停效应明显占优，但是否进入主升还要看次日分化承接。"
+    return "结构性轮动：指数、板块和个股没有形成完全一致的合力，操作上仍以主线强弱和量能为锚。"
+
+
+def _describe_main_line(current_themes: list[dict[str, Any]], sector_leaders: list[dict[str, Any]]) -> str:
+    theme_parts = []
+    for item in current_themes[:3]:
+        theme = str(item.get("theme") or "").strip()
+        if not theme:
+            continue
+        strength = str(item.get("strength") or "").strip()
+        summary = _clip_text(item.get("summary"), 48)
+        if strength:
+            theme_parts.append(f"{theme}（{strength}）")
+        elif summary:
+            theme_parts.append(f"{theme}（{summary}）")
+        else:
+            theme_parts.append(theme)
+    leader_names = _sector_name_list(sector_leaders, limit=4)
+    if theme_parts:
+        base = "、".join(theme_parts)
+        if leader_names:
+            return f"{base}。盘面强度集中在 {'、'.join(leader_names)}，说明资金优先选择有辨识度的主线方向，而不是均匀摊开。"
+        return f"{base}。主线持续性还需要成交额和前排封单强度继续确认。"
+    if leader_names:
+        return f"今日板块强度主要落在 {'、'.join(leader_names)}。当前缺少更细的消息催化和封单数据，不能把所有上涨都归因为同一条主线。"
+    return "当前板块强弱数据不足，绝对主线未能被系统确认，先按轮动修复处理。"
+
+
+def _risk_action_tone(
+    market_mode: str,
+    sector_leaders: list[dict[str, Any]],
+    sector_laggards: list[dict[str, Any]],
+    total_amount: Any,
+    up_count: Any,
+    down_count: Any,
+) -> str:
+    leaders = _sector_name_list(sector_leaders, limit=3)
+    laggards = _sector_name_list(sector_laggards, limit=3)
+    has_amount = _as_number(total_amount) is not None
+    up = _as_number(up_count)
+    down = _as_number(down_count)
+
+    if "个股失血" in market_mode:
+        return (
+            "指数强不等于持仓安全，次日先看主线是否继续虹吸。"
+            f"仓位优先贴近 {'、'.join(leaders) if leaders else '当日最强主线'}，"
+            f"回避 {'、'.join(laggards) if laggards else '弱势失血方向'} 的无量反抽。"
+        )
+    if up is not None and down is not None and up > down * 1.5:
+        return (
+            "普涨修复阶段可以提高观察仓弹性，但追高仍只看有量能、有辨识度、有板块协同的前排；"
+            "后排冲高没有换手承接，仍按套利处理。"
+        )
+    if has_amount:
+        return (
+            "成交额维持高位时，主线分歧往往不是立即结束，而是高低切和强弱切。"
+            "次日用开盘半小时确认资金是否继续留在前排，弱分歧可做T，放量破位要先降风险。"
+        )
+    return "数据覆盖不足时不要追求精确预测，次日以开盘量能、前排承接和弱势板块是否继续失血作为执行锚点。"
+
+
+def _narrative_markdown_is_strong(value: Any) -> bool:
+    text_value = str(value or "").strip()
+    if len(text_value) < 800:
+        return False
+    required_markers = ("Market Matrix", "Battlefield", "Portfolio T+0", "Risk")
+    if not all(marker in text_value for marker in required_markers):
+        return False
+    judgement_terms = ("指数失真", "资金虹吸", "个股失血", "流动性外溢", "抽血", "情绪", "主线")
+    return sum(1 for term in judgement_terms if term in text_value) >= 3
+
+
+def _build_narrative_markdown(
+    *,
+    trade_date: str,
+    market: dict[str, Any],
+    payload: dict[str, Any],
+    diagnostics: list[dict[str, Any]],
+) -> str:
+    market_summary = payload.get("market_summary") or {}
+    portfolio_summary = payload.get("portfolio_summary") or {}
+    sector_gainers = market.get("sector_gainers") or []
+    sector_losers = market.get("sector_losers") or []
+    current_themes = payload.get("current_main_themes") or []
+    risks = payload.get("risk_watchpoints") or []
+    market_matrix = _summarize_market_matrix(market)
+    market_stats = market.get("market_stats") or {}
+    total_amount = market_stats.get("index_turnover_amount") or market_stats.get("total_amount")
+    up_count = market_stats.get("up_count")
+    down_count = market_stats.get("down_count")
+    broad_lines = len(market.get("top_gainers") or []) + len(market.get("top_losers") or [])
+    market_mode = _infer_market_mode(market)
+    sector_leaders = _top_sector_names(sector_gainers, limit=4)
+    sector_laggards = _top_sector_names(sector_losers, limit=3)
+
+    lines: list[str] = [
+        f"# {trade_date} 每日收盘深度量化复盘",
+        "",
+        "## 1. 大盘大局观与多空资金博弈 (Market Matrix)",
+        f"- **【盘面总判定】**：{market_mode}",
+        f"- **【指数失真与筹码博弈】**：{market_summary.get('headline') or '市场主线仍需结合成交额和涨跌家数确认。'}",
+    ]
+    lines.extend(f"- {item}" for item in market_matrix[:4])
+    if not market_matrix:
+        lines.append("- 今日指数、涨跌家数或成交额数据覆盖不足，指数失真与资金虹吸只能等待盘后数据补齐后确认。")
+    if total_amount:
+        lines.append(f"- **【核心资金动向】**：两市成交约 {_format_amount_cn(total_amount)}，资金不是温和轮动，而是明显在主线方向做极端虹吸。")
+    else:
+        lines.append("- **【核心资金动向】**：当前成交额数据未完整注入，资金虹吸强度只能按板块和指数相对表现判断。")
+    if up_count is not None and down_count is not None:
+        lines.append(
+            f"- **【涨跌家数背离】**：上涨 {int(up_count or 0)} 家，下跌 {int(down_count or 0)} 家，"
+            + ("指数牛市、个股失血" if int(down_count or 0) > int(up_count or 0) else "指数与个股同向修复，但背离仍需盯住主线外溢范围")
+            + "。"
+        )
+    lines.append(
+        f"- **【短线情绪压强】**：{_sentiment_metric_sentence(market_stats)}"
+        f"{_sentiment_pressure_tone(market_stats)}"
+    )
+    if market_stats.get("sentiment_source"):
+        lines.append(f"- **【情绪数据口径】**：{market_stats.get('sentiment_source')}；以日线触板/封板估算，不能替代盘口封单明细。")
+    if broad_lines:
+        lines.append(f"- **【涨跌榜分化】**：当前样本覆盖到 {broad_lines} 只涨跌榜标的，板块分歧和个股分化都已经很直观。")
+
+    lines.extend(
+        [
+            "",
+            "## 2. 核心 Battlefield：绝对主线与板块逻辑 (Sectors)",
+            f"- **【绝对主线驱动力解析】**：{_describe_main_line(current_themes, sector_leaders)}",
+        ]
+    )
+    if sector_gainers:
+        lines.append(
+            "- 强势板块："
+            + "、".join(
+                f"{item.get('sector_name')} {_format_pct(item.get('change_pct'))}"
+                for item in sector_gainers[:4]
+            )
+        )
+    if sector_losers:
+        lines.append(
+            "- **【抽血跷跷板警示】**："
+            + "、".join(
+                f"{item.get('sector_name')} {_format_pct(item.get('change_pct'))}"
+                for item in sector_laggards[:4]
+            )
+            + "，说明主线不是简单普涨，而是典型的资金虹吸式上攻。"
+        )
+    elif not sector_gainers:
+        lines.append("- 板块涨跌与资金流数据不足，主线持续性暂不做过度外推。")
+
+    lines.extend(
+        [
+            "",
+            "## 3. Wolf's Quant 持仓个股硬核量化诊断 (Portfolio T+0 Strategy)",
+            f"> {portfolio_summary.get('headline') or '未检测到持仓摘要，若无持仓则按自选股前 8 只降级跟踪。'}",
+        ]
+    )
+    if diagnostics:
+        for item in diagnostics:
+            daily_macd = item.get("daily_macd") or {}
+            minute_macd = item.get("minute_macd_60m")
+            bollinger = item.get("bollinger") or {}
+            volume_price = item.get("volume_price") or {}
+            t0_plan = item.get("t0_plan") or {}
+            data_quality = item.get("data_quality") or {}
+            lines.extend(
+                [
+                    "",
+                    f"### 股票名称：{item.get('name') or item.get('symbol')} | 代码：{item.get('symbol')}",
+                    f"- **【日内盘口特征】**：最新价 {item.get('latest_price') if item.get('latest_price') is not None else '--'}，涨跌幅 {_format_pct(item.get('change_pct'))}；量价标签：{'、'.join(volume_price.get('tags') or ['数据不足'])}。",
+                    "- **【量化技术形态解构】**：",
+                    f"  * **布林带状态**：{bollinger.get('track_position') or '日线样本不足，不能生成布林带结论'}；中轨/上轨/下轨：{bollinger.get('middle') or '--'} / {bollinger.get('upper') or '--'} / {bollinger.get('lower') or '--'}；开口：{bollinger.get('opening_state') or '需确认'}。",
+                    f"  * **MACD动能（日线）**：DIF {daily_macd.get('dif') if daily_macd else '--'}，DEA {daily_macd.get('dea') if daily_macd else '--'}，柱体 {daily_macd.get('histogram') if daily_macd else '--'}；{daily_macd.get('zero_axis_state') or '日线样本不足'}，{daily_macd.get('histogram_change') or '动能变化待确认'}，{daily_macd.get('divergence_hint') or '不生成背离结论'}。",
+                    f"  * **MACD动能（60分钟）**：{('DIF ' + str(minute_macd.get('dif')) + '，DEA ' + str(minute_macd.get('dea')) + '，' + str(minute_macd.get('histogram_change'))) if isinstance(minute_macd, dict) else '分钟线数据缺失，不写 60 分钟结论'}。",
+                    "- **【次日 T+0 滚动做T实战指引】**：",
+                    f"  * **高抛做空区间 (压力位)**：{_format_price_zone(t0_plan.get('pressure_zone'))}，依据：{(t0_plan.get('pressure_zone') or {}).get('basis') if isinstance(t0_plan.get('pressure_zone'), dict) else '需盘中确认'}。",
+                    f"  * **低吸做多区间 (支撑位)**：{_format_price_zone(t0_plan.get('support_zone'))}，依据：{(t0_plan.get('support_zone') or {}).get('basis') if isinstance(t0_plan.get('support_zone'), dict) else '需盘中确认'}。",
+                    f"  * **日内观测核心**：{t0_plan.get('opening_watchpoint') or '开盘半小时先确认量能与分时承接。'}",
+                    f"  * **数据质量**：日线 {data_quality.get('daily_rows', 0)} 条，分钟线 {data_quality.get('minute_rows', 0)} 条；缺失项：{', '.join(data_quality.get('missing_fields') or []) or '无'}。",
+                ]
+            )
+    else:
+        lines.append("- 当前无持仓/自选技术诊断对象，个股 T+0 段降级为空。")
+
+    lines.extend(
+        [
+            "",
+            "## 4. 调仓风控提示与知行合一 (Risk & Action)",
+            "- "
+            + (
+                "；".join(f"{item.get('title')}：{item.get('detail')}" for item in risks[:4])
+                or "仓位控制以市场量能和主线持续性为准；缺少明确数据时不追求精确预测。"
+            ),
+            "- **【次日总策略】**：" + _risk_action_tone(market_mode, sector_leaders, sector_laggards, total_amount, up_count, down_count),
+        ]
+    )
+    return "\n".join(lines).strip()
+
+
 def _build_rule_based_review(
     trade_date: str,
     market: dict[str, Any],
@@ -594,6 +1072,7 @@ def _build_rule_based_review(
     today_reports: list[ReportDB] = user_context.get("today_reports") or []
     latest_report_map: dict[str, ReportDB] = user_context.get("latest_report_map") or {}
     quotes = user_context.get("holdings_quotes") or {}
+    diagnostics = user_context.get("portfolio_technical_diagnostics") or []
 
     positive_themes, negative_themes = _build_theme_candidates(news_items, market)
 
@@ -603,9 +1082,14 @@ def _build_rule_based_review(
     amount_label = _format_amount_cn(market_amount)
     amount_change_label = _format_amount_cn(abs(market_stats.get("amount_change") or 0.0)) if market_stats.get("amount_change") else ""
     lead_themes = "、".join([item["theme"] for item in positive_themes[:2]]) or "强势方向待确认"
-    market_headline = f"{trade_date} 市场复盘：{up_count}/{len(indices) or 1} 个核心指数收涨，主线集中在{lead_themes}。"
+    market_mode_headline = _infer_market_mode(market)
+    sentiment_tone = _sentiment_pressure_tone(market_stats)
+    market_headline = f"{trade_date} 市场复盘：{market_mode_headline}；{sentiment_tone}主线集中在{lead_themes}。"
     if amount_label and market_stats.get("up_count"):
-        market_headline = f"{trade_date} 市场复盘：两市成交 {amount_label}，{int(market_stats.get('up_count') or 0)} 只个股上涨，主线集中在{lead_themes}。"
+        market_headline = (
+            f"{trade_date} 市场复盘：两市成交 {amount_label}，上涨 {int(market_stats.get('up_count') or 0)} 只、"
+            f"下跌 {int(market_stats.get('down_count') or 0)} 只；{market_mode_headline}；{sentiment_tone}主线集中在{lead_themes}。"
+        )
     market_bullets = [
         f"{item.get('name')} {item.get('change_pct'):+.2f}%".replace("+", "+") for item in indices[:4] if item.get("change_pct") is not None
     ]
@@ -621,6 +1105,10 @@ def _build_rule_based_review(
             stats_parts.append(f"上涨 {int(market_stats.get('up_count') or 0)} 只，下跌 {int(market_stats.get('down_count') or 0)} 只")
         if market_stats.get("limit_up_count") is not None:
             stats_parts.append(f"涨停/近涨停 {int(market_stats.get('limit_up_count') or 0)} 只")
+        if market_stats.get("limit_up_promotion_rate") is not None:
+            stats_parts.append(f"连板晋级率 {_format_rate(market_stats.get('limit_up_promotion_rate'))}")
+        if market_stats.get("failed_limit_up_rate") is not None:
+            stats_parts.append(f"炸板率 {_format_rate(market_stats.get('failed_limit_up_rate'))}")
         market_bullets.append("；".join(stats_parts))
     if sector_gainers:
         market_bullets.append("强势板块：" + "、".join(f"{item.get('sector_name')} {float(item.get('change_pct') or 0):+.2f}%" for item in sector_gainers[:3]))
@@ -668,6 +1156,13 @@ def _build_rule_based_review(
         if item.get("decision"):
             label += f" | 最新结论 {item['decision']}"
         portfolio_bullets.append(label)
+    for item in diagnostics[:2]:
+        t0_plan = item.get("t0_plan") or {}
+        volume_price = item.get("volume_price") or {}
+        portfolio_bullets.append(
+            f"{item.get('name')}({item.get('symbol')}) T+0：压力 {_format_price_zone(t0_plan.get('pressure_zone'))}，"
+            f"支撑 {_format_price_zone(t0_plan.get('support_zone'))}，量价 {'、'.join(volume_price.get('tags') or ['待确认'])}"
+        )
     if watchlist:
         portfolio_bullets.append("自选聚焦：" + "、".join(f"{item.get('name')}({item.get('symbol')})" for item in watchlist[:5]))
     if today_reports:
@@ -780,7 +1275,7 @@ def _build_rule_based_review(
                 }
             )
 
-    return {
+    payload = {
         "market_summary": {
             "headline": market_headline,
             "bullets": _string_list(market_bullets, limit=6),
@@ -795,7 +1290,15 @@ def _build_rule_based_review(
         "next_main_themes": next_main_themes[:4],
         "next_candidate_stocks": next_candidate_stocks[:8],
         "risk_watchpoints": risk_watchpoints[:6],
+        "portfolio_technical_diagnostics": diagnostics,
     }
+    payload["narrative_markdown"] = _build_narrative_markdown(
+        trade_date=trade_date,
+        market=market,
+        payload=payload,
+        diagnostics=diagnostics,
+    )
+    return payload
 
 
 def _llm_enhance_review(
@@ -830,13 +1333,21 @@ def _llm_enhance_review(
     context = {
         "trade_date": trade_date,
         "rule_based": rule_based,
-        "indices": market.get("indices", [])[:4],
-        "sector_gainers": market.get("sector_gainers", [])[:4],
-        "sector_losers": market.get("sector_losers", [])[:3],
-        "top_gainers": market.get("top_gainers", [])[:6],
-        "top_losers": market.get("top_losers", [])[:4],
-        "holdings": (user_context.get("holdings") or [])[:8],
-        "watchlist": (user_context.get("watchlist") or [])[:8],
+        "market_data_json": {
+            "indices": market.get("indices", [])[:5],
+            "sector_gainers": market.get("sector_gainers", [])[:6],
+            "sector_losers": market.get("sector_losers", [])[:4],
+            "sector_inflows": market.get("sector_inflows", [])[:6],
+            "sector_outflows": market.get("sector_outflows", [])[:4],
+            "top_gainers": market.get("top_gainers", [])[:6],
+            "top_losers": market.get("top_losers", [])[:4],
+            "market_stats": market.get("market_stats") or {},
+        },
+        "portfolio_data_json": {
+            "holdings": (user_context.get("holdings") or [])[:8],
+            "watchlist": (user_context.get("watchlist") or [])[:8],
+        },
+        "technical_diagnostics_json": (user_context.get("portfolio_technical_diagnostics") or [])[:8],
         "today_reports": [
             {
                 "symbol": row.symbol,
@@ -892,6 +1403,8 @@ def _merge_review_payload(rule_based: dict[str, Any], llm_payload: dict[str, Any
     for key, value in rule_based.items():
         merged[key] = value
     if not llm_payload:
+        if not merged.get("narrative_markdown"):
+            merged["narrative_markdown"] = rule_based.get("narrative_markdown")
         return merged
     for key in merged.keys():
         value = llm_payload.get(key)
@@ -905,6 +1418,12 @@ def _merge_review_payload(rule_based: dict[str, Any], llm_payload: dict[str, Any
                     merged[key].setdefault(extra_key, extra_value)
         elif isinstance(merged[key], list) and isinstance(value, list) and value:
             merged[key] = value[:8]
+        elif key == "narrative_markdown" and isinstance(value, str) and value.strip():
+            merged[key] = value.strip()
+    if rule_based.get("portfolio_technical_diagnostics"):
+        merged["portfolio_technical_diagnostics"] = rule_based.get("portfolio_technical_diagnostics") or []
+    if not _narrative_markdown_is_strong(merged.get("narrative_markdown")):
+        merged["narrative_markdown"] = rule_based.get("narrative_markdown")
     return merged
 
 
@@ -974,6 +1493,12 @@ def _apply_known_daily_review_corrections(
         {"title": "主线去弱留强", "detail": "芯片、算力、锂电、有色若出现分化，优先观察中军和前排，回避无量跟风。", "level": "high"},
         {"title": "复盘心法", "detail": "按“看大势、抓主流、盯龙头、定策略”四步执行；复盘不是预测涨跌，而是准备不同情景下的应对。", "level": "low"},
     ]
+    corrected["narrative_markdown"] = _build_narrative_markdown(
+        trade_date=trade_date,
+        market=market,
+        payload=corrected,
+        diagnostics=corrected.get("portfolio_technical_diagnostics") or [],
+    )
     corrected.setdefault("raw_correction_context", {})
     corrected["raw_correction_context"] = {
         "source": "known_market_close_correction",
@@ -999,6 +1524,7 @@ def _send_daily_review_email(user: UserDB, review: dict[str, Any]) -> tuple[bool
     current_themes = review.get("current_main_themes") or []
     next_candidates = review.get("next_candidate_stocks") or []
     risks = review.get("risk_watchpoints") or []
+    diagnostics = review.get("portfolio_technical_diagnostics") or []
 
     lines = [
         f"量化之神每日复盘 - {review.get('trade_date') or ''}",
@@ -1014,6 +1540,12 @@ def _send_daily_review_email(user: UserDB, review: dict[str, Any]) -> tuple[bool
         "",
         "次日候选股：",
         *[f"- {item.get('name')}({item.get('symbol')}): {item.get('reason')}" for item in next_candidates[:5]],
+        "",
+        "持仓技术提示：",
+        *[
+            f"- {item.get('name')}({item.get('symbol')}): 压力 {_format_price_zone((item.get('t0_plan') or {}).get('pressure_zone'))}，支撑 {_format_price_zone((item.get('t0_plan') or {}).get('support_zone'))}"
+            for item in diagnostics[:2]
+        ],
         "",
         "风险观察：",
         *[f"- {item.get('title')}: {item.get('detail')}" for item in risks[:4]],
@@ -1090,6 +1622,14 @@ def generate_daily_review(
     try:
         market = _load_market_snapshot(db, resolved_trade_date)
         user_context = _load_user_context(db, user_id, resolved_trade_date)
+        diagnostics = build_portfolio_technical_diagnostics(
+            db,
+            trade_date=resolved_trade_date,
+            holdings=user_context.get("holdings") or [],
+            watchlist=user_context.get("watchlist") or [],
+            quotes=user_context.get("holdings_quotes") or {},
+        )
+        user_context["portfolio_technical_diagnostics"] = diagnostics
         news_items = _pick_focus_news(db)
         rule_based = _build_rule_based_review(resolved_trade_date, market, user_context, news_items)
         llm_payload, llm_meta = _llm_enhance_review(
@@ -1114,15 +1654,27 @@ def generate_daily_review(
         row.next_main_themes = final_payload.get("next_main_themes")
         row.next_candidate_stocks = final_payload.get("next_candidate_stocks")
         row.risk_watchpoints = final_payload.get("risk_watchpoints")
+        row.narrative_markdown = final_payload.get("narrative_markdown")
+        row.portfolio_technical_diagnostics = final_payload.get("portfolio_technical_diagnostics") or diagnostics
         row.raw_result_data = {
             "trigger": trigger,
             "generated_at": _utcnow().isoformat(),
             "llm": llm_meta,
-            "market_snapshot": market,
-            "rule_based": rule_based,
-            "correction": final_payload.get("raw_correction_context"),
-            "news_items": news_items[:12],
-            "today_report_symbols": [report.symbol for report in (user_context.get("today_reports") or [])],
+        "market_snapshot": market,
+        "rule_based": rule_based,
+        "technical_diagnostics": diagnostics,
+        "market_sentiment": {
+            "limit_up_promotion_rate": market.get("market_stats", {}).get("limit_up_promotion_rate"),
+            "limit_up_promotion_count": market.get("market_stats", {}).get("limit_up_promotion_count"),
+            "limit_up_promotion_base": market.get("market_stats", {}).get("limit_up_promotion_base"),
+            "failed_limit_up_rate": market.get("market_stats", {}).get("failed_limit_up_rate"),
+            "failed_limit_up_count": market.get("market_stats", {}).get("failed_limit_up_count"),
+            "limit_up_touch_count": market.get("market_stats", {}).get("limit_up_touch_count"),
+            "sentiment_source": market.get("market_stats", {}).get("sentiment_source"),
+        },
+        "correction": final_payload.get("raw_correction_context"),
+        "news_items": news_items[:12],
+        "today_report_symbols": [report.symbol for report in (user_context.get("today_reports") or [])],
             "holdings_count": len(user_context.get("holdings") or []),
             "watchlist_count": len(user_context.get("watchlist") or []),
         }

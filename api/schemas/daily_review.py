@@ -51,6 +51,8 @@ class DailyReviewResponse(BaseModel):
     next_main_themes: list[dict[str, Any]] = Field(default_factory=list)
     next_candidate_stocks: list[dict[str, Any]] = Field(default_factory=list)
     risk_watchpoints: list[dict[str, Any]] = Field(default_factory=list)
+    narrative_markdown: Optional[str] = None
+    portfolio_technical_diagnostics: list[dict[str, Any]] = Field(default_factory=list)
     raw_result_data: dict[str, Any] = Field(default_factory=dict)
     push_status: Optional[str] = None
     push_error: Optional[str] = None

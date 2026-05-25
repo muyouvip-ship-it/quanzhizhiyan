@@ -137,6 +137,7 @@ def build_daily_review_message(review: "DailyReviewDB | dict") -> str:
     next_main_themes = _pick_attr(review, "next_main_themes") or []
     next_candidate_stocks = _pick_attr(review, "next_candidate_stocks") or []
     risk_watchpoints = _pick_attr(review, "risk_watchpoints") or []
+    diagnostics = _pick_attr(review, "portfolio_technical_diagnostics") or []
 
     def _theme_line(item) -> str:
         theme = _clip_text(_pick_attr(item, "theme"), 18)
@@ -172,6 +173,16 @@ def build_daily_review_message(review: "DailyReviewDB | dict") -> str:
         lines.append("")
         lines.append("次日候选股：")
         lines.extend(f"- {_stock_line(item)}" for item in next_candidate_stocks[:5])
+    if diagnostics:
+        lines.append("")
+        lines.append("持仓技术提示：")
+        for item in diagnostics[:2]:
+            t0_plan = _pick_attr(item, "t0_plan") or {}
+            volume_price = _pick_attr(item, "volume_price") or {}
+            pressure = _pick_attr(_pick_attr(t0_plan, "pressure_zone") or {}, "label") or "需盘中确认"
+            support = _pick_attr(_pick_attr(t0_plan, "support_zone") or {}, "label") or "需盘中确认"
+            tags = "、".join((_pick_attr(volume_price, "tags") or [])[:2]) if isinstance(_pick_attr(volume_price, "tags"), list) else ""
+            lines.append(f"- {_clip_text(_pick_attr(item, 'name'), 10)}({_clip_text(_pick_attr(item, 'symbol'), 12)}) 压力 {pressure} / 支撑 {support} {tags}".strip())
     if risk_watchpoints:
         lines.append("")
         lines.append("风险观察：")
