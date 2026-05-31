@@ -12,14 +12,14 @@
   },
   "dependencies": {
     "@heroicons/react": "^2.2.0",
-    "@tailwindcss/postcss": "^4.2.2",
-    "@tanstack/react-virtual": "^3.13.23",
+    "@tailwindcss/postcss": "^4.3.0",
+    "@tanstack/react-virtual": "^3.13.26",
     "@vercel/speed-insights": "^2.0.0",
     "@xyflow/react": "^12.10.2",
     "clsx": "^2.1.0",
-    "date-fns": "^4.1.0",
+    "date-fns": "^4.4.0",
     "jszip": "^3.10.1",
-    "lightweight-charts": "^5.1.0",
+    "lightweight-charts": "^5.2.0",
     "lucide-react": "^0.344.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
@@ -27,23 +27,23 @@
     "react-router-dom": "^6.22.0",
     "recharts": "^2.12.0",
     "remark-gfm": "^4.0.1",
-    "tailwind-merge": "^3.5.0",
+    "tailwind-merge": "^3.6.0",
     "tailwindcss": "^4.2.2",
-    "zustand": "^5.0.12"
+    "zustand": "^5.0.14"
   },
   "devDependencies": {
     "@types/react": "^18.2.55",
     "@types/react-dom": "^18.2.19",
-    "@typescript-eslint/eslint-plugin": "^8.58.1",
+    "@typescript-eslint/eslint-plugin": "^8.60.0",
     "@typescript-eslint/parser": "^8.57.2",
     "@vitejs/plugin-react": "^4.2.1",
     "eslint": "^9.39.4",
-    "eslint-plugin-react-hooks": "^7.0.1",
+    "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.2",
-    "globals": "^17.4.0",
+    "globals": "^17.6.0",
     "postcss": "^8.5.9",
-    "typescript": "^6.0.2",
+    "typescript": "^6.0.3",
     "vite": "^6.4.2",
-    "vitest": "^4.1.4"
+    "vitest": "^4.1.7"
   }
 }
