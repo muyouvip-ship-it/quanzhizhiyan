@@ -207,14 +207,41 @@ class AgentBacktester:
         trade_date: str,
         holding_days: int,
     ) -> float:
-        """
-        获取实际收益率
-        
-        TODO: 实现真实的数据获取逻辑
-        """
-        # 这里应该调用数据接口获取实际价格
-        # 暂时返回模拟数据
-        return np.random.uniform(-0.1, 0.1)  # -10% 到 +10%
+        """获取实际收益率，基于 stock_daily_kline 表计算。"""
+        try:
+            from api.database import SessionLocal
+            from api.services.market_data_pipeline_service import preferred_daily_kline_table
+            from sqlalchemy import text
+            from datetime import timedelta
+
+            table = preferred_daily_kline_table()
+            start_dt = datetime.strptime(trade_date, "%Y-%m-%d")
+            end_dt = start_dt + timedelta(days=holding_days + 5)
+
+            db = SessionLocal()
+            try:
+                rows = db.execute(
+                    text(
+                        f"SELECT trade_date, close FROM {table} "
+                        "WHERE symbol = :symbol AND trade_date BETWEEN :start AND :end "
+                        "ORDER BY trade_date ASC"
+                    ),
+                    {"symbol": symbol, "start": trade_date, "end": end_dt.strftime("%Y-%m-%d")},
+                ).fetchall()
+
+                if len(rows) < 2:
+                    return 0.0
+
+                entry_price = float(rows[0][1])
+                exit_price = float(rows[-1][1])
+                if entry_price and entry_price != 0:
+                    return (exit_price - entry_price) / entry_price
+                return 0.0
+            finally:
+                db.close()
+        except Exception:
+            logger.warning("Failed to fetch actual return for %s on %s, returning 0.0", symbol, trade_date)
+            return 0.0
     
     async def _get_trading_days(
         self,
@@ -222,21 +249,38 @@ class AgentBacktester:
         end_date: str,
         interval: int,
     ) -> List[str]:
-        """
-        获取交易日列表（采样）
-        """
-        # 这里应该调用交易日历API
-        # 暂时返回模拟数据
-        start = datetime.strptime(start_date, "%Y-%m-%d")
-        end = datetime.strptime(end_date, "%Y-%m-%d")
-        
-        days = []
-        current = start
-        while current <= end:
-            days.append(current.strftime("%Y-%m-%d"))
-            current += timedelta(days=interval)
-        
-        return days
+        """获取交易日列表，基于真实交易日历并按 interval 采样。"""
+        try:
+            from tradingagents.dataflows.trade_calendar import _load_cn_trade_dates
+
+            all_dates, _ = _load_cn_trade_dates()
+            if not all_dates:
+                # Fallback: 使用周末规则
+                start = datetime.strptime(start_date, "%Y-%m-%d")
+                end = datetime.strptime(end_date, "%Y-%m-%d")
+                days = []
+                current = start
+                while current <= end:
+                    if current.weekday() < 5:
+                        days.append(current.strftime("%Y-%m-%d"))
+                    current += timedelta(days=1)
+                return days[::interval]
+
+            start_d = datetime.strptime(start_date, "%Y-%m-%d").date()
+            end_d = datetime.strptime(end_date, "%Y-%m-%d").date()
+            filtered = [d.isoformat() for d in all_dates if start_d <= d <= end_d]
+            return filtered[::interval]
+        except Exception:
+            logger.warning("Failed to load trade calendar, using weekday fallback")
+            start = datetime.strptime(start_date, "%Y-%m-%d")
+            end = datetime.strptime(end_date, "%Y-%m-%d")
+            days = []
+            current = start
+            while current <= end:
+                if current.weekday() < 5:
+                    days.append(current.strftime("%Y-%m-%d"))
+                current += timedelta(days=1)
+            return days[::interval]
     
     def _evaluate_decision(
         self,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -23,9 +23,9 @@ class UserRuntimeConfigResponse(BaseModel):
     deep_think_llm: str
     quick_think_llm: str
     backend_url: str
-    news_llm_provider: str = ""
-    news_backend_url: str = ""
-    news_analysis_llm: str = ""
+    news_llm_provider: Optional[str] = None
+    news_backend_url: Optional[str] = None
+    news_analysis_llm: Optional[str] = None
     max_debate_rounds: int
     max_risk_discuss_rounds: int
     has_api_key: bool = False
@@ -36,6 +36,7 @@ class UserRuntimeConfigResponse(BaseModel):
     email_report_enabled: bool = True
     wecom_report_enabled: bool = True
     default_analysts: List[str] = Field(default_factory=list)
+    llm_core_stock: Dict[str, Any] = Field(default_factory=dict)
     qmt_paper_account: QmtAccountConfigPayload
     qmt_live_account: QmtAccountConfigPayload
 

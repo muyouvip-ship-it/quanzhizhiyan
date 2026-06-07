@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
-from datetime import date, datetime, time as dtime, timezone
+from datetime import date, datetime, time as dtime, timezone, timedelta
 
 from sqlalchemy import text
 
 from api.backtest_data_api import _refresh_daily_kline_cache_from_db
 from api.database import SessionLocal
+from api.core.utils import env_flag as _env_flag, run_async
 from api.services.qmt_market_data_service import (
     build_market_integrity_report,
     capture_intraday_symbols,
@@ -28,6 +30,7 @@ _STOP_EVENT: asyncio.Event | None = None
 _POLL_SECONDS = 60
 _LAST_EOD_SYNC_DATE: date | None = None
 _LAST_REPAIR_SYNC_DATE: date | None = None
+_LAST_INTRADAY_SELECTION_REFRESH_AT: dict[str, datetime] = {}
 
 
 @dataclass(frozen=True)
@@ -89,13 +92,20 @@ def _scan_and_run_once() -> None:
     if _is_trading_session(local_now):
         for target in targets:
             capture_result = _capture_intraday_for_target(target, trade_date=trade_date)
+            selection_refresh = _refresh_event_driven_selection_after_intraday_capture(
+                trigger="qmt-market-sync:intraday",
+                user_id=target.user_id,
+                local_now=local_now,
+                capture_result=capture_result,
+            )
             logger.info(
-                "[qmt-market-sync] intraday capture user=%s account=%s rows=%s symbols=%s success=%s",
+                "[qmt-market-sync] intraday capture user=%s account=%s rows=%s symbols=%s success=%s selection_refresh=%s",
                 target.user_id,
                 target.account_key,
                 capture_result.get("rows", 0),
                 len(target.symbols),
                 capture_result.get("success"),
+                selection_refresh.get("status"),
             )
 
     if run_eod:
@@ -112,15 +122,35 @@ def _scan_and_run_once() -> None:
 
 
 def _capture_intraday_for_target(target: _MarketSyncTarget, *, trade_date: str) -> dict[str, object]:
-    with SessionLocal() as db:
-        return capture_intraday_symbols(
-            target.symbols,
-            trade_date=trade_date,
-            period="1m",
-            account_key=target.account_key,
-            db=db,
-            user_id=target.user_id,
+    try:
+        with SessionLocal() as db:
+            return capture_intraday_symbols(
+                target.symbols,
+                trade_date=trade_date,
+                period="1m",
+                account_key=target.account_key,
+                db=db,
+                user_id=target.user_id,
+            )
+    except Exception as exc:
+        logger.warning(
+            "[qmt-market-sync] intraday capture failed user=%s account=%s symbols=%s trade_date=%s error=%s",
+            target.user_id,
+            target.account_key,
+            len(target.symbols),
+            trade_date,
+            exc,
         )
+        return {
+            "success": False,
+            "rows": 0,
+            "symbols": list(target.symbols),
+            "captured_symbols": [],
+            "missing_symbols": list(target.symbols),
+            "message": f"QMT盘中分钟线采集异常：{exc}"[:240],
+            "source": "qmt_intraday",
+            "error": str(exc)[:240],
+        }
 
 
 def _run_eod_sync(local_now: datetime, target: _MarketSyncTarget, *, stock_daily_result: dict[str, object] | None = None) -> None:
@@ -149,8 +179,12 @@ def _run_eod_sync(local_now: datetime, target: _MarketSyncTarget, *, stock_daily
         ) if latest_trade_date else {"updated": False, "records": 0}
         integrity = build_market_integrity_report(db, target_date=trade_date)
     stock_daily_result = stock_daily_result or _run_stock_daily_sync(local_now, target.symbols)
+    selection_refresh = _refresh_event_driven_selection_after_market_sync(
+        trigger="qmt-market-sync:eod",
+        user_id=target.user_id,
+    )
     logger.info(
-        "[qmt-market-sync] eod sync user=%s account=%s trade_date=%s intraday_rows=%s stock_daily_mode=%s stock_daily_records=%s index_daily_rows=%s cache_updated=%s integrity_tables=%s",
+        "[qmt-market-sync] eod sync user=%s account=%s trade_date=%s intraday_rows=%s stock_daily_mode=%s stock_daily_records=%s index_daily_rows=%s cache_updated=%s integrity_tables=%s selection_generated=%s selection_errors=%s",
         target.user_id,
         target.account_key,
         trade_date,
@@ -160,6 +194,8 @@ def _run_eod_sync(local_now: datetime, target: _MarketSyncTarget, *, stock_daily
         index_daily_result.get("rows", 0),
         cache_result.get("updated", False),
         ",".join(sorted((integrity.get("tables") or {}).keys())),
+        len(selection_refresh.get("generated") or []),
+        len(selection_refresh.get("errors") or []),
     )
 
 
@@ -181,8 +217,12 @@ def _run_repair_sync(local_now: datetime, target: _MarketSyncTarget, *, stock_da
         ) if latest_trade_date else {"updated": False, "records": 0}
         integrity = build_market_integrity_report(db, target_date=trade_date)
     stock_daily_result = stock_daily_result or _run_stock_daily_sync(local_now, target.symbols)
+    selection_refresh = _refresh_event_driven_selection_after_market_sync(
+        trigger="qmt-market-sync:repair",
+        user_id=target.user_id,
+    )
     logger.info(
-        "[qmt-market-sync] repair sync user=%s account=%s trade_date=%s stock_daily_mode=%s stock_daily_records=%s index_daily_rows=%s cache_updated=%s integrity_tables=%s",
+        "[qmt-market-sync] repair sync user=%s account=%s trade_date=%s stock_daily_mode=%s stock_daily_records=%s index_daily_rows=%s cache_updated=%s integrity_tables=%s selection_generated=%s selection_errors=%s",
         target.user_id,
         target.account_key,
         trade_date,
@@ -191,7 +231,102 @@ def _run_repair_sync(local_now: datetime, target: _MarketSyncTarget, *, stock_da
         index_daily_result.get("rows", 0),
         cache_result.get("updated", False),
         ",".join(sorted((integrity.get("tables") or {}).keys())),
+        len(selection_refresh.get("generated") or []),
+        len(selection_refresh.get("errors") or []),
     )
+
+
+def _refresh_event_driven_selection_after_intraday_capture(
+    *,
+    trigger: str,
+    user_id: str,
+    local_now: datetime,
+    capture_result: dict[str, object],
+) -> dict[str, object]:
+    if not _env_flag("AI_QUANT_INTRADAY_CAPTURE_REFRESH_SELECTION", "1"):
+        return {"status": "skipped", "reason": "disabled"}
+
+    interval_seconds = _env_int("AI_QUANT_INTRADAY_SELECTION_REFRESH_INTERVAL_SECONDS", 55)
+    last = _LAST_INTRADAY_SELECTION_REFRESH_AT.get(user_id)
+    if last is not None and (local_now - last) < timedelta(seconds=interval_seconds):
+        return {"status": "skipped", "reason": "debounced"}
+
+    capture_rows = int(capture_result.get("rows") or 0)
+    capture_success = bool(capture_result.get("success"))
+    try:
+        from api.services import catalyst_selection_service
+
+        payload = catalyst_selection_service.schedule_event_driven_selection_refresh(
+            trigger=trigger,
+            windows=("24h",),
+            limit=10,
+            user_id=user_id,
+            reason="intraday_capture" if capture_success and capture_rows > 0 else "qmt_no_success_rows",
+            context={
+                "capture_success": capture_success,
+                "capture_rows": capture_rows,
+                "source": "qmt_market_sync",
+            },
+        )
+    except Exception as exc:
+        logger.exception("[qmt-market-sync] intraday event-driven selection schedule failed trigger=%s user=%s", trigger, user_id)
+        return {
+            "status": "failed",
+            "reason": str(exc)[:240],
+            "generated_count": 0,
+            "error_count": 1,
+            "skipped": False,
+            "capture_success": capture_success,
+            "capture_rows": capture_rows,
+        }
+
+    _LAST_INTRADAY_SELECTION_REFRESH_AT[user_id] = local_now
+    scheduled_status = str(payload.get("status") or "scheduled")
+    if capture_success and capture_rows > 0:
+        status = scheduled_status
+        reason = None
+    else:
+        status = "fallback_running" if scheduled_status == "running" else "fallback_scheduled"
+        reason = "qmt_no_success_rows"
+    return {
+        "status": status,
+        "reason": reason,
+        "deduped": bool(payload.get("deduped")),
+        "scheduled": scheduled_status == "scheduled",
+        "generated_count": len(payload.get("generated") or []),
+        "error_count": len(payload.get("errors") or []),
+        "skipped": bool(payload.get("skipped")),
+        "capture_success": capture_success,
+        "capture_rows": capture_rows,
+        "window_count": len(payload.get("windows") or []),
+    }
+
+
+def _refresh_event_driven_selection_after_market_sync(
+    *,
+    trigger: str,
+    user_id: str,
+    windows: tuple[str, ...] = ("premarket", "24h"),
+) -> dict[str, object]:
+    try:
+        from api.services import catalyst_selection_service
+
+        with SessionLocal() as db:
+            return catalyst_selection_service.refresh_event_driven_selection(
+                db,
+                trigger=trigger,
+                windows=windows,
+                limit=10,
+                user_id=user_id,
+            )
+    except Exception as exc:
+        logger.exception("[qmt-market-sync] event-driven selection refresh failed trigger=%s user=%s", trigger, user_id)
+        return {
+            "trigger": trigger,
+            "generated": [],
+            "errors": [{"window": "premarket", "error": str(exc)}],
+            "skipped": False,
+        }
 
 
 def _run_stock_daily_sync(local_now: datetime, symbols: list[str]) -> dict[str, object]:
@@ -249,7 +384,7 @@ def _run_targeted_stock_daily_sync(trade_day: date, stock_codes: list[str]) -> d
         downloader = DataDownloader(db)
         for code in stock_codes[:200]:
             try:
-                result = asyncio.run(downloader.download_daily_kline(code, trade_day, trade_day, force=True))
+                result = run_async(downloader.download_daily_kline(code, trade_day, trade_day, force=True))
             except Exception as exc:
                 logger.warning("[qmt-market-sync] targeted stock daily sync failed symbol=%s error=%s", code, exc)
                 error_symbols += 1
@@ -365,6 +500,14 @@ def _is_trading_day(local_now: datetime) -> bool:
 def _is_trading_session(local_now: datetime) -> bool:
     current = local_now.time()
     return dtime(9, 30) <= current <= dtime(11, 30) or dtime(13, 0) <= current <= dtime(15, 0)
+
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.getenv(name, str(default))))
+    except Exception:
+        return default
 
 
 def _should_run_eod_sync(local_now: datetime, last_sync_date: date | None) -> bool:

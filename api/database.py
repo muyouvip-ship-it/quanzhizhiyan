@@ -11,6 +11,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 from api.core.env import load_project_env
+from api.core.utils import env_flag as _env_flag
 
 load_project_env()
 
@@ -87,9 +88,6 @@ Base = declarative_base()
 logger = logging.getLogger(__name__)
 _init_db_completed_for: str | None = None
 
-
-def _env_flag(name: str, default: str = "0") -> bool:
-    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def get_db() -> Generator[Session, None, None]:

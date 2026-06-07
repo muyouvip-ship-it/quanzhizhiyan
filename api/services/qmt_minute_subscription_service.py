@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 from datetime import datetime, timedelta, timezone, time as dtime
 
 from sqlalchemy import text
@@ -11,7 +12,8 @@ from api.database import SessionLocal
 from api.services.qmt_market_data_service import resolve_market_account_key
 from api.services import qmt_virtual_account_service, watchlist_service
 from api.services.qmt_realtime_minute_capture_service import capture_today_minute_bars
-from tradingagents.dataflows.trade_calendar import is_cn_trading_day
+from tradingagents.dataflows.trade_calendar import CN_TZ, is_cn_trading_day
+from api.core.utils import env_flag as _env_flag
 
 
 logger = logging.getLogger(__name__)
@@ -19,6 +21,7 @@ _TASK: asyncio.Task | None = None
 _STOP_EVENT: asyncio.Event | None = None
 _POLL_SECONDS = 60
 _CAPTURE_SCOPE_PREFIX = "intraday_capture:"
+_LAST_SELECTION_REFRESH_AT: datetime | None = None
 
 
 async def start_background_worker() -> None:
@@ -58,7 +61,7 @@ async def _run_loop() -> None:
 
 def _scan_and_run_once() -> None:
     now = datetime.now(timezone.utc)
-    local_now = now.astimezone()
+    local_now = now.astimezone(CN_TZ)
     if not _is_trading_day(local_now) or not _is_trading_session(local_now):
         return
     with SessionLocal() as db:
@@ -106,7 +109,7 @@ def _capture_single_config(db, row, now: datetime) -> None:
     account_key = str(resolve_market_account_key(db=db, user_id=str(row.user_id)) or "paper_sim").strip() or "paper_sim"
     symbols = _resolve_capture_symbols(db, str(row.user_id), row.default_symbols or [], account_key=account_key)
     scope_key = _capture_scope_key(symbols)
-    trade_date = now.astimezone().date().isoformat()
+    trade_date = now.astimezone(CN_TZ).date().isoformat()
     if not symbols:
         _touch_intraday_watermark(
             db,
@@ -146,13 +149,73 @@ def _capture_single_config(db, row, now: datetime) -> None:
         WHERE id = :config_id
     """), {"config_id": int(row.id)})
     db.commit()
+    selection_refresh = _refresh_realtime_selection_after_capture(
+        db,
+        user_id=str(row.user_id),
+        now=now,
+        capture_result=result,
+    )
     logger.info(
-        "[qmt-minute-subscription] config=%s symbols=%s rows=%s status=%s",
+        "[qmt-minute-subscription] config=%s symbols=%s rows=%s status=%s selection_refresh=%s",
         row.id,
         len(symbols),
         result.get("rows", 0),
         result.get("success"),
+        selection_refresh.get("status"),
     )
+
+
+def _refresh_realtime_selection_after_capture(
+    db,
+    *,
+    user_id: str,
+    now: datetime,
+    capture_result: dict[str, object],
+) -> dict[str, object]:
+    global _LAST_SELECTION_REFRESH_AT
+    if not _env_flag("AI_QUANT_MINUTE_CAPTURE_REFRESH_SELECTION", "1"):
+        return {"status": "skipped", "reason": "disabled"}
+    if not capture_result.get("success") or int(capture_result.get("rows") or 0) <= 0:
+        return {"status": "skipped", "reason": "no_success_rows"}
+    interval_seconds = _env_int("AI_QUANT_MINUTE_SELECTION_REFRESH_INTERVAL_SECONDS", 55)
+    if _LAST_SELECTION_REFRESH_AT is not None and (now - _LAST_SELECTION_REFRESH_AT) < timedelta(seconds=interval_seconds):
+        return {"status": "skipped", "reason": "debounced"}
+    try:
+        from api.services import catalyst_selection_service
+
+        capture_rows = int(capture_result.get("rows") or 0)
+        payload = catalyst_selection_service.schedule_event_driven_selection_refresh(
+            trigger="qmt-minute-subscription:intraday",
+            windows=("24h",),
+            limit=10,
+            user_id=user_id,
+            reason="minute_capture",
+            context={
+                "capture_success": bool(capture_result.get("success")),
+                "capture_rows": capture_rows,
+                "source": "qmt_minute_subscription",
+            },
+        )
+        _LAST_SELECTION_REFRESH_AT = now
+        status = str(payload.get("status") or "scheduled")
+        return {
+            "status": status,
+            "deduped": bool(payload.get("deduped")),
+            "scheduled": status == "scheduled",
+            "generated_count": len(payload.get("generated") or []),
+            "error_count": len(payload.get("errors") or []),
+            "skipped": bool(payload.get("skipped")),
+            "capture_success": True,
+            "capture_rows": capture_rows,
+            "window_count": len(payload.get("windows") or []),
+        }
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            logger.exception("[qmt-minute-subscription] rollback failed after catalyst refresh error")
+        logger.exception("[qmt-minute-subscription] realtime catalyst refresh failed user=%s", user_id)
+        return {"status": "failed", "reason": str(exc)}
 
 
 def _resolve_capture_symbols(db, user_id: str, configured_symbols: list[str], *, account_key: str) -> list[str]:
@@ -263,6 +326,14 @@ def _normalize_symbol(value: str) -> str:
         if text_value.startswith(("4", "8")):
             return f"{text_value}.BJ"
     return text_value
+
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.getenv(name, str(default))))
+    except Exception:
+        return default
 
 
 def _is_trading_day(local_now: datetime) -> bool:

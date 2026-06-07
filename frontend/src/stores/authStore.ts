@@ -3,11 +3,15 @@ import type { AuthUser } from '@/types'
 import { api } from '@/services/api'
 import { useAnalysisStore } from '@/stores/analysisStore'
 
+const DEV_ACCESS_TOKEN = (import.meta.env.VITE_TA_DEV_ACCESS_TOKEN as string) || 'dev-test-token-001'
+const DEV_USER_ID = (import.meta.env.VITE_TA_DEV_USER_ID as string) || 'test-user-001'
+const DEV_USER_EMAIL = (import.meta.env.VITE_TA_DEV_USER_EMAIL as string) || 'test@example.com'
+
 function createDevUser(): AuthUser {
     const now = new Date().toISOString()
     return {
-        id: 'test-user-001',
-        email: 'test@example.com',
+        id: DEV_USER_ID,
+        email: DEV_USER_EMAIL,
         created_at: now,
         last_login_at: now,
     }
@@ -57,14 +61,10 @@ export const useAuthStore = create<AuthState>((set) => ({
 
         // 开发模式下允许直接回退到本地测试用户，避免后端短暂不可用时整站卡死。
         if (!token) {
-            const devToken = 'dev-test-token-001'
-            const devUser = createDevUser()
+            token = DEV_ACCESS_TOKEN
             try {
-                localStorage.setItem('ta-access-token', devToken)
-                localStorage.setItem('ta-user', JSON.stringify(devUser))
+                localStorage.setItem('ta-access-token', token)
             } catch {}
-            set({ token: devToken, user: devUser, hydrated: true, loading: false })
-            return
         }
 
         set({ loading: true })

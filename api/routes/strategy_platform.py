@@ -3,20 +3,23 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Mapping
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from api.core.strategy_db import StrategySessionLocal, get_strategy_db
-from api.core.runtime_config import build_runtime_config
+from api.core.runtime_config import build_runtime_config, has_mixed_account_llm_runtime, llm_runtime_source_payload
 from api.database import UserDB, get_db
 from api.deps import optional_web_user
 from api.models.strategy_models import PaperAccountDB, PaperOrderDB, TradeRecordDB
@@ -49,9 +52,26 @@ from api.services.strategy_platform_repository import (
     update_platform_evolution_candidate_status,
     update_platform_strategy_metrics,
 )
+from tradingagents.llm_clients.factory import create_llm_client
 
 
 router = APIRouter(tags=["Strategy Platform"])
+_REMOTE_LLM_PROVIDERS_REQUIRING_KEY = {
+    "openai",
+    "anthropic",
+    "google",
+    "xai",
+    "openrouter",
+    "volcengine",
+    "volcengine-ark",
+    "ark",
+    "dashscope",
+    "deepseek",
+    "moonshot",
+    "zhipu",
+    "siliconflow",
+}
+_STRATEGY_DRAFT_LLM_TIMEOUT_SECONDS = float(os.getenv("STRATEGY_DRAFT_LLM_TIMEOUT_SECONDS", "60"))
 
 
 StrategyType = Literal["selection", "trading", "risk", "portfolio"]
@@ -963,19 +983,268 @@ def _get_strategy_template(template_id: str) -> StrategyTemplateDefinition | Non
     return next((item for item in _strategy_templates() if item.id == template_id), None)
 
 
-def _strategy_llm_runtime_payload(current_user: UserDB | None, db: Session | None) -> dict[str, Any]:
-    runtime_config = build_runtime_config({}, user_id=current_user.id if current_user else None, db=db)
+def _strategy_runtime_config(current_user: UserDB | None, db: Session | None) -> dict[str, Any]:
+    return build_runtime_config({}, user_id=current_user.id if current_user else None, db=db)
+
+
+def _strategy_llm_model(runtime_config: dict[str, Any]) -> str:
+    return str(runtime_config.get("deep_think_llm") or runtime_config.get("quick_think_llm") or "").strip()
+
+
+def _is_local_strategy_llm(provider: str, base_url: str | None) -> bool:
+    if str(provider or "").strip().lower() == "ollama":
+        return True
+    value = str(base_url or "").strip()
+    if not value:
+        return False
+    hostname = (urlparse(value).hostname or "").lower()
+    return hostname in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+
+
+def _strategy_llm_status(runtime_config: dict[str, Any], *, current_user: UserDB | None) -> tuple[bool, str, str]:
+    provider = str(runtime_config.get("llm_provider") or "").strip().lower()
+    model = _strategy_llm_model(runtime_config)
+    base_url = str(runtime_config.get("backend_url") or "").strip()
+    has_api_key = bool(str(runtime_config.get("api_key") or "").strip())
+    if current_user is None:
+        return False, "not_authenticated", "未登录用户不调用服务端默认 LLM，只返回本地模板草案。"
+    if has_mixed_account_llm_runtime(runtime_config):
+        return False, "mixed_runtime_rejected", "账号 LLM 字段未形成同源运行包；provider、Base URL、模型和 Key 必须来自同一套账号配置。"
+    if not provider or not model:
+        return False, "missing_model", "设置页缺少 provider 或模型名。"
+    if _is_local_strategy_llm(provider, base_url):
+        return False, "local_rejected", "策略草案要求使用远程 LLM，当前本地模型配置被拒绝。"
+    if provider in _REMOTE_LLM_PROVIDERS_REQUIRING_KEY and not has_api_key:
+        return False, "missing_api_key", "远程 LLM 缺少 API Key。"
+    return True, "ready", "完整远程 LLM 配置可用。"
+
+
+def _strategy_llm_runtime_payload(
+    current_user: UserDB | None,
+    db: Session | None,
+    *,
+    runtime_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    runtime_config = runtime_config or _strategy_runtime_config(current_user, db)
+    ready, status, reason = _strategy_llm_status(runtime_config, current_user=current_user)
+    runtime_sources = llm_runtime_source_payload(runtime_config)
     return {
         "shared_with_settings": True,
         "source": "user_settings" if current_user else "server_default",
+        "ready": ready,
+        "status": status,
+        "reason": reason,
+        "used": False,
         "llm_provider": runtime_config.get("llm_provider") or "",
         "quick_think_llm": runtime_config.get("quick_think_llm") or "",
         "deep_think_llm": runtime_config.get("deep_think_llm") or "",
         "backend_url": runtime_config.get("backend_url") or "",
         "has_api_key": bool(runtime_config.get("api_key")),
+        "api_key_source": runtime_sources.get("api_key_source"),
+        "provider_source": runtime_sources.get("provider_source"),
+        "base_url_source": runtime_sources.get("base_url_source"),
+        "model_source": runtime_sources.get("model_source"),
+        "runtime_package_source": runtime_sources.get("runtime_package_source"),
+        "account_runtime_sources": runtime_sources.get("account_runtime_sources"),
+        "mixed_account_runtime": runtime_sources.get("mixed_account_runtime"),
+        "force_skipped": runtime_config.get("_llm_runtime_force_skipped"),
+        "forced": bool(runtime_config.get("_llm_runtime_forced")),
         "structured_outputs": True,
         "schema_name": "StrategyDslSchema",
     }
+
+
+_STRATEGY_DRAFT_SYSTEM_PROMPT = """你是A股量化策略 DSL 生成器。根据用户意图生成可编译的策略草案。
+
+要求：
+1. 只输出 JSON，不要 Markdown。
+2. JSON 字段必须包含 name、strategy_type、intent_summary、pending_confirmations、data_dependencies、risk_notes、dsl、explanation。
+3. strategy_type 只能是 selection、trading、risk、portfolio。
+4. dsl 必须符合 StrategyDsl：schema_version、strategy_type、universe、factor_model、entry、exit、position、risk、execution、evolution。
+5. A股执行约束必须保守：exclude_st=true、exclude_suspended=true、lot_size=100、禁止全市场分钟线预加载。
+6. factor_model.factors 至少 3 个，字段优先使用 net_profit_growth_yoy、money_flow_strength_20d、momentum_60d、volatility_20d、turnover_rate、amount。
+7. 如果用户只要选股，entry.conditions 和 exit.conditions 返回空数组。
+8. 不要编造未来收益、未来涨跌幅或任何未来函数字段。
+9. pending_confirmations 用于记录你做出的必要假设。"""
+
+
+def _safe_strategy_llm_error(exc: Exception, runtime_config: dict[str, Any]) -> str:
+    message = str(exc) or exc.__class__.__name__
+    api_key = str(runtime_config.get("api_key") or "").strip()
+    if api_key:
+        message = message.replace(api_key, "***")
+    return message[:500]
+
+
+def _parse_strategy_llm_json(raw: str) -> dict[str, Any] | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        pass
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _strategy_type_from_request(prompt: str, requested: StrategyType | None) -> StrategyType:
+    if requested:
+        return requested
+    if "交易" in prompt and "选股" not in prompt:
+        return "trading"
+    if "选股" in prompt and "交易" not in prompt and "波段" not in prompt:
+        return "selection"
+    return "portfolio"
+
+
+def _string_list(value: Any, *, limit: int = 8) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if text:
+            result.append(text[:240])
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _coerce_confirmations(value: Any) -> list[StrategyDraftConfirmation]:
+    if not isinstance(value, list):
+        return []
+    items: list[StrategyDraftConfirmation] = []
+    for row in value[:8]:
+        if not isinstance(row, Mapping):
+            continue
+        field = str(row.get("field") or row.get("kind") or "假设").strip()
+        assumed_as = str(row.get("assumed_as") or row.get("value") or "待确认").strip()
+        reason = str(row.get("reason") or row.get("message") or "LLM 生成草案时做出的假设。").strip()
+        if field and assumed_as and reason:
+            items.append(StrategyDraftConfirmation(field=field[:80], assumed_as=assumed_as[:160], reason=reason[:240]))
+    return items
+
+
+def _merge_strategy_dsl_defaults(raw_dsl: Any, strategy_type: StrategyType) -> StrategyDsl:
+    default_payload = _default_dsl(strategy_type).model_dump()
+    payload = deepcopy(default_payload)
+    if isinstance(raw_dsl, Mapping):
+        for key in StrategyDsl.model_fields:
+            if key not in raw_dsl:
+                continue
+            value = raw_dsl[key]
+            if isinstance(value, Mapping) and isinstance(payload.get(key), dict):
+                merged = dict(payload[key])
+                merged.update(dict(value))
+                payload[key] = merged
+            elif value is not None:
+                payload[key] = value
+    payload["schema_version"] = "1.0"
+    payload["strategy_type"] = strategy_type
+    if not ((payload.get("factor_model") or {}).get("factors")):
+        payload["factor_model"] = default_payload["factor_model"]
+    if not isinstance(payload.get("execution"), dict):
+        payload["execution"] = default_payload["execution"]
+    execution = payload.setdefault("execution", {})
+    data_engine = execution.setdefault("data_engine", {})
+    if isinstance(data_engine, dict):
+        data_engine.setdefault("filter", "duckdb")
+        data_engine.setdefault("factor_compute", "polars")
+    minute_loading = execution.setdefault("minute_loading", {})
+    if isinstance(minute_loading, dict):
+        minute_loading.setdefault("mode", "lazy_by_watchlist")
+        minute_loading["forbid_full_market_preload"] = True
+    execution.setdefault("market", "A_SHARE")
+    execution.setdefault("lot_size", 100)
+    if strategy_type == "selection":
+        payload["entry"] = {"logic": "all", "conditions": []}
+        payload["exit"] = {"logic": "any", "conditions": []}
+    return StrategyDsl.model_validate(payload)
+
+
+def _build_strategy_draft_response(
+    payload: Mapping[str, Any] | None,
+    *,
+    prompt: str,
+    strategy_type: StrategyType,
+    llm_runtime: dict[str, Any],
+    llm_used: bool,
+) -> StrategyDraftResponse:
+    payload = payload or {}
+    selected_type = strategy_type
+    dsl = _merge_strategy_dsl_defaults(payload.get("dsl"), selected_type)
+    compiled = compile_strategy_dsl(dsl.model_dump())
+    type_label = {
+        "selection": "选股",
+        "trading": "交易",
+        "risk": "风控",
+        "portfolio": "组合",
+    }.get(selected_type, "组合")
+    fallback_name = f"{prompt[:16].strip() or 'AI量化'}{type_label}策略"
+    explanation = str(payload.get("explanation") or "").strip()
+    if not explanation:
+        explanation = "已按设置页远程 LLM 生成策略 DSL。" if llm_used else "LLM 未使用，已返回规则模板 DSL。"
+    return StrategyDraftResponse(
+        name=str(payload.get("name") or fallback_name).strip()[:80],
+        strategy_type=selected_type,
+        intent_summary=str(payload.get("intent_summary") or f"根据用户输入生成{type_label}策略草案。").strip()[:500],
+        pending_confirmations=_coerce_confirmations(payload.get("pending_confirmations")),
+        data_dependencies=_string_list(payload.get("data_dependencies"), limit=12) or [
+            f"{preferred_daily_kline_table()}.close",
+            f"{preferred_daily_kline_table()}.volume",
+            f"{preferred_daily_kline_table()}.float_market_cap",
+            f"{preferred_daily_kline_table()}.net_profit_ttm",
+            f"{preferred_minute_kline_table()}.30m",
+        ],
+        risk_notes=_string_list(payload.get("risk_notes"), limit=10) or [
+            "候选策略进入纸交易前必须通过样本外验证。",
+            "分钟线只按 Watchlist 懒加载，避免全市场分钟数据 OOM。",
+        ],
+        dsl=dsl,
+        explanation=explanation[:800],
+        structured_output_schema=StrategyDslSchema.model_json_schema(),
+        compile_report=compiled.to_response_payload(),
+        llm_runtime={**llm_runtime, "used": llm_used, "status": "used" if llm_used else llm_runtime.get("status")},
+    )
+
+
+def _invoke_strategy_draft_llm(runtime_config: dict[str, Any], *, prompt: str, strategy_type: StrategyType) -> dict[str, Any]:
+    provider = str(runtime_config.get("llm_provider") or "").strip().lower()
+    model = _strategy_llm_model(runtime_config)
+    base_url = str(runtime_config.get("backend_url") or "").strip() or None
+    client_kwargs: dict[str, Any] = {"timeout": _STRATEGY_DRAFT_LLM_TIMEOUT_SECONDS}
+    api_key = str(runtime_config.get("api_key") or "").strip()
+    if api_key:
+        client_kwargs["api_key"] = api_key
+    client = create_llm_client(provider=provider, model=model, base_url=base_url, **client_kwargs)
+    context = {
+        "user_prompt": prompt,
+        "requested_strategy_type": strategy_type,
+        "daily_table": preferred_daily_kline_table(),
+        "minute_table": preferred_minute_kline_table(),
+        "default_dsl_template": _default_dsl(strategy_type).model_dump(),
+        "json_schema": StrategyDslSchema.model_json_schema(),
+    }
+    result = client.get_llm().invoke(
+        [
+            SystemMessage(content=_STRATEGY_DRAFT_SYSTEM_PROMPT),
+            HumanMessage(content=json.dumps(context, ensure_ascii=False)),
+        ]
+    )
+    parsed = _parse_strategy_llm_json(str(getattr(result, "content", "") or ""))
+    if not parsed:
+        raise ValueError("LLM 策略草案返回值不是有效 JSON。")
+    return parsed
 
 
 def _detail_response(
@@ -1487,62 +1756,31 @@ async def create_llm_strategy_draft(
     current_user: UserDB | None = Depends(optional_web_user),
 ):
     prompt = request.prompt.strip()
-    llm_runtime = _strategy_llm_runtime_payload(current_user, main_db)
-    requested_strategy_type: StrategyType = request.strategy_type or "portfolio"
-    dsl = _default_dsl(requested_strategy_type)
-    if request.strategy_type is None and "交易" in prompt and "选股" not in prompt:
-        dsl.strategy_type = "trading"
-    elif request.strategy_type is None and "选股" in prompt and "交易" not in prompt and "波段" not in prompt:
-        dsl.strategy_type = "selection"
-    if dsl.strategy_type == "selection":
-        dsl.entry = {**(dsl.entry or {}), "conditions": []}
-        dsl.exit = {**(dsl.exit or {}), "conditions": []}
-    compiled = compile_strategy_dsl(dsl.model_dump())
+    requested_strategy_type = _strategy_type_from_request(prompt, request.strategy_type)
+    runtime_config = _strategy_runtime_config(current_user, main_db)
+    llm_runtime = _strategy_llm_runtime_payload(current_user, main_db, runtime_config=runtime_config)
 
-    strategy_type_names = {
-        "selection": "选股",
-        "trading": "交易",
-        "risk": "风控",
-        "portfolio": "组合",
-    }
-    selected_type_label = strategy_type_names.get(dsl.strategy_type, "组合")
-
-    return StrategyDraftResponse(
-        name=f"算力业绩高增{selected_type_label}策略",
-        strategy_type=dsl.strategy_type,
-        intent_summary=(
-            "筛选算力相关板块中，流通市值 100-200 亿且业绩高速增长的股票。"
-            if dsl.strategy_type == "selection"
-            else "筛选算力相关板块中，流通市值 100-200 亿且业绩高速增长的股票，并用多周期波段信号交易。"
-        ),
-        pending_confirmations=[
-            StrategyDraftConfirmation(
-                field="资金",
-                assumed_as="float_market_cap",
-                reason="用户描述为 100 亿到 200 亿，更接近市值区间；如需成交额或主力资金可再确认。",
+    llm_payload: dict[str, Any] | None = None
+    if llm_runtime.get("ready"):
+        try:
+            llm_payload = await asyncio.to_thread(
+                _invoke_strategy_draft_llm,
+                runtime_config,
+                prompt=prompt,
+                strategy_type=requested_strategy_type,
             )
-        ],
-        data_dependencies=[
-            f"{preferred_daily_kline_table()}.close",
-            f"{preferred_daily_kline_table()}.volume",
-            f"{preferred_daily_kline_table()}.float_market_cap",
-            f"{preferred_daily_kline_table()}.net_profit_ttm",
-            "concept_membership",
-            f"{preferred_minute_kline_table()}.30m",
-        ],
-        risk_notes=[
-            "分钟线只按 Watchlist 懒加载，避免全市场分钟数据 OOM。",
-            "候选策略进入纸交易前必须通过样本外验证。",
-            "进化建议只生成草案，必须用户确认后才激活。",
-        ],
-        dsl=dsl,
-        explanation=(
-            "已按 Pydantic JSON Schema 生成可解释 DSL：DuckDB 负责 Parquet 裁剪，"
-            "Polars 负责编译后的因子计算和横截面排名。策略/回测 LLM 使用设置页的模型配置。"
-        ),
-        structured_output_schema=StrategyDslSchema.model_json_schema(),
-        compile_report=compiled.to_response_payload(),
+            llm_runtime["model_used"] = _strategy_llm_model(runtime_config)
+        except Exception as exc:
+            llm_runtime["status"] = "failed"
+            llm_runtime["reason"] = "远程 LLM 策略草案生成失败，已使用规则模板兜底。"
+            llm_runtime["error"] = _safe_strategy_llm_error(exc, runtime_config)
+
+    return _build_strategy_draft_response(
+        llm_payload,
+        prompt=prompt,
+        strategy_type=requested_strategy_type,
         llm_runtime=llm_runtime,
+        llm_used=llm_payload is not None,
     )
 
 

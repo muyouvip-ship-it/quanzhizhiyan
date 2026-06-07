@@ -16,6 +16,7 @@ import {
     ShieldCheck,
     Radio,
     LineChart,
+    Radar,
 } from 'lucide-react'
 
 export interface SidebarNavItem {
@@ -27,6 +28,7 @@ export interface SidebarNavItem {
 export const navItems: SidebarNavItem[] = [
     { path: '/', icon: LayoutDashboard, label: '控制台' },
     { path: '/news-eye', icon: Newspaper, label: '资讯之眼' },
+    { path: '/catalyst-selection', icon: Radar, label: '催化选股' },
     { path: '/stock-market', icon: LineChart, label: '股票市场' },
     { path: '/analysis', icon: Activity, label: '智能分析' },
     { path: '/reports', icon: FileText, label: '历史报告' },

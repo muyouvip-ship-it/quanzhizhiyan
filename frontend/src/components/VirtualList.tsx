@@ -124,7 +124,7 @@ function VirtualRow({
     const observer = new ResizeObserver(measure)
     observer.observe(node)
     return () => observer.disconnect()
-  }, [children, index, onSize])
+  }, [index, onSize])
 
   return (
     <div

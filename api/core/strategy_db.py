@@ -56,7 +56,11 @@ class _LazyStrategyEngineProxy:
     def __repr__(self) -> str:
         try:
             return repr(self._engine())
-        except Exception:
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Strategy engine not yet resolved: %s", exc
+            )
             return "<LazyStrategyEngineProxy unresolved>"
 
 

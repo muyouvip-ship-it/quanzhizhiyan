@@ -12,6 +12,7 @@ from uuid import uuid4
 from sqlalchemy import bindparam, inspect, text
 
 from api.database import SessionLocal, engine
+from api.core.utils import safe_float as _safe_float
 
 
 logger = logging.getLogger(__name__)
@@ -1528,13 +1529,6 @@ def _normalize_symbols(values: list[str]) -> list[str]:
     return sorted(set(result))
 
 
-def _safe_float(value: Any) -> float | None:
-    if value is None or value == "":
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def _safe_text(value: Any) -> str | None:

@@ -62,8 +62,11 @@ class Settings:
                         })
                     if normalized:
                         return normalized
-            except Exception:
-                pass
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Failed to parse QMT_ACCOUNTS_JSON, falling back to single-account config: %s", exc
+                )
         return [{
             "key": self.qmt_default_account_key or "qmt_default",
             "enabled": self.qmt_enabled,

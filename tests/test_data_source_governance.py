@@ -1,6 +1,8 @@
 from api.services.data_source_governance import (
     build_backtest_governance,
+    build_market_overview_governance,
     describe_sources,
+    list_news_source_links,
     list_surface_registry,
     list_registered_sources,
     split_source_values,
@@ -57,3 +59,38 @@ def test_surface_registry_exposes_page_to_source_mapping():
     assert realtime["route"] == "/realtime"
     assert "qmt" in realtime["source_keys"]
     assert any(source["key"] == "realtime_event_stream" for source in realtime["sources"])
+
+
+def test_news_source_links_expose_fetch_names_and_urls():
+    sources = list_news_source_links()
+    names = {item["name"] for item in sources}
+    assert "财联社电报" in names
+    assert "东方财富全球快讯" in names
+    assert all(item["url"].startswith("https://") for item in sources)
+
+
+def test_market_overview_governance_includes_market_stats_source():
+    payload = build_market_overview_governance(
+        {
+            "source": "qmt_realtime+postgresql_fallback",
+            "updated_at": "2026-05-26T10:00:00Z",
+            "indices": [{"source": "qmt_realtime"}],
+            "top_gainers": [{"source": "postgresql:stock_daily_kline"}],
+            "top_losers": [],
+            "sector_gainers": [],
+            "sector_losers": [],
+            "sector_fund_inflows": [],
+            "sector_fund_outflows": [],
+            "market_stats": {
+                "source": "postgresql:stock_daily_kline",
+                "up_count": 3100,
+                "down_count": 1800,
+                "total_amount": 2_200_000_000_000,
+            },
+        }
+    )
+
+    labels = [item["label"] for item in payload["items"]]
+    assert "市场宽度与成交额" in labels
+    stats_item = next(item for item in payload["items"] if item["label"] == "市场宽度与成交额")
+    assert stats_item["value"] == "postgresql:stock_daily_kline"

@@ -211,6 +211,44 @@ _SURFACE_REGISTRY: list[dict[str, Any]] = [
     },
 ]
 
+_NEWS_SOURCE_LINKS: tuple[dict[str, str], ...] = (
+    {
+        "key": "stock_info_global_cls",
+        "name": "财联社电报",
+        "url": "https://www.cls.cn/telegraph",
+    },
+    {
+        "key": "stock_info_global_em",
+        "name": "东方财富全球快讯",
+        "url": "https://kuaixun.eastmoney.com/7_24.html",
+    },
+    {
+        "key": "stock_info_cjzc_em",
+        "name": "东方财富财经早餐",
+        "url": "https://stock.eastmoney.com/a/czpnc.html",
+    },
+    {
+        "key": "stock_info_global_sina",
+        "name": "新浪7x24",
+        "url": "https://finance.sina.com.cn/7x24",
+    },
+    {
+        "key": "stock_info_global_futu",
+        "name": "富途快讯",
+        "url": "https://news.futunn.com/main/live",
+    },
+    {
+        "key": "stock_info_global_ths",
+        "name": "同花顺全球直播",
+        "url": "https://news.10jqka.com.cn/realtimenews.html",
+    },
+    {
+        "key": "stock_news_em",
+        "name": "东方财富个股新闻",
+        "url": "https://so.eastmoney.com/news/s?keyword=000001",
+    },
+)
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -348,6 +386,10 @@ def list_surface_registry() -> list[dict[str, Any]]:
     return items
 
 
+def list_news_source_links() -> list[dict[str, str]]:
+    return [dict(item) for item in _NEWS_SOURCE_LINKS]
+
+
 def build_virtual_warehouse_governance(payload: Mapping[str, Any]) -> dict[str, Any]:
     connection = dict(payload.get("connection") or {})
     background_refresh = dict(payload.get("background_refresh") or {})
@@ -433,14 +475,20 @@ def build_market_overview_governance(payload: Mapping[str, Any]) -> dict[str, An
         *(payload.get("sector_fund_inflows") or []),
         *(payload.get("sector_fund_outflows") or []),
     ]
+    market_stats = dict(payload.get("market_stats") or {})
     index_sources = _unique_strings(item.get("source") for item in indices if isinstance(item, Mapping))
     ranking_sources = _unique_strings(item.get("source") for item in [*top_gainers, *top_losers] if isinstance(item, Mapping))
     sector_sources = _unique_strings(item.get("source") for item in sector_items if isinstance(item, Mapping))
+    stats_source = str(market_stats.get("source") or "--")
     fallback = bool(payload.get("fallback", False))
     updated_at = str(payload.get("updated_at") or "")
     warnings = []
     if fallback:
         warnings.append("当前市场页已经进入 fallback 链路，指数、个股榜单与板块来源可能不同步。")
+    if not market_stats.get("total_amount") and not market_stats.get("index_turnover_amount"):
+        warnings.append("市场宽度缺少两市成交额，主线强弱和流动性判断会降级。")
+    if market_stats.get("up_count") is None or market_stats.get("down_count") is None:
+        warnings.append("市场宽度缺少涨跌家数，赚钱效应判断会降级。")
     return build_governance_payload(
         domain="stock_market",
         title="数据源治理",
@@ -471,6 +519,12 @@ def build_market_overview_governance(payload: Mapping[str, Any]) -> dict[str, An
                 tone="info" if sector_sources else "neutral",
             ),
             build_item(
+                "市场宽度与成交额",
+                stats_source,
+                "两市成交额、涨跌家数和涨跌停统计由日线库聚合，用于判断主线是否得到盘面确认。",
+                tone="good" if stats_source != "--" else "warn",
+            ),
+            build_item(
                 "页面更新时间",
                 updated_at or "--",
                 "这是市场总览接口更新时间，不保证所有子模块完全同频。",
@@ -478,7 +532,7 @@ def build_market_overview_governance(payload: Mapping[str, Any]) -> dict[str, An
             ),
         ],
         warnings=warnings,
-        source_values=[payload.get("source"), index_sources, ranking_sources, sector_sources],
+        source_values=[payload.get("source"), index_sources, ranking_sources, sector_sources, stats_source],
         updated_at=updated_at or None,
     )
 

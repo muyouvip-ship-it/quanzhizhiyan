@@ -4,6 +4,7 @@
 """
 
 import logging
+import os
 from typing import Dict, Any, Optional
 from datetime import date
 from enum import Enum
@@ -192,8 +193,8 @@ class DualDataSourceManager:
 # 使用示例
 if __name__ == '__main__':
     # 配置
-    API_KEY = '2HUTNZYOSRA8X5Z7TY2VZGKNTX5UN28B'
-    HID = '1ad9e296ad8d3816b9bce5cba86b1ff6'
+    API_KEY = os.getenv('QUANTCLASS_API_KEY', '')
+    HID = os.getenv('QUANTCLASS_HID', '')
     
     # 创建管理器
     manager = DualDataSourceManager(API_KEY, HID)

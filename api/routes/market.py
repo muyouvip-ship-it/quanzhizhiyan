@@ -22,7 +22,8 @@ from api.services.qmt_market_data_service import (
     get_index_presets,
 )
 from api.services.data_source_governance import build_market_overview_governance
-from api.services.market_data_pipeline_service import preferred_daily_kline_table
+from api.services.daily_review_market_behavior import interpret_market_behavior
+from api.services.market_data_pipeline_service import preferred_daily_kline_table, preferred_minute_kline_table
 
 router = APIRouter(prefix="/v1/market", tags=["Market"])
 
@@ -144,25 +145,32 @@ def get_kline(
 def get_intraday(
     symbol: str,
     trade_date: str,
-    period: str = Query("1m", pattern="^1m$"),
+    period: str = Query("1m", pattern="^(1m|5m|15m|30m|60m)$"),
     include_latest_quote: bool = Query(True),
+    lookback_sessions: int = Query(1, ge=1, le=60),
     db: Session = Depends(get_db),
     current_user=Depends(optional_web_user),
 ):
     normalized = normalize_symbol(symbol)
     user_id = str(current_user.id) if current_user is not None else None
-    payload = _fetch_intraday_bars_compat(
+    if lookback_sessions > 1:
+        return _load_intraday_history_payload(
+            normalized,
+            trade_date=trade_date,
+            period=period,
+            include_latest_quote=include_latest_quote,
+            lookback_sessions=lookback_sessions,
+            db=db,
+            user_id=user_id,
+        )
+    return _load_intraday_payload_with_fallback(
         normalized,
         trade_date=trade_date,
         period=period,
         include_latest_quote=include_latest_quote,
-        account_key=None,
-        persist=True,
-        quote_timeout_seconds=FAST_INTRADAY_QUOTE_TIMEOUT_SECONDS,
         db=db,
         user_id=user_id,
     )
-    return payload
 
 
 @router.get("/quote")
@@ -208,6 +216,20 @@ def get_market_overview(
     top_gainers, top_losers = _load_stock_rankings(db, limit=limit)
     sector_gainers, sector_losers = _load_sector_rankings(db, limit=limit)
     sector_fund_inflows, sector_fund_outflows = _load_sector_fund_flow(limit=limit)
+    market_stats = _load_market_stats(db)
+    index_turnover = _index_turnover_amount(indices)
+    if index_turnover is not None:
+        market_stats["index_turnover_amount"] = round(index_turnover, 2)
+    market_behavior_labels = interpret_market_behavior(
+        {
+            "indices": indices,
+            "sector_gainers": sector_gainers,
+            "sector_losers": sector_losers,
+            "sector_inflows": sector_fund_inflows,
+            "sector_outflows": sector_fund_outflows,
+            "market_stats": market_stats,
+        }
+    )
     payload = {
         "indices": indices,
         "top_gainers": top_gainers,
@@ -216,6 +238,8 @@ def get_market_overview(
         "sector_losers": sector_losers,
         "sector_fund_inflows": sector_fund_inflows,
         "sector_fund_outflows": sector_fund_outflows,
+        "market_stats": market_stats,
+        "market_behavior_labels": market_behavior_labels,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "source": "qmt_realtime+postgresql_fallback",
         "fallback": not bool(quote_map),
@@ -235,8 +259,71 @@ def get_market_integrity_report(
 
 
 @router.get("/kline/chanlun")
-def get_chanlun_overlay(symbol: str, start_date: str, end_date: str, db: Session = Depends(get_db)):
+def get_chanlun_overlay(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    period: str = Query("daily", pattern="^(daily|1m|5m|15m|30m|60m)$"),
+    lookback_sessions: int = Query(1, ge=1, le=60),
+    db: Session = Depends(get_db),
+    current_user=Depends(optional_web_user),
+):
     normalized = normalize_symbol(symbol)
+    user_id = str(current_user.id) if current_user is not None else None
+    if period != "daily":
+        payload = (
+            _load_intraday_history_payload(
+                normalized,
+                trade_date=end_date,
+                period=period,
+                include_latest_quote=False,
+                lookback_sessions=lookback_sessions,
+                db=db,
+                user_id=user_id,
+            )
+            if lookback_sessions > 1
+            else _load_intraday_payload_with_fallback(
+                normalized,
+                trade_date=end_date,
+                period=period,
+                include_latest_quote=False,
+                db=db,
+                user_id=user_id,
+            )
+        )
+        candles = []
+        for item in payload.get("items") or []:
+            open_price = _to_float(item.get("open"))
+            high = _to_float(item.get("high"))
+            low = _to_float(item.get("low"))
+            close = _to_float(item.get("close"))
+            trade_time = str(item.get("trade_time") or "")
+            if not trade_time or open_price is None or high is None or low is None or close is None:
+                continue
+            candles.append(
+                {
+                    "date": trade_time,
+                    "open": open_price,
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                    "pre_close": None,
+                }
+            )
+        overlay = _calculate_chanlun_overlay(candles)
+        overlay.update(
+            {
+                "symbol": normalized,
+                "start_date": payload.get("start_trade_date") or payload.get("trade_date") or start_date,
+                "end_date": payload.get("end_trade_date") or payload.get("trade_date") or end_date,
+                "requested_trade_date": payload.get("requested_trade_date"),
+                "period": period,
+                "source": payload.get("source") or "intraday",
+                "message": None if len(candles) >= 10 else "分时K线数量不足，缠论指标仅显示可确认部分。",
+            }
+        )
+        return overlay
+
     code = normalized.split(".", 1)[0]
     index_codes = {item["code"] for item in INDEX_PRESETS}
     is_index = normalized in {item["symbol"] for item in INDEX_PRESETS} or code in index_codes
@@ -268,6 +355,7 @@ def get_chanlun_overlay(symbol: str, start_date: str, end_date: str, db: Session
             "symbol": normalized,
             "start_date": start_date,
             "end_date": end_date,
+            "period": "daily",
             "source": "postgresql_daily",
             "message": None if len(candles) >= 10 else "K线数量不足，缠论指标仅显示可确认部分。",
         }
@@ -360,6 +448,334 @@ def _fetch_realtime_quotes_compat(
         except TypeError:
             parsed = fetch_realtime_quotes(symbols)
     return parsed if isinstance(parsed, dict) else {}
+
+def _aggregate_intraday_bars(items: list[dict[str, Any]], period: str) -> list[dict[str, Any]]:
+    """Aggregate 1-minute bars into higher-period bars (5m/15m/30m/60m).
+
+    Groups 1m bars by trading-minute sequence and computes OHLCV for each bucket.
+    """
+    if period == "1m" or not items:
+        return items
+
+    minutes = {"5m": 5, "15m": 15, "30m": 30, "60m": 60}.get(period)
+    if not minutes:
+        return items
+
+    parsed_items: list[tuple[str, datetime, dict[str, Any]]] = []
+    for bar in items:
+        trade_time = str(bar.get("trade_time") or "")
+        if not trade_time:
+            continue
+        try:
+            parsed_time = datetime.fromisoformat(trade_time.replace(" ", "T").replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        parsed_items.append((parsed_time.date().isoformat(), parsed_time, bar))
+
+    parsed_items.sort(key=lambda item: (item[0], item[1]))
+    aggregated: list[dict[str, Any]] = []
+    bucket: list[tuple[str, datetime, dict[str, Any]]] = []
+    current_day: str | None = None
+
+    def flush_bucket() -> None:
+        nonlocal bucket
+        if not bucket:
+            return
+        valid_bars = [
+            item
+            for item in bucket
+            if _to_float(item[2].get("open")) is not None
+            and _to_float(item[2].get("high")) is not None
+            and _to_float(item[2].get("low")) is not None
+            and _to_float(item[2].get("close")) is not None
+        ]
+        if not valid_bars:
+            bucket = []
+            return
+        _, end_time, end_bar = valid_bars[-1]
+        first_bar = valid_bars[0][2]
+        high_values = [_to_float(item[2].get("high")) for item in valid_bars]
+        low_values = [_to_float(item[2].get("low")) for item in valid_bars]
+        aggregated.append(
+            {
+                "symbol": end_bar.get("symbol") or first_bar.get("symbol"),
+                "trade_time": end_time.isoformat(timespec="seconds"),
+                "open": _to_float(first_bar.get("open")),
+                "high": max(value for value in high_values if value is not None),
+                "low": min(value for value in low_values if value is not None),
+                "close": _to_float(end_bar.get("close")),
+                "volume": sum(float(item[2].get("volume") or 0) for item in valid_bars),
+                "amount": sum(float(item[2].get("amount") or 0) for item in valid_bars),
+            }
+        )
+        bucket = []
+
+    for trade_day, parsed_time, bar in parsed_items:
+        if current_day is not None and trade_day != current_day:
+            flush_bucket()
+        current_day = trade_day
+        bucket.append((trade_day, parsed_time, bar))
+        if len(bucket) >= minutes:
+            flush_bucket()
+    flush_bucket()
+
+    return aggregated
+
+
+def _load_intraday_payload_with_fallback(
+    symbol: str,
+    *,
+    trade_date: str,
+    period: str,
+    include_latest_quote: bool,
+    db: Session,
+    user_id: str | None,
+) -> dict[str, Any]:
+    fetch_period = "1m"
+    payload = _fetch_intraday_bars_compat(
+        symbol,
+        trade_date=trade_date,
+        period=fetch_period,
+        include_latest_quote=include_latest_quote,
+        account_key=None,
+        persist=True,
+        quote_timeout_seconds=FAST_INTRADAY_QUOTE_TIMEOUT_SECONDS,
+        db=db,
+        user_id=user_id,
+    )
+    if period != "1m" and payload.get("items"):
+        payload["items"] = _aggregate_intraday_bars(payload["items"], period)
+        payload["period"] = period
+        payload["source"] = (payload.get("source") or "") + f"_aggregated_to_{period}"
+        return payload
+    if payload.get("items"):
+        payload["period"] = period
+        return payload
+
+    fallback_date = _latest_available_intraday_trade_date(db, symbol, trade_date)
+    if fallback_date and fallback_date != trade_date:
+        fallback_payload = _fetch_intraday_bars_compat(
+            symbol,
+            trade_date=fallback_date,
+            period=fetch_period,
+            include_latest_quote=include_latest_quote,
+            account_key=None,
+            persist=True,
+            quote_timeout_seconds=FAST_INTRADAY_QUOTE_TIMEOUT_SECONDS,
+            db=db,
+            user_id=user_id,
+        )
+        if fallback_payload.get("items"):
+            fallback_payload["requested_trade_date"] = trade_date
+            fallback_payload["trade_date"] = fallback_date
+            fallback_payload["source"] = (fallback_payload.get("source") or "") + ":latest_available_fallback"
+            if period != "1m":
+                fallback_payload["items"] = _aggregate_intraday_bars(fallback_payload["items"], period)
+                fallback_payload["period"] = period
+                fallback_payload["source"] = (fallback_payload.get("source") or "") + f"_aggregated_to_{period}"
+            else:
+                fallback_payload["period"] = period
+            return fallback_payload
+
+    payload["period"] = period
+    return payload
+
+
+def _load_intraday_history_payload(
+    symbol: str,
+    *,
+    trade_date: str,
+    period: str,
+    include_latest_quote: bool,
+    lookback_sessions: int,
+    db: Session,
+    user_id: str | None,
+) -> dict[str, Any]:
+    table_name, trade_dates, items = _load_intraday_history_rows_from_db(
+        db,
+        symbol,
+        requested_trade_date=trade_date,
+        lookback_sessions=lookback_sessions,
+    )
+    if not items:
+        payload = _load_intraday_payload_with_fallback(
+            symbol,
+            trade_date=trade_date,
+            period=period,
+            include_latest_quote=include_latest_quote,
+            db=db,
+            user_id=user_id,
+        )
+        payload["lookback_sessions"] = lookback_sessions
+        return payload
+
+    normalized = normalize_symbol(symbol)
+    aggregated_items = _aggregate_intraday_bars(items, period) if period != "1m" else items
+    latest_trade_date = trade_dates[-1] if trade_dates else trade_date
+    latest_quote = (
+        _fetch_realtime_quotes_compat(
+            [normalized],
+            timeout_seconds=FAST_INTRADAY_QUOTE_TIMEOUT_SECONDS,
+            db=db,
+            user_id=user_id,
+        ).get(normalized)
+        if include_latest_quote
+        else None
+    )
+    return {
+        "symbol": normalized,
+        "trade_date": latest_trade_date,
+        "requested_trade_date": trade_date if latest_trade_date != trade_date else None,
+        "start_trade_date": trade_dates[0] if trade_dates else latest_trade_date,
+        "end_trade_date": latest_trade_date,
+        "period": period,
+        "lookback_sessions": lookback_sessions,
+        "loaded_sessions": len(trade_dates),
+        "items": aggregated_items,
+        "latest_quote": latest_quote,
+        "source": f"postgresql_cache:{table_name}:history_{len(trade_dates)}sessions"
+        + (f"_aggregated_to_{period}" if period != "1m" else ""),
+    }
+
+
+def _load_intraday_history_rows_from_db(
+    db: Session,
+    symbol: str,
+    *,
+    requested_trade_date: str,
+    lookback_sessions: int,
+) -> tuple[str | None, list[str], list[dict[str, Any]]]:
+    normalized = normalize_symbol(symbol)
+    code = normalized.split(".", 1)[0]
+    index_codes = {item["code"] for item in INDEX_PRESETS}
+    index_symbols = {item["symbol"] for item in INDEX_PRESETS}
+    is_index = normalized in index_symbols or code in index_codes
+    table_candidates = ["index_minute_kline"] if is_index else [preferred_minute_kline_table(), "stock_minute_kline", "pub_stock_minute_kline"]
+    symbol_candidates = _intraday_symbol_candidates(normalized, is_index=is_index)
+    symbol_placeholders = ", ".join(f":symbol_{index}" for index, _ in enumerate(symbol_candidates))
+    symbol_params = {f"symbol_{index}": value for index, value in enumerate(symbol_candidates)}
+    session_limit = max(1, min(int(lookback_sessions or 1), 60))
+
+    for table_name in dict.fromkeys(table_candidates):
+        if not _has_table(db, table_name):
+            continue
+        try:
+            date_rows = db.execute(
+                text(
+                    f"""
+                    SELECT DATE(trade_time) AS trade_day
+                    FROM {table_name}
+                    WHERE symbol IN ({symbol_placeholders})
+                      AND DATE(trade_time) <= :requested_trade_date
+                    GROUP BY DATE(trade_time)
+                    ORDER BY trade_day DESC
+                    LIMIT :session_limit
+                    """
+                ),
+                {
+                    **symbol_params,
+                    "requested_trade_date": requested_trade_date,
+                    "session_limit": session_limit,
+                },
+            ).all()
+        except Exception:
+            continue
+        trade_dates = sorted(
+            row[0].isoformat() if hasattr(row[0], "isoformat") else str(row[0])[:10]
+            for row in date_rows
+            if row and row[0]
+        )
+        if not trade_dates:
+            continue
+
+        date_placeholders = ", ".join(f":trade_date_{index}" for index, _ in enumerate(trade_dates))
+        date_params = {f"trade_date_{index}": value for index, value in enumerate(trade_dates)}
+        try:
+            rows = db.execute(
+                text(
+                    f"""
+                    SELECT symbol, trade_time, open, high, low, close, volume, amount
+                    FROM {table_name}
+                    WHERE symbol IN ({symbol_placeholders})
+                      AND DATE(trade_time) IN ({date_placeholders})
+                    ORDER BY trade_time ASC
+                    """
+                ),
+                {**symbol_params, **date_params},
+            ).mappings().all()
+        except Exception:
+            continue
+
+        deduped: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            trade_time_raw = row.get("trade_time")
+            trade_time = trade_time_raw.isoformat(timespec="seconds") if hasattr(trade_time_raw, "isoformat") else str(trade_time_raw)
+            record = {
+                "symbol": normalized,
+                "trade_time": trade_time,
+                "open": _to_float(row.get("open")),
+                "high": _to_float(row.get("high")),
+                "low": _to_float(row.get("low")),
+                "close": _to_float(row.get("close")),
+                "volume": _to_float(row.get("volume")) or 0.0,
+                "amount": _to_float(row.get("amount")) or 0.0,
+            }
+            previous = deduped.get(trade_time)
+            if previous is None or str(row.get("symbol") or "").upper() == normalized:
+                deduped[trade_time] = record
+        items = [deduped[key] for key in sorted(deduped)]
+        if items:
+            return table_name, trade_dates, items
+    return None, [], []
+
+
+def _latest_available_intraday_trade_date(db: Session, symbol: str, requested_trade_date: str) -> str | None:
+    normalized = normalize_symbol(symbol)
+    code = normalized.split(".", 1)[0]
+    index_codes = {item["code"] for item in INDEX_PRESETS}
+    index_symbols = {item["symbol"] for item in INDEX_PRESETS}
+    is_index = normalized in index_symbols or code in index_codes
+    table_candidates = ["index_minute_kline"] if is_index else [preferred_minute_kline_table(), "stock_minute_kline", "pub_stock_minute_kline"]
+    symbol_candidates = _intraday_symbol_candidates(normalized, is_index=is_index)
+    placeholders = ", ".join(f":symbol_{index}" for index, _ in enumerate(symbol_candidates))
+    params = {
+        "requested_trade_date": requested_trade_date,
+        **{f"symbol_{index}": value for index, value in enumerate(symbol_candidates)},
+    }
+
+    for table_name in dict.fromkeys(table_candidates):
+        if not _has_table(db, table_name):
+            continue
+        try:
+            row = db.execute(
+                text(
+                    f"""
+                    SELECT DATE(trade_time) AS trade_day
+                    FROM {table_name}
+                    WHERE symbol IN ({placeholders})
+                      AND DATE(trade_time) <= :requested_trade_date
+                    GROUP BY DATE(trade_time)
+                    ORDER BY trade_day DESC
+                    LIMIT 1
+                    """
+                ),
+                params,
+            ).first()
+        except Exception:
+            continue
+        if row and row[0]:
+            return row[0].isoformat() if hasattr(row[0], "isoformat") else str(row[0])[:10]
+    return None
+
+
+def _intraday_symbol_candidates(symbol: str, *, is_index: bool) -> list[str]:
+    normalized = normalize_symbol(symbol)
+    code = normalized.split(".", 1)[0]
+    candidates = {normalized, code}
+    if is_index and code:
+        candidates.update({f"sh{code}", f"sz{code}", f"{code}.SH", f"{code}.SZ"})
+    return sorted(item for item in candidates if item)
+
 
 
 def _fetch_intraday_bars_compat(
@@ -524,6 +940,200 @@ def _merge_market_item(symbol: str, name: str, latest: dict[str, Any], quote: di
         "amount": _to_float(quote.get("amount")) or latest.get("amount"),
         "trade_time": quote.get("quote_time") or latest.get("trade_date"),
         "source": source,
+    }
+
+
+def _load_market_stats(db: Session, trade_date: str | None = None) -> dict[str, Any]:
+    daily_table = _preferred_market_latest_daily_table(db)
+    if not _has_table(db, daily_table):
+        return {}
+    target_date = _load_latest_daily_trade_date(db, daily_table, trade_date=trade_date)
+    if not target_date:
+        return {}
+    previous_date = _load_previous_daily_trade_date(db, daily_table, target_date)
+    try:
+        rows = _load_market_stat_rows(db, daily_table, target_date)
+        previous_rows = _load_market_stat_rows(db, daily_table, previous_date) if previous_date else []
+    except Exception:
+        return {}
+
+    total_amount = 0.0
+    previous_amount = sum(float(row.get("amount") or 0.0) for row in previous_rows)
+    up_count = 0
+    down_count = 0
+    flat_count = 0
+    limit_up_count = 0
+    limit_down_count = 0
+    for row in rows:
+        close = _to_float(row.get("close"))
+        pre_close = _to_float(row.get("pre_close"))
+        if close is None or pre_close is None or pre_close <= 0:
+            continue
+        total_amount += float(row.get("amount") or 0.0)
+        change_ratio = (close - pre_close) / pre_close
+        if change_ratio > 0:
+            up_count += 1
+        elif change_ratio < 0:
+            down_count += 1
+        else:
+            flat_count += 1
+        if change_ratio >= _limit_up_threshold(row.get("symbol")):
+            limit_up_count += 1
+        if change_ratio <= _limit_down_threshold(row.get("symbol")):
+            limit_down_count += 1
+
+    previous_amount_value = float(previous_amount) if previous_rows else None
+    payload = {
+        "trade_date": target_date.isoformat() if hasattr(target_date, "isoformat") else str(target_date),
+        "previous_trade_date": previous_date.isoformat() if hasattr(previous_date, "isoformat") else (str(previous_date) if previous_date else None),
+        "stock_count": len(rows),
+        "total_amount": round(total_amount, 2),
+        "previous_total_amount": round(previous_amount_value, 2) if previous_amount_value is not None else None,
+        "amount_change": round(total_amount - previous_amount_value, 2) if previous_amount_value is not None else None,
+        "up_count": up_count,
+        "down_count": down_count,
+        "flat_count": flat_count,
+        "limit_up_count": limit_up_count,
+        "limit_down_count": limit_down_count,
+        "source": f"postgresql:{daily_table}",
+    }
+    payload.update(
+        _derive_market_sentiment_metrics(
+            rows,
+            previous_rows,
+            source=f"postgresql:{daily_table}:daily_ohlc_estimate",
+        )
+    )
+    return payload
+
+
+def _load_market_stat_rows(db: Session, daily_table: str, trade_date: Any) -> list[dict[str, Any]]:
+    return [
+        dict(row)
+        for row in db.execute(
+            text(
+                f"""
+                SELECT symbol, close, high, pre_close, amount
+                FROM {daily_table}
+                WHERE trade_date = :trade_date
+                  AND close IS NOT NULL
+                  AND pre_close IS NOT NULL
+                  AND pre_close > 0
+                """
+            ),
+            {"trade_date": trade_date},
+        ).mappings().all()
+    ]
+
+
+def _load_previous_daily_trade_date(db: Session, table_name: str, target_date: Any):
+    try:
+        return db.execute(
+            text(f"SELECT MAX(trade_date) FROM {table_name} WHERE trade_date < :target_date"),
+            {"target_date": target_date},
+        ).scalar()
+    except Exception:
+        return None
+
+
+def _index_turnover_amount(indices: list[dict[str, Any]]) -> float | None:
+    by_symbol = {str(item.get("symbol") or "").upper(): item for item in indices}
+    sh_amount = _to_float((by_symbol.get("000001.SH") or {}).get("amount"))
+    sz_amount = _to_float((by_symbol.get("399001.SZ") or {}).get("amount"))
+    if sh_amount is None or sz_amount is None:
+        return None
+    return sh_amount + sz_amount
+
+
+def _limit_up_threshold(symbol: Any) -> float:
+    code = str(symbol or "").upper().split(".", 1)[0]
+    if code.startswith(("300", "301", "688", "689")):
+        return 0.198
+    if code.startswith(("4", "8", "9")):
+        return 0.298
+    return 0.098
+
+
+def _limit_down_threshold(symbol: Any) -> float:
+    code = str(symbol or "").upper().split(".", 1)[0]
+    if code.startswith(("300", "301", "688", "689")):
+        return -0.198
+    if code.startswith(("4", "8", "9")):
+        return -0.298
+    return -0.098
+
+
+def _row_price_change_ratio(row: Any, price_field: str) -> float | None:
+    price = _to_float(row.get(price_field))
+    pre_close = _to_float(row.get("pre_close"))
+    if price is None or pre_close is None or pre_close <= 0:
+        return None
+    return (price - pre_close) / pre_close
+
+
+def _row_is_limit_up_close(row: Any) -> bool:
+    change_ratio = _row_price_change_ratio(row, "close")
+    return change_ratio is not None and change_ratio >= _limit_up_threshold(row.get("symbol"))
+
+
+def _row_is_limit_up_touch(row: Any) -> bool:
+    change_ratio = _row_price_change_ratio(row, "high")
+    return change_ratio is not None and change_ratio >= _limit_up_threshold(row.get("symbol"))
+
+
+def _market_symbol_key(symbol: Any) -> str:
+    return str(symbol or "").strip().upper()
+
+
+def _derive_market_sentiment_metrics(
+    rows: list[dict[str, Any]],
+    previous_rows: list[dict[str, Any]],
+    *,
+    source: str,
+) -> dict[str, Any]:
+    current_limit_up_symbols: set[str] = set()
+    limit_up_touch_count = 0
+    failed_limit_up_count = 0
+    rows_with_high = 0
+
+    for row in rows:
+        symbol = _market_symbol_key(row.get("symbol"))
+        if _row_is_limit_up_close(row):
+            current_limit_up_symbols.add(symbol)
+        if row.get("high") is not None:
+            rows_with_high += 1
+        if _row_is_limit_up_touch(row):
+            limit_up_touch_count += 1
+            if not _row_is_limit_up_close(row):
+                failed_limit_up_count += 1
+
+    previous_limit_up_symbols = {
+        _market_symbol_key(row.get("symbol"))
+        for row in previous_rows
+        if _row_is_limit_up_close(row)
+    }
+    promotion_base = len(previous_limit_up_symbols)
+    promotion_count = len(previous_limit_up_symbols & current_limit_up_symbols) if promotion_base else None
+    promotion_rate = promotion_count / promotion_base * 100 if promotion_base and promotion_count is not None else None
+    failed_rate = failed_limit_up_count / limit_up_touch_count * 100 if limit_up_touch_count else (0.0 if rows_with_high else None)
+
+    missing_fields: list[str] = []
+    if not rows_with_high:
+        missing_fields.append("daily_high")
+    if not previous_rows:
+        missing_fields.append("previous_session_limit_up_pool")
+    elif promotion_base == 0:
+        missing_fields.append("previous_session_limit_up_count_zero")
+
+    return {
+        "limit_up_touch_count": limit_up_touch_count if rows_with_high else None,
+        "failed_limit_up_count": failed_limit_up_count if rows_with_high else None,
+        "failed_limit_up_rate": round(failed_rate, 2) if failed_rate is not None else None,
+        "limit_up_promotion_base": promotion_base if previous_rows else None,
+        "limit_up_promotion_count": promotion_count,
+        "limit_up_promotion_rate": round(promotion_rate, 2) if promotion_rate is not None else None,
+        "sentiment_source": source,
+        "sentiment_missing_fields": missing_fields,
     }
 
 
@@ -832,88 +1442,287 @@ def _code_to_symbol(code: str) -> str:
     return f"{code}.SZ"
 
 
-def _calculate_chanlun_overlay(candles: list[dict[str, Any]]) -> dict[str, Any]:
-    if len(candles) < 3:
-        return {"fractals": [], "bi": [], "segments": [], "zhongshu": [], "buy_sell_points": []}
+def _merge_chanlun_kbars(candles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """K线包含处理：将存在包含关系的相邻K线合并。
 
+    缠论中，相邻两根K线如果一根完全包含另一根（高更高、低更低），
+    需要按趋势方向合并为一根新K线：
+    - 上升趋势中：取高高（两K线高点取高，低点取高）
+    - 下降趋势中：取低低（两K线高点取低，低点取低）
+    """
+    if len(candles) < 2:
+        return list(candles)
+
+    merged: list[dict[str, Any]] = [dict(candles[0])]
+    # Determine initial direction from first two candles
+    direction = "up" if candles[1]["high"] > candles[0]["high"] else "down"
+
+    for i in range(1, len(candles)):
+        current = dict(candles[i])
+        prev = merged[-1]
+
+        # Check inclusion: current completely contains prev or vice versa
+        cur_contains_prev = current["high"] >= prev["high"] and current["low"] <= prev["low"]
+        prev_contains_cur = prev["high"] >= current["high"] and prev["low"] <= current["low"]
+
+        if cur_contains_prev or prev_contains_cur:
+            # Inclusion detected – merge based on direction
+            if direction == "up":
+                merged[-1] = {
+                    "date": current["date"],
+                    "open": prev["open"],
+                    "high": max(prev["high"], current["high"]),
+                    "low": max(prev["low"], current["low"]),
+                    "close": current["close"],
+                    "volume": (prev.get("volume", 0) or 0) + (current.get("volume", 0) or 0),
+                    "amount": (prev.get("amount", 0) or 0) + (current.get("amount", 0) or 0),
+                }
+            else:
+                merged[-1] = {
+                    "date": current["date"],
+                    "open": prev["open"],
+                    "high": min(prev["high"], current["high"]),
+                    "low": min(prev["low"], current["low"]),
+                    "close": current["close"],
+                    "volume": (prev.get("volume", 0) or 0) + (current.get("volume", 0) or 0),
+                    "amount": (prev.get("amount", 0) or 0) + (current.get("amount", 0) or 0),
+                }
+        else:
+            # No inclusion – update direction
+            if current["high"] > prev["high"]:
+                direction = "up"
+            elif current["low"] < prev["low"]:
+                direction = "down"
+            merged.append(current)
+
+    return merged
+
+
+def _detect_fractals(kbars: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """在合并后的K线序列上检测顶底分型。
+
+    顶分型：中间K线高点最高，低点最高（三根K线）
+    底分型：中间K线低点最低，高点最低（三根K线）
+    """
     fractals: list[dict[str, Any]] = []
-    for index in range(1, len(candles) - 1):
-        prev_item = candles[index - 1]
-        item = candles[index]
-        next_item = candles[index + 1]
-        if item["high"] > prev_item["high"] and item["high"] > next_item["high"]:
-            fractals.append({"date": item["date"], "type": "top", "price": item["high"], "index": index})
-        if item["low"] < prev_item["low"] and item["low"] < next_item["low"]:
-            fractals.append({"date": item["date"], "type": "bottom", "price": item["low"], "index": index})
+    for i in range(1, len(kbars) - 1):
+        left, mid, right = kbars[i - 1], kbars[i], kbars[i + 1]
+        # Top fractal: mid high is highest, mid low is highest
+        if mid["high"] > left["high"] and mid["high"] > right["high"] and mid["low"] > left["low"] and mid["low"] > right["low"]:
+            fractals.append({"date": mid["date"], "type": "top", "price": mid["high"], "index": i})
+        # Bottom fractal: mid low is lowest, mid high is lowest
+        if mid["low"] < left["low"] and mid["low"] < right["low"] and mid["high"] < left["high"] and mid["high"] < right["high"]:
+            fractals.append({"date": mid["date"], "type": "bottom", "price": mid["low"], "index": i})
+    return fractals
 
-    normalized_fractals: list[dict[str, Any]] = []
-    for fractal in sorted(fractals, key=lambda item: item["index"]):
-        if not normalized_fractals:
-            normalized_fractals.append(fractal)
-            continue
-        last = normalized_fractals[-1]
-        if fractal["type"] == last["type"]:
-            if (fractal["type"] == "top" and fractal["price"] >= last["price"]) or (
-                fractal["type"] == "bottom" and fractal["price"] <= last["price"]
+
+def _normalize_fractals(fractals: list[dict[str, Any]], kbars: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """标准化分型序列：去重、确保顶底交替、间隔足够。"""
+    if not fractals:
+        return []
+
+    fractals.sort(key=lambda f: f["index"])
+    result: list[dict[str, Any]] = [fractals[0]]
+
+    for f in fractals[1:]:
+        last = result[-1]
+        # Same type: keep the more extreme one
+        if f["type"] == last["type"]:
+            if (f["type"] == "top" and f["price"] >= last["price"]) or (
+                f["type"] == "bottom" and f["price"] <= last["price"]
             ):
-                normalized_fractals[-1] = fractal
+                result[-1] = f
             continue
-        if fractal["index"] - last["index"] < 3:
+        # Must have at least 3 merged K-bars between alternating fractals
+        if f["index"] - last["index"] < 3:
             continue
-        normalized_fractals.append(fractal)
+        result.append(f)
 
+    return result
+
+
+def _build_strokes(fractals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """从分型序列构建笔。相邻的底-顶构成向上笔，顶-底构成向下笔。"""
     strokes: list[dict[str, Any]] = []
-    for start, end in zip(normalized_fractals, normalized_fractals[1:]):
-        direction = "up" if start["type"] == "bottom" and end["type"] == "top" else "down"
-        strokes.append(
-            {
-                "start_date": start["date"],
-                "end_date": end["date"],
-                "start_price": start["price"],
-                "end_price": end["price"],
-                "direction": direction,
-            }
-        )
+    for i in range(0, len(fractals) - 1, 1):
+        start, end = fractals[i], fractals[i + 1]
+        if start["type"] == end["type"]:
+            continue
+        direction = "up" if start["type"] == "bottom" else "down"
+        strokes.append({
+            "start_date": start["date"],
+            "end_date": end["date"],
+            "start_price": start["price"],
+            "end_price": end["price"],
+            "direction": direction,
+        })
+    return strokes
+
+
+def _build_segments(strokes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """从笔序列构建线段。
+
+    线段由至少3笔构成，方向由第一笔决定。
+    线段结束条件：出现反向笔且该反向笔之后又出现同向笔。
+    """
+    if len(strokes) < 3:
+        return []
 
     segments: list[dict[str, Any]] = []
-    for offset in range(0, max(len(strokes) - 2, 0), 2):
-        part = strokes[offset : offset + 3]
+    seg_start = 0
+
+    for i in range(2, len(strokes)):
+        # Check if strokes [seg_start:i+1] form a valid segment
+        part = strokes[seg_start:i + 1]
         if len(part) < 3:
             continue
-        segments.append(
-            {
-                "start_date": part[0]["start_date"],
-                "end_date": part[-1]["end_date"],
-                "start_price": part[0]["start_price"],
-                "end_price": part[-1]["end_price"],
-                "direction": part[-1]["direction"],
-            }
-        )
 
-    zhongshu: list[dict[str, Any]] = []
-    for offset in range(0, max(len(strokes) - 2, 0)):
-        part = strokes[offset : offset + 3]
-        ranges = [(min(item["start_price"], item["end_price"]), max(item["start_price"], item["end_price"])) for item in part]
-        low = max(item[0] for item in ranges)
-        high = min(item[1] for item in ranges)
-        if low <= high:
-            zhongshu.append(
-                {
+        first_dir = part[0]["direction"]
+        # A segment is valid when we have at least one opposite-direction stroke
+        # and the segment direction is determined by the first stroke
+        has_opposite = any(s["direction"] != first_dir for s in part)
+
+        if has_opposite:
+            # Check if the last stroke direction confirms segment end
+            # Segment ends when we return to the original direction
+            last_dir = part[-1]["direction"]
+            if last_dir == first_dir and len(part) >= 3:
+                segments.append({
                     "start_date": part[0]["start_date"],
                     "end_date": part[-1]["end_date"],
-                    "low": round(low, 4),
-                    "high": round(high, 4),
-                    "mid": round((low + high) / 2, 4),
-                }
-            )
+                    "start_price": part[0]["start_price"],
+                    "end_price": part[-1]["end_price"],
+                    "direction": first_dir,
+                })
+                seg_start = i
 
-    buy_sell_points = _derive_chanlun_points(normalized_fractals, zhongshu)
+    return segments
+
+
+def _build_zhongshu(strokes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """从笔序列构建中枢。中枢由连续3笔的重叠区间构成。"""
+    zhongshu: list[dict[str, Any]] = []
+    for i in range(0, max(len(strokes) - 2, 0)):
+        part = strokes[i:i + 3]
+        ranges = [
+            (min(s["start_price"], s["end_price"]), max(s["start_price"], s["end_price"]))
+            for s in part
+        ]
+        low = max(r[0] for r in ranges)
+        high = min(r[1] for r in ranges)
+        if low < high:
+            zhongshu.append({
+                "start_date": part[0]["start_date"],
+                "end_date": part[-1]["end_date"],
+                "low": round(low, 4),
+                "high": round(high, 4),
+                "mid": round((low + high) / 2, 4),
+            })
+    return zhongshu
+
+
+def _calculate_chanlun_overlay(candles: list[dict[str, Any]]) -> dict[str, Any]:
+    """计算缠论叠加指标：分型、笔、线段、中枢、买卖点。
+
+    严格按缠论步骤：
+    1. K线包含处理（合并包含关系的相邻K线）
+    2. 在合并K线上检测顶底分型
+    3. 标准化分型序列
+    4. 构建笔
+    5. 构建线段
+    6. 构建中枢
+    7. 推导买卖点
+    """
+    if len(candles) < 3:
+        return {
+            "fractals": [],
+            "bi": [],
+            "segments": [],
+            "zhongshu": [],
+            "buy_sell_points": [],
+            "pending_bi": [],
+            "pending_fractals": [],
+        }
+
+    # Step 1: K-line inclusion processing
+    kbars = _merge_chanlun_kbars(candles)
+
+    # Step 2: Detect fractals on merged K-bars
+    raw_fractals = _detect_fractals(kbars)
+
+    # Step 3: Normalize fractal sequence
+    fractals = _normalize_fractals(raw_fractals, kbars)
+
+    # Step 4: Build strokes (笔)
+    strokes = _build_strokes(fractals)
+
+    # Step 5: Build segments (线段)
+    segments = _build_segments(strokes)
+
+    # Step 6: Build zhongshu (中枢)
+    zhongshu = _build_zhongshu(strokes)
+
+    # Step 7: Derive buy/sell points
+    buy_sell_points = _derive_chanlun_points(fractals, zhongshu)
+
+    # Step 8: Add pending/unconfirmed strokes and fractals for recent K-lines
+    pending_strokes: list[dict[str, Any]] = []
+    pending_fractals: list[dict[str, Any]] = []
+
+    if kbars:
+        last_kbar = kbars[-1]
+        last_idx = len(kbars) - 1
+
+        # Detect tentative fractals on the last 2 K-lines (missing right neighbor)
+        for offset in (0, 1):
+            idx = last_idx - offset
+            if idx < 2:
+                continue
+            left, mid = kbars[idx - 1], kbars[idx]
+            # Tentative top: mid high > left high
+            if mid["high"] > left["high"]:
+                pending_fractals.append({
+                    "date": mid["date"], "type": "top", "price": mid["high"],
+                    "index": idx, "confirmed": False,
+                })
+            # Tentative bottom: mid low < left low
+            if mid["low"] < left["low"]:
+                pending_fractals.append({
+                    "date": mid["date"], "type": "bottom", "price": mid["low"],
+                    "index": idx, "confirmed": False,
+                })
+
+        # Build pending stroke from last confirmed fractal to latest price
+        if fractals:
+            last_fractal = fractals[-1]
+            if last_fractal["index"] < len(kbars) - 2:
+                if last_fractal["type"] == "bottom":
+                    pending_strokes.append({
+                        "start_date": last_fractal["date"],
+                        "end_date": last_kbar["date"],
+                        "start_price": last_fractal["price"],
+                        "end_price": last_kbar["close"],
+                        "direction": "up",
+                        "confirmed": False,
+                    })
+                else:
+                    pending_strokes.append({
+                        "start_date": last_fractal["date"],
+                        "end_date": last_kbar["date"],
+                        "start_price": last_fractal["price"],
+                        "end_price": last_kbar["close"],
+                        "direction": "down",
+                        "confirmed": False,
+                    })
+
     return {
-        "fractals": normalized_fractals,
+        "fractals": fractals,
         "bi": strokes,
         "segments": segments,
         "zhongshu": zhongshu,
         "buy_sell_points": buy_sell_points,
+        "pending_bi": pending_strokes,
+        "pending_fractals": pending_fractals,
     }
 
 

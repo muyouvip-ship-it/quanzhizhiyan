@@ -6,6 +6,7 @@ import { useAuthStore } from './stores/authStore'
 
 const Dashboard = lazy(() => import('./pages/Dashboard'))
 const NewsEye = lazy(() => import('./pages/NewsEye'))
+const CatalystSelection = lazy(() => import('./pages/CatalystSelection'))
 const StockMarket = lazy(() => import('./pages/StockMarket'))
 const Analysis = lazy(() => import('./pages/Analysis'))
 const Reports = lazy(() => import('./pages/Reports'))
@@ -62,6 +63,7 @@ function App() {
                   <Routes>
                     <Route path="/" element={<Dashboard />} />
                     <Route path="/news-eye" element={<NewsEye />} />
+                    <Route path="/catalyst-selection" element={<CatalystSelection />} />
                     <Route path="/stock-market" element={<StockMarket />} />
                     <Route path="/tracking-board" element={<TrackingBoard />} />
                     <Route path="/analysis" element={<Analysis />} />

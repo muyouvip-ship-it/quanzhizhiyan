@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from api.services.qmt_market_data_service import capture_intraday_symbols
+from api.core.utils import safe_float as _safe_float
 
 
 logger = logging.getLogger(__name__)
@@ -92,10 +93,3 @@ def _normalize_trade_time(value: Any) -> datetime | None:
         return None
 
 
-def _safe_float(value: Any) -> float | None:
-    try:
-        if value in (None, ""):
-            return None
-        return float(value)
-    except Exception:
-        return None

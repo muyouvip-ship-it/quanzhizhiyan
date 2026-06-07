@@ -16,6 +16,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text
 
+from api.core.runtime_config import has_mixed_account_llm_runtime, llm_runtime_source_payload
 from api.core.progress_tracker import AgentProgressTracker
 from api.database import get_db_ctx
 from api.services.market_data_pipeline_service import preferred_daily_kline_table
@@ -28,6 +29,21 @@ logger = logging.getLogger(__name__)
 _GRAPH_CACHE_MAX_SIZE = int(os.getenv("TRADING_GRAPH_CACHE_SIZE", "4"))
 _GRAPH_CACHE: OrderedDict[str, Any] = OrderedDict()
 _GRAPH_CACHE_LOCK = threading.Lock()
+
+
+def _mixed_runtime_error_message(config: dict[str, Any]) -> str:
+    runtime_sources = llm_runtime_source_payload(config)
+    package_source = runtime_sources.get("runtime_package_source") or "unknown"
+    account_sources = ",".join(runtime_sources.get("account_runtime_sources") or []) or "-"
+    return (
+        "账号 LLM 字段未形成同源运行包；provider、Base URL、模型和 Key 必须来自同一套账号配置。"
+        f" 当前 runtime_package_source={package_source}, account_sources={account_sources}。"
+    )
+
+
+def _reject_mixed_account_runtime(config: dict[str, Any]) -> None:
+    if has_mixed_account_llm_runtime(config):
+        raise HTTPException(status_code=400, detail=_mixed_runtime_error_message(config))
 
 
 def _get_deep_analysis_graph(selected_analysts: list[str], config: dict[str, Any]):
@@ -85,6 +101,7 @@ async def chat_completions(request: dict = Body(...), current_user=Depends(requi
 
     text = compat._extract_chat_text(request.get("messages") or [])
     config = compat._build_runtime_config({}, user_id=current_user.id)
+    _reject_mixed_account_runtime(config)
     symbol, trade_date, horizons, focus_areas, specific_questions, user_context = compat._ai_extract_symbol_and_date(text, config)
     del horizons, focus_areas, specific_questions, user_context
     if not symbol:
@@ -520,6 +537,7 @@ async def _run_deep_analysis_pipeline(
     from tradingagents.graph.intent_parser import parse_intent
 
     config = compat._build_runtime_config({}, user_id=user_id)
+    _reject_mixed_account_runtime(config)
     merged_user_context = _build_user_context_snapshot(symbol, user_id)
     graph = _get_deep_analysis_graph(selected_analysts, config)
 

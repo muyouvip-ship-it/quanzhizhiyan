@@ -1,4 +1,5 @@
 import {
+  Component,
   Suspense,
   lazy,
   useCallback,
@@ -99,9 +100,35 @@ function stockDisplayName(symbol: string, stockNameMap: Record<string, string>) 
     : normalizedSymbol || "--";
 }
 
-function formatPercent(value?: number | null) {
-  if (value == null) return "--";
-  return `${value >= 0 ? "+" : ""}${(value * 100).toFixed(2)}%`;
+function toFiniteNumber(value: unknown) {
+  if (value == null || value === "") return null;
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : null;
+}
+
+function formatDecimal(value: unknown, digits = 2) {
+  const numberValue = toFiniteNumber(value);
+  return numberValue == null ? "--" : numberValue.toFixed(digits);
+}
+
+function formatPrice(value: unknown) {
+  return formatDecimal(value, 2);
+}
+
+function formatScore(value: unknown) {
+  return formatDecimal(value, 3);
+}
+
+function formatPercent(value?: unknown, digits = 2) {
+  const numberValue = toFiniteNumber(value);
+  if (numberValue == null) return "--";
+  return `${numberValue >= 0 ? "+" : ""}${(numberValue * 100).toFixed(digits)}%`;
+}
+
+function formatPlainPercent(value?: unknown, digits = 1) {
+  const numberValue = toFiniteNumber(value);
+  if (numberValue == null) return "--";
+  return `${(numberValue * 100).toFixed(digits)}%`;
 }
 
 function formatDate(value?: string | null) {
@@ -118,9 +145,10 @@ function dateKey(value?: string | null) {
   return value ? value.slice(0, 10) : "";
 }
 
-function formatAmount(value?: number | null) {
-  if (value == null) return "--";
-  return `¥${Number(value).toLocaleString()}`;
+function formatAmount(value?: unknown) {
+  const numberValue = toFiniteNumber(value);
+  if (numberValue == null) return "--";
+  return `¥${numberValue.toLocaleString()}`;
 }
 
 function toChineseBacktestStatus(value?: string | null) {
@@ -446,6 +474,56 @@ function LazyPanelFallback({
       {message}
     </div>
   );
+}
+
+class KlinePanelErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: string | null }
+> {
+  state: { error: string | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error: error.message || "K线组件渲染失败" };
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="flex h-full min-h-[360px] flex-col items-center justify-center rounded-2xl border border-amber-200 bg-amber-50 p-6 text-center text-sm text-amber-700 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-200">
+          <ChartBarIcon className="mb-2 h-6 w-6" />
+          <div className="font-medium">K线面板加载异常，结果页已保持可用。</div>
+          <div className="mt-1 max-w-xl text-xs opacity-80">
+            {this.state.error}；可以切换其他股票或刷新后重试。
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+class BacktestViewErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: string | null }
+> {
+  state: { error: string | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error: error.message || "回测视图渲染失败" };
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <SectionCard title="当前视图加载异常" subtitle="结果页主体仍可继续切换其他视图">
+          <div className="rounded-xl bg-amber-50 p-4 text-sm text-amber-700 dark:bg-amber-950/30 dark:text-amber-200">
+            {this.state.error}
+          </div>
+        </SectionCard>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 export default function BacktestResult() {
@@ -976,6 +1054,7 @@ export default function BacktestResult() {
           </div>
           <div className="flex flex-wrap items-center gap-3">
             <button
+              type="button"
               onClick={() => void load(true)}
               disabled={refreshing}
               className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-700 shadow-sm disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"
@@ -986,6 +1065,7 @@ export default function BacktestResult() {
               刷新结果
             </button>
             <button
+              type="button"
               onClick={() =>
                 navigate(`/backtest?strategy_id=${run?.strategy_id ?? ""}`)
               }
@@ -1071,7 +1151,7 @@ export default function BacktestResult() {
               />
               <MetricCard
                 title="夏普比率"
-                value={metrics ? metrics.sharpe_ratio.toFixed(2) : "--"}
+                value={formatDecimal(metrics?.sharpe_ratio, 2)}
               />
               <MetricCard
                 title={strategyType === "risk" ? "风控后最大回撤" : "最大回撤"}
@@ -1169,6 +1249,7 @@ export default function BacktestResult() {
                 return (
                   <button
                     key={item.key}
+                    type="button"
                     onClick={() => setViewMode(item.key as ViewMode)}
                     className={`flex items-center gap-3 rounded-xl border px-4 py-3 text-left text-sm ${active ? "border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-900 dark:bg-blue-500/10 dark:text-blue-200" : "border-slate-200 bg-white text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"}`}
                   >
@@ -1212,6 +1293,9 @@ export default function BacktestResult() {
           </SectionCard>
         </div>
 
+        <BacktestViewErrorBoundary
+          key={viewMode}
+        >
         {viewMode === "overview" && (
           <div className="space-y-6">
             {watchlists.length > 0 && (
@@ -1252,7 +1336,7 @@ export default function BacktestResult() {
                         </div>
                         <div className="mt-1 text-xl font-semibold text-slate-900 dark:text-slate-100">
                           {candidateSectorGroups[0]
-                            ? `${(candidateSectorGroups[0].percentage * 100).toFixed(1)}%`
+                            ? formatPlainPercent(candidateSectorGroups[0].percentage, 1)
                             : "--"}
                         </div>
                       </div>
@@ -1269,11 +1353,11 @@ export default function BacktestResult() {
                                 {group.sector}
                               </div>
                               <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                                平均因子分 {group.avgScore.toFixed(3)}
+                                平均因子分 {formatScore(group.avgScore)}
                               </div>
                             </div>
                             <div className="shrink-0 rounded-full bg-blue-100 px-2 py-0.5 text-xs font-semibold text-blue-700 dark:bg-blue-500/15 dark:text-blue-200">
-                              {(group.percentage * 100).toFixed(1)}%
+                              {formatPlainPercent(group.percentage, 1)}
                             </div>
                           </div>
 
@@ -1315,6 +1399,7 @@ export default function BacktestResult() {
                               {group.examples.slice(0, 3).map((item) => (
                                 <button
                                   key={`${group.sector}_${item.symbol}`}
+                                  type="button"
                                   onClick={() => {
                                     setSelectedSymbol(item.symbol);
                                     setViewMode("symbols");
@@ -1362,6 +1447,7 @@ export default function BacktestResult() {
                       latestWatchlists.map((item) => (
                         <button
                           key={`${item.date}_${item.symbol}_${item.rank}`}
+                          type="button"
                           onClick={() => {
                             setSelectedSymbol(item.symbol);
                             setViewMode("symbols");
@@ -1377,7 +1463,7 @@ export default function BacktestResult() {
                             </div>
                           </div>
                           <div className="mt-1 text-slate-500 dark:text-slate-400">
-                            因子分 {item.factor_score.toFixed(3)} · 周线趋势{" "}
+                            因子分 {formatScore(item.factor_score)} · 周线趋势{" "}
                             {item.weekly_trend_pass === false
                               ? "未通过"
                               : "通过"}
@@ -1400,6 +1486,7 @@ export default function BacktestResult() {
                       topWatchlists.map((item) => (
                         <button
                           key={`${item.date}_${item.symbol}_${item.factor_score}_${item.rank}`}
+                          type="button"
                           onClick={() => {
                             setSelectedSymbol(item.symbol);
                             setViewMode("symbols");
@@ -1415,7 +1502,7 @@ export default function BacktestResult() {
                             </div>
                           </div>
                           <div className="mt-1 text-slate-500 dark:text-slate-400">
-                            因子分 {item.factor_score.toFixed(3)} · 当日排名{" "}
+                            因子分 {formatScore(item.factor_score)} · 当日排名{" "}
                             {item.rank}
                           </div>
                         </button>
@@ -1501,6 +1588,7 @@ export default function BacktestResult() {
                 {symbolCards.slice(0, 12).map((item) => (
                   <button
                     key={item.symbol}
+                    type="button"
                     onClick={() => {
                       setSelectedSymbol(item.symbol);
                       setViewMode("symbols");
@@ -1632,22 +1720,26 @@ export default function BacktestResult() {
               >
                 {selectedSymbol && (
                   <div className="mb-4 h-[460px]">
-                    <Suspense
-                      fallback={
-                        <LazyPanelFallback
-                          message="正在加载单票 K 线..."
-                          minHeight="460px"
-                        />
-                      }
+                    <KlinePanelErrorBoundary
+                      key={`${selectedSymbol}_${focusedEventDate}`}
                     >
-                      <KlinePanel
-                        symbol={selectedSymbol}
-                        onSymbolChange={setSelectedSymbol}
-                        showChanlunOverlay={false}
-                        focusDate={focusedEventDate}
-                        markers={selectedSymbolMarkers}
-                      />
-                    </Suspense>
+                      <Suspense
+                        fallback={
+                          <LazyPanelFallback
+                            message="正在加载单票 K 线..."
+                            minHeight="460px"
+                          />
+                        }
+                      >
+                        <KlinePanel
+                          symbol={selectedSymbol}
+                          onSymbolChange={setSelectedSymbol}
+                          showChanlunOverlay
+                          focusDate={focusedEventDate}
+                          markers={selectedSymbolMarkers}
+                        />
+                      </Suspense>
+                    </KlinePanelErrorBoundary>
                   </div>
                 )}
                 <VirtualList
@@ -1655,7 +1747,7 @@ export default function BacktestResult() {
                     ...selectedWatchlists.map((item) => ({
                       time: item.date,
                       type: "候选池",
-                      text: `因子分 ${item.factor_score.toFixed(3)}，排名 ${item.rank}`,
+                      text: `因子分 ${formatScore(item.factor_score)}，排名 ${item.rank}`,
                     })),
                     ...selectedMinuteConfirmations.map((item) => ({
                       time: item.bar_end || item.date,
@@ -1675,7 +1767,7 @@ export default function BacktestResult() {
                     ...selectedTrades.map((item) => ({
                       time: item.timestamp,
                       type: "成交",
-                      text: `${toChineseDirection(item.direction)} ${item.quantity} 股 @ ${item.price.toFixed(2)}`,
+                      text: `${toChineseDirection(item.direction)} ${item.quantity} 股 @ ${formatPrice(item.price)}`,
                     })),
                   ]
                     .sort((left, right) =>
@@ -1752,7 +1844,7 @@ export default function BacktestResult() {
                             </div>
                             <div className="mt-1 text-slate-500 dark:text-slate-400">
                               {formatDate(item.date)} · 因子分{" "}
-                              {item.factor_score.toFixed(3)}
+                              {formatScore(item.factor_score)}
                             </div>
                           </div>
                         ))}
@@ -1812,7 +1904,7 @@ export default function BacktestResult() {
                             </div>
                             <div className="mt-1 text-slate-500 dark:text-slate-400">
                               {formatDateTime(item.timestamp)} ·{" "}
-                              {item.price.toFixed(2)} · {item.reason}
+                              {formatPrice(item.price)} · {item.reason}
                             </div>
                           </div>
                         ))}
@@ -1841,8 +1933,8 @@ export default function BacktestResult() {
                             {formatDate(item.date)} · 持仓 {item.quantity} 股
                           </div>
                           <div className="mt-1 text-slate-500 dark:text-slate-400">
-                            均价 {item.avg_price.toFixed(2)} · 收盘{" "}
-                            {item.close.toFixed(2)} · 市值{" "}
+                            均价 {formatPrice(item.avg_price)} · 收盘{" "}
+                            {formatPrice(item.close)} · 市值{" "}
                             {formatAmount(item.market_value)}
                           </div>
                         </div>
@@ -1905,9 +1997,7 @@ export default function BacktestResult() {
                                 <div className="text-slate-500 dark:text-slate-400">
                                   {formatDate(selectedWatchlists[0].date)} ·
                                   因子分{" "}
-                                  {selectedWatchlists[0].factor_score.toFixed(
-                                    3,
-                                  )}
+                                  {formatScore(selectedWatchlists[0].factor_score)}
                                 </div>
                               </div>
                             )}
@@ -1956,8 +2046,7 @@ export default function BacktestResult() {
                           </div>
                           <div className="text-xs text-slate-400">
                             因子分{" "}
-                            {latestSelectedSignal.factor_score?.toFixed(3) ??
-                              "--"}
+                            {formatScore(latestSelectedSignal.factor_score)}
                           </div>
                         </div>
                       ) : (
@@ -1999,7 +2088,7 @@ export default function BacktestResult() {
                                     latestSelectedTrade.direction,
                                   )}{" "}
                                   {latestSelectedTrade.quantity} 股 @{" "}
-                                  {latestSelectedTrade.price.toFixed(2)}
+                                  {formatPrice(latestSelectedTrade.price)}
                                 </div>
                                 <div className="text-slate-500 dark:text-slate-400">
                                   {latestSelectedTrade.reason || "无成交原因"}
@@ -2184,7 +2273,7 @@ export default function BacktestResult() {
                           {symbolLabel(item.symbol)} · 候选池
                         </div>
                         <div className="mt-1 text-slate-500 dark:text-slate-400">
-                          因子分 {item.factor_score.toFixed(3)} · 排名{" "}
+                          因子分 {formatScore(item.factor_score)} · 排名{" "}
                           {item.rank}
                         </div>
                       </div>
@@ -2265,7 +2354,7 @@ export default function BacktestResult() {
                         </div>
                         <div className="mt-1 text-slate-500 dark:text-slate-400">
                           {toChineseDirection(item.direction)} {item.quantity}{" "}
-                          股 @ {item.price.toFixed(2)}
+                          股 @ {formatPrice(item.price)}
                         </div>
                       </div>
                     ))}
@@ -2308,7 +2397,7 @@ export default function BacktestResult() {
                     </div>
                     <div className="mt-1 text-slate-500 dark:text-slate-400">
                       {formatDate(item.date)} · 分数{" "}
-                      {item.factor_score.toFixed(3)} · 排名 {item.rank}
+                      {formatScore(item.factor_score)} · 排名 {item.rank}
                     </div>
                   </div>
                 ))}
@@ -2388,7 +2477,7 @@ export default function BacktestResult() {
                           <div className="mt-1 text-slate-500 dark:text-slate-400">
                             {formatDateTime(item.timestamp)} ·{" "}
                             {toChineseDirection(item.direction)} {item.quantity}{" "}
-                            股 @ {item.price.toFixed(2)}
+                            股 @ {formatPrice(item.price)}
                           </div>
                         </div>
                       ))}
@@ -2447,7 +2536,7 @@ export default function BacktestResult() {
                       <div className="mt-1 text-slate-500 dark:text-slate-400">
                         {formatDateTime(item.timestamp)} ·{" "}
                         {toChineseDirection(item.direction)} {item.quantity} 股
-                        @ {item.price.toFixed(2)}
+                        @ {formatPrice(item.price)}
                       </div>
                     </div>
                   ))}
@@ -2456,6 +2545,7 @@ export default function BacktestResult() {
             )}
           </div>
         )}
+        </BacktestViewErrorBoundary>
       </div>
     </div>
   );

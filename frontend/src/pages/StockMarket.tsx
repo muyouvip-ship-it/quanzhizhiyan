@@ -13,6 +13,11 @@ function isFiniteNumberValue(value: unknown): value is number {
   return Number.isFinite(Number(value))
 }
 
+function asNumber(value: unknown): number | null {
+  if (!isFiniteNumberValue(value)) return null
+  return Number(value)
+}
+
 function formatDateTime(value?: string | null) {
   if (!value) return '--'
   const date = new Date(value)
@@ -41,6 +46,22 @@ function formatMoneyFlow(value?: number | null) {
   return `${number >= 0 ? '+' : ''}${formatNumber(number)}`
 }
 
+function formatAmountCn(value?: number | null) {
+  if (!isFiniteNumberValue(value)) return '--'
+  const number = Number(value)
+  const abs = Math.abs(number)
+  if (abs >= 1e12) return `${formatNumber(number / 1e12)} 万亿元`
+  if (abs >= 1e8) return `${formatNumber(number / 1e8)} 亿元`
+  if (abs >= 1e4) return `${formatNumber(number / 1e4)} 万元`
+  return `${formatNumber(number)} 元`
+}
+
+function formatSignedPercent(value?: number | null) {
+  if (!isFiniteNumberValue(value)) return '--'
+  const number = Number(value)
+  return `${number >= 0 ? '+' : ''}${formatNumber(number)}%`
+}
+
 function createFallbackOverview(): MarketOverviewResponse {
   return {
     indices: [
@@ -54,6 +75,8 @@ function createFallbackOverview(): MarketOverviewResponse {
     sector_losers: [],
     sector_fund_inflows: [],
     sector_fund_outflows: [],
+    market_stats: {},
+    market_behavior_labels: {},
     updated_at: new Date().toISOString(),
     source: 'frontend_fallback',
     fallback: true,
@@ -225,6 +248,8 @@ export default function StockMarket() {
     [overview?.indices, overview?.top_gainers, overview?.top_losers, selectedSymbol],
   )
   const backendGovernance = overview?.data_governance || null
+  const marketStats = overview?.market_stats || {}
+  const marketBehavior = overview?.market_behavior_labels || {}
   const governanceItems = useMemo<DataSourceGovernanceItem[]>(() => {
     if (backendGovernance?.items?.length) return backendGovernance.items
     const indexSources = Array.from(new Set((overview?.indices || []).map(item => item.source).filter(Boolean)))
@@ -272,6 +297,18 @@ export default function StockMarket() {
       },
     ]
   }, [backendGovernance?.items, overview])
+  const marketBehaviorCards = useMemo(() => {
+    const labels = marketBehavior as Record<string, { label?: string; detail?: string }>
+    return [
+      labels.liquidity_state,
+      labels.breadth_state,
+      labels.market_regime,
+      labels.sentiment_state,
+      labels.style_rotation,
+      labels.sector_battlefield,
+      labels.risk_pressure,
+    ].filter(Boolean)
+  }, [marketBehavior])
   const governanceWarnings = useMemo(() => {
     if (backendGovernance?.warnings?.length) {
       const merged = [...backendGovernance.warnings]
@@ -368,6 +405,58 @@ export default function StockMarket() {
         items={governanceItems}
         warnings={governanceWarnings}
       />
+
+      <div className="grid gap-4 xl:grid-cols-4">
+        <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950/50">
+          <div className="text-xs text-slate-400">两市成交额</div>
+          <div className="mt-2 text-lg font-semibold text-slate-900 dark:text-slate-100">
+            {formatAmountCn(asNumber(marketStats.index_turnover_amount ?? marketStats.total_amount))}
+          </div>
+          <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+            {marketStats.amount_change == null ? '较前一交易日变化未覆盖' : `较前一交易日 ${formatAmountCn(asNumber(marketStats.amount_change))}`}
+          </div>
+        </div>
+        <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950/50">
+          <div className="text-xs text-slate-400">上涨 / 下跌家数</div>
+          <div className="mt-2 text-lg font-semibold text-slate-900 dark:text-slate-100">
+            {marketStats.up_count ?? '--'} / {marketStats.down_count ?? '--'}
+          </div>
+          <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+            {marketStats.breadth_ratio == null ? '广度比未覆盖' : `涨跌比 ${formatNumber(asNumber(marketStats.breadth_ratio), 2)}`}
+          </div>
+        </div>
+        <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950/50">
+          <div className="text-xs text-slate-400">涨停 / 跌停</div>
+          <div className="mt-2 text-lg font-semibold text-slate-900 dark:text-slate-100">
+            {marketStats.limit_up_count ?? '--'} / {marketStats.limit_down_count ?? '--'}
+          </div>
+          <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+            {marketStats.limit_up_promotion_rate == null ? '晋级率未覆盖' : `晋级率 ${formatSignedPercent(asNumber(marketStats.limit_up_promotion_rate))}`}
+          </div>
+        </div>
+        <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950/50">
+          <div className="text-xs text-slate-400">市场状态</div>
+          <div className="mt-2 text-sm font-semibold text-slate-900 dark:text-slate-100">
+            {typeof marketBehavior?.market_regime === 'object' && marketBehavior?.market_regime && 'label' in marketBehavior.market_regime
+              ? (marketBehavior.market_regime as { label?: string }).label || '--'
+              : '--'}
+          </div>
+          <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+            {typeof marketBehavior?.liquidity_state === 'object' && marketBehavior?.liquidity_state && 'label' in marketBehavior.liquidity_state
+              ? (marketBehavior.liquidity_state as { label?: string }).label || '--'
+              : '--'}
+          </div>
+        </div>
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        {marketBehaviorCards.length > 0 ? marketBehaviorCards.map((item, index) => (
+          <div key={`${item?.label || 'behavior'}-${index}`} className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950/50">
+            <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">{item?.label || '--'}</div>
+            <div className="mt-2 text-sm leading-6 text-slate-600 dark:text-slate-300">{item?.detail || '--'}</div>
+          </div>
+        )) : null}
+      </div>
 
       {loading || !overview ? (
         <div className="card flex min-h-[320px] items-center justify-center text-slate-500 dark:text-slate-400">

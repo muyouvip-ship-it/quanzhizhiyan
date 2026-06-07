@@ -13,6 +13,7 @@ from sqlalchemy.engine import Engine
 
 from api.core.env import load_project_env
 from api.services.market_data_pipeline_service import preferred_minute_kline_table
+from api.core.utils import safe_float as _safe_float
 
 
 MINUTE_CACHE_ROOT = Path("data/artifacts/minute_cache")
@@ -552,13 +553,6 @@ def _has_module(name: str) -> bool:
         return False
 
 
-def _safe_float(value: Any) -> float | None:
-    if value is None or (isinstance(value, float) and math.isnan(value)):
-        return None
-    try:
-        return float(value)
-    except Exception:
-        return None
 
 
 def _safe_iso(value: Any) -> str | None:

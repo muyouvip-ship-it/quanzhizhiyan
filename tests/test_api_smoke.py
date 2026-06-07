@@ -264,6 +264,33 @@ class TestChatCompletionsEndpoint:
         assert result["status"] == "completed"
         assert result["decision"] == "DRY_RUN"
 
+    def test_chat_completion_rejects_mixed_account_runtime_before_llm_parse(self):
+        mixed_runtime = {
+            "llm_provider": "openai",
+            "backend_url": "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2",
+            "quick_think_llm": "env-quick",
+            "deep_think_llm": "env-deep",
+            "api_key": "volcengine-key-only",
+            "_api_key_source": "user_config",
+            "_llm_provider_source": "TA_LLM_PROVIDER",
+            "_backend_url_source": "TA_BASE_URL",
+            "_quick_think_llm_source": "TA_LLM_QUICK",
+            "_deep_think_llm_source": "TA_LLM_DEEP",
+        }
+        with (
+            patch("api.main._build_runtime_config", return_value=mixed_runtime),
+            patch("api.main._ai_extract_symbol_and_date") as extract_symbol,
+        ):
+            r = self.client.post("/v1/chat/completions", headers=self.headers, json={
+                "messages": [{"role": "user", "content": "分析600519短线机会"}],
+                "stream": False,
+                "dry_run": True,
+            })
+
+        assert r.status_code == 400
+        assert "同源运行包" in r.json()["detail"]
+        extract_symbol.assert_not_called()
+
     def test_chat_completion_uses_fallback_symbol_from_request(self):
         """When prompt omits stock text, current page symbol can be used as fallback."""
         with patch("api.main._ai_extract_symbol_and_date", return_value=(None, None, ["short"], [], [], {})):
@@ -408,10 +435,41 @@ class TestRuntimeConfigWarmup:
         self.token = _auth(self.client)
         self.headers = {"Authorization": f"Bearer {self.token}"}
 
-    def test_model_change_schedules_warmup(self):
+    def test_get_config_exposes_core_stock_llm_readiness(self):
+        readiness = {
+            "enabled": True,
+            "ready": False,
+            "status": "missing_api_key",
+            "reason": "远程 LLM 已配置但缺少 API Key",
+            "provider": "openai",
+            "model": "astron-code-latest",
+            "base_url": "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2",
+            "api_key_source": None,
+            "base_url_source": "TA_BASE_URL",
+            "model_source": "TA_LLM_MODEL",
+            "requires_api_key": True,
+            "has_api_key": False,
+        }
+        with patch("api.services.news_theme_service.core_stock_llm_readiness", return_value=readiness) as llm_readiness:
+            r = self.client.get("/v1/config", headers=self.headers)
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["llm_core_stock"]["status"] == "missing_api_key"
+        assert body["llm_core_stock"]["provider"] == "openai"
+        assert body["llm_core_stock"]["base_url_source"] == "TA_BASE_URL"
+        assert body["llm_core_stock"]["has_api_key"] is False
+        assert "api_key" not in body["llm_core_stock"]
+        llm_readiness.assert_called_once()
+        assert llm_readiness.call_args.kwargs["user_id"] == _get_user_id_from_token(self.token)
+
+    def test_model_change_schedules_warmup(self, monkeypatch):
+        monkeypatch.setenv("TA_FORCE_LLM_RUNTIME", "0")
         model_name = f"gpt-test-quick-{uuid4().hex[:8]}"
         with patch("api.main._probe_runtime_config", return_value={"status": "ok", "model": model_name}) as probe, \
-             patch("api.main._run_config_warmup") as warmup:
+             patch("api.main._run_config_warmup") as warmup, \
+             patch("api.services.news_theme_service.core_stock_llm_readiness", return_value={"ready": False, "status": "missing_api_key"}), \
+             patch("api.routes.config._run_event_driven_selection_refresh") as refresh:
             r = self.client.patch("/v1/config", headers=self.headers, json={
                 "quick_think_llm": model_name,
             })
@@ -421,6 +479,66 @@ class TestRuntimeConfigWarmup:
         assert body["warmup"]["triggered"] is True
         assert model_name in body["warmup"]["models"]
         warmup.assert_called_once()
+        refresh.assert_not_called()
+
+    def test_llm_config_change_schedules_event_driven_selection_refresh(self):
+        model_name = f"astron-code-latest-{uuid4().hex[:8]}"
+        readiness = {
+            "enabled": True,
+            "ready": True,
+            "status": "ready",
+            "reason": "远程 LLM 配置可用",
+            "provider": "openai",
+            "model": model_name,
+            "base_url": "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2",
+            "requires_api_key": True,
+            "has_api_key": True,
+        }
+        with patch("api.main._probe_runtime_config", return_value={"status": "ok", "model": model_name}), \
+             patch("api.main._run_config_warmup"), \
+             patch("api.services.news_theme_service.core_stock_llm_readiness", return_value=readiness), \
+             patch("api.routes.config._run_event_driven_selection_refresh") as refresh:
+            r = self.client.patch("/v1/config", headers=self.headers, json={
+                "llm_provider": "openai",
+                "backend_url": "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2",
+                "quick_think_llm": model_name,
+                "api_key": "sk-test-valid",
+            })
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["event_driven_selection"]["requested"] is True
+        assert body["event_driven_selection"]["triggered"] is True
+        assert body["event_driven_selection"]["status"] == "scheduled"
+        assert body["event_driven_selection"]["llm_core_stock"]["status"] == "ready"
+        refresh.assert_called_once()
+
+    def test_llm_config_change_skips_event_refresh_when_llm_not_ready(self):
+        readiness = {
+            "enabled": True,
+            "ready": False,
+            "status": "missing_api_key",
+            "reason": "远程 LLM 已配置但缺少 API Key",
+            "provider": "openai",
+            "model": "astron-code-latest",
+            "base_url": "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2",
+            "requires_api_key": True,
+            "has_api_key": False,
+        }
+        with patch("api.main._run_config_warmup"), \
+             patch("api.services.news_theme_service.core_stock_llm_readiness", return_value=readiness), \
+             patch("api.routes.config._run_event_driven_selection_refresh") as refresh:
+            r = self.client.patch("/v1/config", headers=self.headers, json={
+                "quick_think_llm": "astron-code-latest",
+                "warmup": False,
+            })
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["event_driven_selection"]["requested"] is True
+        assert body["event_driven_selection"]["triggered"] is False
+        assert body["event_driven_selection"]["reason"] == "missing_api_key"
+        refresh.assert_not_called()
 
     def test_non_model_change_skips_warmup(self):
         with patch("api.main._run_config_warmup") as warmup:
@@ -431,11 +549,25 @@ class TestRuntimeConfigWarmup:
         body = r.json()
         assert body["warmup"]["status"] == "skipped"
         assert body["warmup"]["triggered"] is False
+        assert body["event_driven_selection"]["requested"] is False
         warmup.assert_not_called()
 
     def test_api_key_is_probed_before_save(self):
+        readiness = {
+            "enabled": True,
+            "ready": True,
+            "status": "ready",
+            "reason": "远程 LLM 配置可用",
+            "provider": "openai",
+            "model": "moonshot-v1-8k",
+            "base_url": "https://api.moonshot.cn/v1",
+            "requires_api_key": True,
+            "has_api_key": True,
+        }
         with patch("api.main._probe_runtime_config", return_value={"status": "ok", "model": "moonshot-v1-8k"}) as probe, \
-             patch("api.main._run_config_warmup") as warmup:
+             patch("api.main._run_config_warmup") as warmup, \
+             patch("api.services.news_theme_service.core_stock_llm_readiness", return_value=readiness), \
+             patch("api.routes.config._run_event_driven_selection_refresh") as refresh:
             r = self.client.patch("/v1/config", headers=self.headers, json={
                 "llm_provider": "openai",
                 "backend_url": "https://api.moonshot.cn/v1",
@@ -445,6 +577,81 @@ class TestRuntimeConfigWarmup:
         assert r.status_code == 200
         probe.assert_called_once()
         warmup.assert_called_once()
+        refresh.assert_called_once()
+
+    def test_config_update_persists_complete_news_llm_runtime_package(self):
+        user_id = _get_user_id_from_token(self.token)
+        with patch("api.main._probe_runtime_config", return_value={"status": "ok", "model": "deepseek-v4-flash"}), \
+             patch("api.main._run_config_warmup"), \
+             patch("api.routes.config._run_event_driven_selection_refresh"):
+            r = self.client.patch("/v1/config", headers=self.headers, json={
+                "llm_provider": "volcengine-ark",
+                "backend_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
+                "quick_think_llm": "deepseek-v4-flash",
+                "deep_think_llm": "deepseek-v4-pro",
+                "api_key": "volcengine-main-key",
+                "news_llm_provider": "volcengine-ark",
+                "news_backend_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
+                "news_analysis_llm": "deepseek-v4-flash",
+                "news_api_key": "volcengine-news-key",
+            })
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["current"]["news_llm_provider"] == "volcengine-ark"
+        assert body["current"]["news_backend_url"] == "https://ark.cn-beijing.volces.com/api/coding/v3"
+        assert body["current"]["news_analysis_llm"] == "deepseek-v4-flash"
+        assert body["current"]["has_news_api_key"] is True
+        assert body["current"]["llm_core_stock"]["ready"] is True
+        assert body["current"]["llm_core_stock"]["runtime_package_source"] == "user_news_config"
+        assert body["current"]["llm_core_stock"]["provider_source"] == "user_news_config"
+        assert body["current"]["llm_core_stock"]["base_url_source"] == "user_news_config"
+        assert body["current"]["llm_core_stock"]["model_source"] == "user_news_config"
+        assert body["current"]["llm_core_stock"]["api_key_source"] == "user_news_config"
+
+        from api.services import auth_service
+
+        with get_db_ctx() as db:
+            row = auth_service.get_user_llm_config(db, user_id)
+            assert row is not None
+            assert row.news_llm_provider == "volcengine-ark"
+            assert row.news_backend_url == "https://ark.cn-beijing.volces.com/api/coding/v3"
+            assert row.news_analysis_llm == "deepseek-v4-flash"
+            assert auth_service.decrypt_secret(row.news_api_key_encrypted) == "volcengine-news-key"
+
+    def test_clear_api_key_clears_news_llm_key_together(self):
+        user_id = _get_user_id_from_token(self.token)
+        from api.services import auth_service
+
+        with get_db_ctx() as db:
+            auth_service.upsert_user_llm_config(
+                db,
+                user_id,
+                llm_provider="volcengine-ark",
+                backend_url="https://ark.cn-beijing.volces.com/api/coding/v3",
+                quick_think_llm="deepseek-v4-flash",
+                api_key="volcengine-main-key",
+                news_llm_provider="volcengine-ark",
+                news_backend_url="https://ark.cn-beijing.volces.com/api/coding/v3",
+                news_analysis_llm="deepseek-v4-flash",
+                news_api_key="volcengine-news-key",
+            )
+
+        r = self.client.patch("/v1/config", headers=self.headers, json={
+            "clear_api_key": True,
+            "clear_news_api_key": True,
+            "warmup": False,
+        })
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["current"]["has_api_key"] is False
+        assert body["current"]["has_news_api_key"] is False
+        with get_db_ctx() as db:
+            row = auth_service.get_user_llm_config(db, user_id)
+            assert row is not None
+            assert row.api_key_encrypted is None
+            assert row.news_api_key_encrypted is None
 
     def test_invalid_api_key_is_rejected_before_save(self):
         with patch("api.main._probe_runtime_config", side_effect=HTTPException(status_code=400, detail="模型 Key 验证失败")) as probe, \
@@ -472,7 +679,8 @@ class TestRuntimeConfigWarmup:
         assert body["warmup"]["triggered"] is True
         warmup.assert_called_once()
 
-    def test_manual_warmup_returns_model_reply(self):
+    def test_manual_warmup_returns_model_reply(self, monkeypatch):
+        monkeypatch.setenv("TA_FORCE_LLM_RUNTIME", "0")
         with patch("api.main._invoke_runtime_warmup", return_value=[{
             "model": "gpt-test-quick",
             "targets": ["常规模型"],

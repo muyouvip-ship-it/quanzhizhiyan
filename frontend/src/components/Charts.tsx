@@ -1,306 +1,254 @@
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, AreaChart, Area, BarChart, Bar } from 'recharts'
+import { useEffect, useRef } from 'react'
+import {
+    AreaSeries,
+    ColorType,
+    createChart,
+    HistogramSeries,
+    LineSeries,
+    Time,
+} from 'lightweight-charts'
 
-interface ChartProps {
-  data: any[]
-  dataKey: string
-  title: string
-  color?: string
-  type?: 'line' | 'area' | 'bar'
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+function toChartTime(dateStr: string): Time | null {
+    if (!dateStr) return null
+    const d = new Date(dateStr.slice(0, 10) + 'T00:00:00')
+    if (Number.isNaN(d.getTime())) return null
+    return { year: d.getFullYear(), month: d.getMonth() + 1, day: d.getDate() } as Time
 }
 
-function formatChineseUnit(value: number) {
-  const abs = Math.abs(value)
-  if (abs >= 1e8) return `${(value / 1e8).toFixed(2)}亿`
-  if (abs >= 1e4) return `${(value / 1e4).toFixed(2)}万`
-  return value.toFixed(2)
+type ChartHandle = ReturnType<typeof createChart>
+type AnySeries = ReturnType<ChartHandle['addSeries']>
+
+function useChart(containerRef: React.RefObject<HTMLDivElement | null>, height: number) {
+    const chartRef = useRef<ChartHandle | null>(null)
+    const seriesList = useRef<AnySeries[]>([])
+
+    useEffect(() => {
+        if (!containerRef.current) return
+        const chart = createChart(containerRef.current, {
+            layout: {
+                background: { type: ColorType.Solid, color: 'transparent' },
+                textColor: '#94a3b8',
+                attributionLogo: false,
+            },
+            localization: { locale: 'zh-CN', dateFormat: 'yyyy-MM-dd' },
+            width: containerRef.current.clientWidth,
+            height,
+            grid: {
+                vertLines: { color: 'rgba(203,213,225,0.4)' },
+                horzLines: { color: 'rgba(203,213,225,0.4)' },
+            },
+            rightPriceScale: { borderColor: '#cbd5e1' },
+            timeScale: { borderColor: '#cbd5e1', timeVisible: false, rightOffset: 4 },
+            crosshair: {
+                vertLine: { color: 'rgba(59,130,246,0.25)' },
+                horzLine: { color: 'rgba(59,130,246,0.25)' },
+            },
+        })
+        chartRef.current = chart
+
+        const onResize = () => {
+            if (!containerRef.current || !chartRef.current) return
+            chartRef.current.applyOptions({ width: containerRef.current.clientWidth, height })
+        }
+        window.addEventListener('resize', onResize)
+
+        return () => {
+            window.removeEventListener('resize', onResize)
+            chartRef.current?.remove()
+            chartRef.current = null
+            seriesList.current = []
+        }
+    }, [containerRef, height])
+
+    return { chartRef, seriesList }
+}
+
+function clearSeries(chart: ChartHandle | null, list: React.MutableRefObject<AnySeries[]>) {
+    list.current.forEach(s => { try { chart?.removeSeries(s) } catch {} })
+    list.current = []
+}
+
+// ── PortfolioValueChart ──────────────────────────────────────────────────────
+
+export function PortfolioValueChart({ data }: { data: { date: string; value: number; cash?: number; position?: number; price?: number }[] }) {
+    const containerRef = useRef<HTMLDivElement | null>(null)
+    const { chartRef, seriesList } = useChart(containerRef, 300)
+
+    useEffect(() => {
+        const chart = chartRef.current
+        if (!chart || !data?.length) return
+        clearSeries(chart, seriesList)
+
+        const lineData = data.flatMap(d => { const t = toChartTime(d.date); return t ? [{ time: t, value: d.value }] : [] })
+        const cashData = data.flatMap(d => { const t = toChartTime(d.date); return t && d.cash != null ? [{ time: t, value: d.cash }] : [] })
+        const posData = data.flatMap(d => { const t = toChartTime(d.date); const pv = (d.position ?? 0) * (d.price ?? 0); return t ? [{ time: t, value: pv }] : [] })
+
+        if (lineData.length) {
+            const s = chart.addSeries(AreaSeries, { lineColor: '#3b82f6', topColor: 'rgba(59,130,246,0.3)', bottomColor: 'rgba(59,130,246,0.02)', lineWidth: 2, priceFormat: { type: 'price', minMove: 0.01 } })
+            s.setData(lineData); seriesList.current.push(s)
+        }
+        if (cashData.length) {
+            const s = chart.addSeries(LineSeries, { color: '#10b981', lineWidth: 2, priceFormat: { type: 'price', minMove: 0.01 } })
+            s.setData(cashData); seriesList.current.push(s)
+        }
+        if (posData.length) {
+            const s = chart.addSeries(LineSeries, { color: '#f59e0b', lineWidth: 2, priceFormat: { type: 'price', minMove: 0.01 } })
+            s.setData(posData); seriesList.current.push(s)
+        }
+        chart.timeScale().fitContent()
+    }, [chartRef, seriesList, data])
+
+    if (!data?.length) return <div className="bg-slate-50 rounded-lg p-8 text-center"><p className="text-slate-500">暂无数据</p></div>
+
+    return (
+        <div className="bg-white rounded-lg shadow p-6">
+            <h3 className="text-lg font-semibold text-slate-900 mb-4">组合价值</h3>
+            <div ref={containerRef} style={{ width: '100%', height: 300 }} />
+            <div className="flex gap-4 mt-2 text-xs text-slate-500">
+                <span><span className="inline-block w-3 h-3 rounded-sm mr-1 align-middle" style={{ background: '#3b82f6' }} />组合价值</span>
+                <span><span className="inline-block w-3 h-3 rounded-sm mr-1 align-middle" style={{ background: '#10b981' }} />现金</span>
+                <span><span className="inline-block w-3 h-3 rounded-sm mr-1 align-middle" style={{ background: '#f59e0b' }} />持仓价值</span>
+            </div>
+        </div>
+    )
+}
+
+// ── DrawdownChart ────────────────────────────────────────────────────────────
+
+export function DrawdownChart({ data }: { data: { date: string; value: number }[] }) {
+    const containerRef = useRef<HTMLDivElement | null>(null)
+    const { chartRef, seriesList } = useChart(containerRef, 250)
+
+    useEffect(() => {
+        const chart = chartRef.current
+        if (!chart || !data?.length) return
+        clearSeries(chart, seriesList)
+
+        const peaks: number[] = []
+        data.forEach((item, i) => { peaks.push(i === 0 ? item.value : Math.max(peaks[i - 1], item.value)) })
+
+        const ddData = data.flatMap((item, i) => {
+            const t = toChartTime(item.date)
+            const peak = peaks[i] ?? item.value
+            const dd = peak === 0 ? 0 : (item.value - peak) / peak
+            return t ? [{ time: t, value: dd * 100 }] : []
+        })
+
+        if (ddData.length) {
+            const s = chart.addSeries(AreaSeries, { lineColor: '#ef4444', topColor: 'rgba(239,68,68,0.3)', bottomColor: 'rgba(239,68,68,0.02)', lineWidth: 2 })
+            s.setData(ddData); seriesList.current.push(s)
+        }
+        chart.timeScale().fitContent()
+    }, [chartRef, seriesList, data])
+
+    if (!data?.length) return <div className="bg-slate-50 rounded-lg p-8 text-center"><p className="text-slate-500">暂无数据</p></div>
+
+    return (
+        <div className="bg-white rounded-lg shadow p-6">
+            <h3 className="text-lg font-semibold text-slate-900 mb-4">回撤曲线</h3>
+            <div ref={containerRef} style={{ width: '100%', height: 250 }} />
+        </div>
+    )
+}
+
+// ── ReturnsDistributionChart ─────────────────────────────────────────────────
+
+export function ReturnsDistributionChart({ data }: { data: { date: string; value: number }[] }) {
+    const containerRef = useRef<HTMLDivElement | null>(null)
+    const { chartRef, seriesList } = useChart(containerRef, 250)
+
+    useEffect(() => {
+        const chart = chartRef.current
+        if (!chart || !data?.length) return
+        clearSeries(chart, seriesList)
+
+        const returns: number[] = []
+        for (let i = 1; i < data.length; i++) returns.push((data[i].value - data[i - 1].value) / data[i - 1].value)
+
+        const bins = [
+            { low: -Infinity, high: -0.05 },
+            { low: -0.05, high: -0.03 },
+            { low: -0.03, high: -0.01 },
+            { low: -0.01, high: 0 },
+            { low: 0, high: 0.01 },
+            { low: 0.01, high: 0.03 },
+            { low: 0.03, high: 0.05 },
+            { low: 0.05, high: Infinity },
+        ]
+
+        const histData = bins.map((bin, i) => ({
+            time: i as Time,
+            value: returns.filter(r => r >= bin.low && r < bin.high).length,
+            color: '#8b5cf6',
+        }))
+
+        if (histData.length) {
+            const s = chart.addSeries(HistogramSeries, {})
+            s.setData(histData); seriesList.current.push(s)
+        }
+        chart.timeScale().fitContent()
+    }, [chartRef, seriesList, data])
+
+    if (!data?.length) return <div className="bg-slate-50 rounded-lg p-8 text-center"><p className="text-slate-500">暂无数据</p></div>
+
+    return (
+        <div className="bg-white rounded-lg shadow p-6">
+            <h3 className="text-lg font-semibold text-slate-900 mb-4">收益分布</h3>
+            <div ref={containerRef} style={{ width: '100%', height: 250 }} />
+            <div className="flex flex-wrap gap-2 mt-2 text-[11px] text-slate-400">
+                {['<-5%', '-5~-3%', '-3~-1%', '-1~0%', '0~1%', '1~3%', '3~5%', '>5%'].map(l => (<span key={l}>{l}</span>))}
+            </div>
+        </div>
+    )
+}
+
+// ── PerformanceChart ─────────────────────────────────────────────────────────
+
+interface ChartProps {
+    data: { date: string; [key: string]: unknown }[]
+    dataKey: string
+    title: string
+    color?: string
+    type?: 'line' | 'area' | 'bar'
 }
 
 export function PerformanceChart({ data, dataKey, title, color = '#3b82f6', type = 'line' }: ChartProps) {
-  if (!data || data.length === 0) {
+    const containerRef = useRef<HTMLDivElement | null>(null)
+    const { chartRef, seriesList } = useChart(containerRef, 300)
+
+    useEffect(() => {
+        const chart = chartRef.current
+        if (!chart || !data?.length) return
+        clearSeries(chart, seriesList)
+
+        const chartData = data.flatMap(item => {
+            const t = toChartTime(item.date as string)
+            const v = Number(item[dataKey])
+            return t && Number.isFinite(v) ? [{ time: t, value: v }] : []
+        })
+        if (!chartData.length) return
+
+        if (type === 'bar') {
+            const s = chart.addSeries(HistogramSeries, { color })
+            s.setData(chartData.map(d => ({ ...d, color }))); seriesList.current.push(s)
+        } else if (type === 'area') {
+            const s = chart.addSeries(AreaSeries, { lineColor: color, topColor: `${color}4d`, bottomColor: `${color}05`, lineWidth: 2 })
+            s.setData(chartData); seriesList.current.push(s)
+        } else {
+            const s = chart.addSeries(LineSeries, { color, lineWidth: 2 })
+            s.setData(chartData); seriesList.current.push(s)
+        }
+        chart.timeScale().fitContent()
+    }, [chartRef, seriesList, data, dataKey, color, type])
+
+    if (!data?.length) return <div className="bg-slate-50 rounded-lg p-8 text-center"><p className="text-slate-500">暂无数据</p></div>
+
     return (
-      <div className="bg-slate-50 rounded-lg p-8 text-center">
-        <p className="text-slate-500">暂无数据</p>
-      </div>
+        <div className="bg-white rounded-lg shadow p-6">
+            <h3 className="text-lg font-semibold text-slate-900 mb-4">{title}</h3>
+            <div ref={containerRef} style={{ width: '100%', height: 300 }} />
+        </div>
     )
-  }
-
-  const formatValue = (value: number) => {
-    return formatChineseUnit(value)
-  }
-
-  const formatPercent = (value: number) => {
-    return `${(value * 100).toFixed(2)}%`
-  }
-
-  const formatDate = (date: string) => {
-    try {
-      const d = new Date(date)
-      return `${d.getMonth() + 1}/${d.getDate()}`
-    } catch {
-      return date
-    }
-  }
-
-  const chartData = data.map((item) => ({
-    ...item,
-    date: formatDate(item.date),
-  }))
-
-  const isPercentage = dataKey.includes('return') || dataKey.includes('rate') || dataKey.includes('drawdown')
-  const formatter = isPercentage ? formatPercent : formatValue
-
-  if (type === 'area') {
-    return (
-      <div className="bg-white rounded-lg shadow p-6">
-        <h3 className="text-lg font-semibold text-slate-900 mb-4">{title}</h3>
-        <ResponsiveContainer width="100%" height={300}>
-          <AreaChart data={chartData}>
-            <defs>
-              <linearGradient id="colorValue" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%" stopColor={color} stopOpacity={0.3} />
-                <stop offset="95%" stopColor={color} stopOpacity={0} />
-              </linearGradient>
-            </defs>
-            <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-            <XAxis dataKey="date" stroke="#94a3b8" fontSize={12} />
-            <YAxis stroke="#94a3b8" fontSize={12} tickFormatter={formatter} />
-            <Tooltip
-              formatter={(value: any) => [formatter(value), title]}
-              contentStyle={{ backgroundColor: '#fff', border: '1px solid #e2e8f0', borderRadius: '8px' }}
-            />
-            <Area type="monotone" dataKey={dataKey} stroke={color} fillOpacity={1} fill="url(#colorValue)" strokeWidth={2} />
-          </AreaChart>
-        </ResponsiveContainer>
-      </div>
-    )
-  }
-
-  if (type === 'bar') {
-    return (
-      <div className="bg-white rounded-lg shadow p-6">
-        <h3 className="text-lg font-semibold text-slate-900 mb-4">{title}</h3>
-        <ResponsiveContainer width="100%" height={300}>
-          <BarChart data={chartData}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-            <XAxis dataKey="date" stroke="#94a3b8" fontSize={12} />
-            <YAxis stroke="#94a3b8" fontSize={12} tickFormatter={formatter} />
-            <Tooltip
-              formatter={(value: any) => [formatter(value), title]}
-              contentStyle={{ backgroundColor: '#fff', border: '1px solid #e2e8f0', borderRadius: '8px' }}
-            />
-            <Bar dataKey={dataKey} fill={color} radius={[4, 4, 0, 0]} />
-          </BarChart>
-        </ResponsiveContainer>
-      </div>
-    )
-  }
-
-  return (
-    <div className="bg-white rounded-lg shadow p-6">
-      <h3 className="text-lg font-semibold text-slate-900 mb-4">{title}</h3>
-      <ResponsiveContainer width="100%" height={300}>
-        <LineChart data={chartData}>
-          <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-          <XAxis dataKey="date" stroke="#94a3b8" fontSize={12} />
-          <YAxis stroke="#94a3b8" fontSize={12} tickFormatter={formatter} />
-          <Tooltip
-            formatter={(value: any) => [formatter(value), title]}
-            contentStyle={{ backgroundColor: '#fff', border: '1px solid #e2e8f0', borderRadius: '8px' }}
-          />
-          <Legend />
-          <Line type="monotone" dataKey={dataKey} stroke={color} strokeWidth={2} dot={false} name={title} />
-        </LineChart>
-      </ResponsiveContainer>
-    </div>
-  )
-}
-
-export function PortfolioValueChart({ data }: { data: any[] }) {
-  if (!data || data.length === 0) {
-    return (
-      <div className="bg-slate-50 rounded-lg p-8 text-center">
-        <p className="text-slate-500">暂无数据</p>
-      </div>
-    )
-  }
-
-  const formatDate = (date: string) => {
-    try {
-      const d = new Date(date)
-      return `${d.getMonth() + 1}/${d.getDate()}`
-    } catch {
-      return date
-    }
-  }
-
-  const chartData = data.map((item) => ({
-    date: formatDate(item.date),
-    组合价值: item.value,
-    现金: item.cash,
-    持仓价值: item.position * item.price,
-  }))
-
-  return (
-    <div className="bg-white rounded-lg shadow p-6">
-      <h3 className="text-lg font-semibold text-slate-900 mb-4">组合价值曲线</h3>
-      <ResponsiveContainer width="100%" height={350}>
-        <AreaChart data={chartData}>
-          <defs>
-            <linearGradient id="colorValue" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3} />
-              <stop offset="95%" stopColor="#3b82f6" stopOpacity={0} />
-            </linearGradient>
-          </defs>
-          <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-          <XAxis dataKey="date" stroke="#94a3b8" fontSize={12} />
-          <YAxis
-            stroke="#94a3b8"
-            fontSize={12}
-            tickFormatter={(value) => formatChineseUnit(Number(value))}
-          />
-          <Tooltip
-            formatter={(value: any) => [`¥${value.toLocaleString()}`, '']}
-            labelFormatter={(label) => `日期: ${label}`}
-            contentStyle={{ backgroundColor: '#fff', border: '1px solid #e2e8f0', borderRadius: '8px' }}
-          />
-          <Legend />
-          <Area
-            type="monotone"
-            dataKey="组合价值"
-            stroke="#3b82f6"
-            fillOpacity={1}
-            fill="url(#colorValue)"
-            strokeWidth={2}
-          />
-          <Line type="monotone" dataKey="现金" stroke="#10b981" strokeWidth={2} dot={false} />
-          <Line type="monotone" dataKey="持仓价值" stroke="#f59e0b" strokeWidth={2} dot={false} />
-        </AreaChart>
-      </ResponsiveContainer>
-    </div>
-  )
-}
-
-export function DrawdownChart({ data }: { data: any[] }) {
-  if (!data || data.length === 0) {
-    return (
-      <div className="bg-slate-50 rounded-lg p-8 text-center">
-        <p className="text-slate-500">暂无数据</p>
-      </div>
-    )
-  }
-
-  const formatDate = (date: string) => {
-    try {
-      const d = new Date(date)
-      return `${d.getMonth() + 1}/${d.getDate()}`
-    } catch {
-      return date
-    }
-  }
-
-  const peaks = data.reduce<number[]>((acc, item, index) => {
-    acc.push(index === 0 ? item.value : Math.max(acc[index - 1], item.value))
-    return acc
-  }, [])
-  const chartData = data.map((item, index) => {
-    const peak = peaks[index] ?? item.value
-    const drawdown = peak === 0 ? 0 : (item.value - peak) / peak
-    return {
-      date: formatDate(item.date),
-      回撤: drawdown,
-    }
-  })
-
-  return (
-    <div className="bg-white rounded-lg shadow p-6">
-      <h3 className="text-lg font-semibold text-slate-900 mb-4">回撤曲线</h3>
-      <ResponsiveContainer width="100%" height={250}>
-        <AreaChart data={chartData}>
-          <defs>
-            <linearGradient id="colorDrawdown" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="5%" stopColor="#ef4444" stopOpacity={0.3} />
-              <stop offset="95%" stopColor="#ef4444" stopOpacity={0} />
-            </linearGradient>
-          </defs>
-          <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-          <XAxis dataKey="date" stroke="#94a3b8" fontSize={12} />
-          <YAxis
-            stroke="#94a3b8"
-            fontSize={12}
-            tickFormatter={(value) => `${(value * 100).toFixed(1)}%`}
-          />
-          <Tooltip
-            formatter={(value: any) => [`${(value * 100).toFixed(2)}%`, '回撤']}
-            contentStyle={{ backgroundColor: '#fff', border: '1px solid #e2e8f0', borderRadius: '8px' }}
-          />
-          <Area
-            type="monotone"
-            dataKey="回撤"
-            stroke="#ef4444"
-            fillOpacity={1}
-            fill="url(#colorDrawdown)"
-            strokeWidth={2}
-          />
-        </AreaChart>
-      </ResponsiveContainer>
-    </div>
-  )
-}
-
-export function ReturnsDistributionChart({ data }: { data: any[] }) {
-  if (!data || data.length === 0) {
-    return (
-      <div className="bg-slate-50 rounded-lg p-8 text-center">
-        <p className="text-slate-500">暂无数据</p>
-      </div>
-    )
-  }
-
-  // 计算每日收益率
-  const returns = []
-  for (let i = 1; i < data.length; i++) {
-    const dailyReturn = (data[i].value - data[i - 1].value) / data[i - 1].value
-    returns.push(dailyReturn)
-  }
-
-  // 分组统计
-  const bins = [
-    { range: '<-5%', count: 0 },
-    { range: '-5%~-3%', count: 0 },
-    { range: '-3%~-1%', count: 0 },
-    { range: '-1%~0%', count: 0 },
-    { range: '0%~1%', count: 0 },
-    { range: '1%~3%', count: 0 },
-    { range: '3%~5%', count: 0 },
-    { range: '>5%', count: 0 },
-  ]
-
-  returns.forEach((r) => {
-    if (r < -0.05) bins[0].count++
-    else if (r < -0.03) bins[1].count++
-    else if (r < -0.01) bins[2].count++
-    else if (r < 0) bins[3].count++
-    else if (r < 0.01) bins[4].count++
-    else if (r < 0.03) bins[5].count++
-    else if (r < 0.05) bins[6].count++
-    else bins[7].count++
-  })
-
-  return (
-    <div className="bg-white rounded-lg shadow p-6">
-      <h3 className="text-lg font-semibold text-slate-900 mb-4">收益分布</h3>
-      <ResponsiveContainer width="100%" height={250}>
-        <BarChart data={bins}>
-          <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-          <XAxis dataKey="range" stroke="#94a3b8" fontSize={11} />
-          <YAxis stroke="#94a3b8" fontSize={12} />
-          <Tooltip
-            formatter={(value: any) => [`${value} 天`, '']}
-            contentStyle={{ backgroundColor: '#fff', border: '1px solid #e2e8f0', borderRadius: '8px' }}
-          />
-          <Bar dataKey="count" fill="#8b5cf6" radius={[4, 4, 0, 0]} name="天数" />
-        </BarChart>
-      </ResponsiveContainer>
-    </div>
-  )
 }

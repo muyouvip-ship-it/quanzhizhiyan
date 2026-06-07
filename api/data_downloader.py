@@ -5,6 +5,7 @@
 import akshare as ak
 import pandas as pd
 import inspect
+import json
 import os
 import re
 import sys
@@ -56,6 +57,72 @@ def _normalize_symbol_for_query(symbol: str) -> str:
             return f"{text}.SH"
         return f"{text}.SZ"
     return text
+
+
+def _stock_code_for_minute_query(symbol: str) -> str:
+    normalized = _normalize_symbol_for_query(symbol)
+    return normalized.split(".", 1)[0] if "." in normalized else normalized
+
+
+def _eastmoney_minute_secid(symbol: str) -> str:
+    normalized = _normalize_symbol_for_query(symbol)
+    code = _stock_code_for_minute_query(normalized)
+    if normalized.endswith(".SH") or code.startswith(("5", "6", "9")):
+        market = "1"
+    else:
+        market = "0"
+    return f"{market}.{code}"
+
+
+def _tencent_daily_symbol(symbol: str) -> str:
+    normalized = _normalize_symbol_for_query(symbol)
+    code = normalized.split(".", 1)[0] if "." in normalized else normalized
+    if normalized.endswith(".SH") or code.startswith(("5", "6", "9")):
+        return f"sh{code}"
+    if normalized.endswith(".BJ") or code.startswith(("4", "8")):
+        return f"bj{code}"
+    return f"sz{code}"
+
+
+def _fetch_eastmoney_minute_frame(symbol: str, *, ndays: int) -> pd.DataFrame:
+    session = requests.Session()
+    session.trust_env = False
+    response = session.get(
+        "https://push2his.eastmoney.com/api/qt/stock/trends2/get",
+        params={
+            "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+            "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+            "ndays": max(1, min(int(ndays or 1), 5)),
+            "iscr": "0",
+            "secid": _eastmoney_minute_secid(symbol),
+        },
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://quote.eastmoney.com/",
+        },
+        timeout=float(os.getenv("EASTMONEY_MINUTE_TIMEOUT_SECONDS", "8") or 8),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    trends = ((payload.get("data") or {}).get("trends") or [])
+    rows: list[dict[str, Any]] = []
+    for item in trends:
+        parts = str(item or "").split(",")
+        if len(parts) < 7:
+            continue
+        rows.append(
+            {
+                "时间": parts[0],
+                "开盘": parts[1],
+                "收盘": parts[2],
+                "最高": parts[3],
+                "最低": parts[4],
+                "成交量": parts[5],
+                "成交额": parts[6],
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 class DataDownloader:
@@ -151,6 +218,8 @@ class DataDownloader:
                 df = self._fetch_daily_kline_via_baostock(symbol, start_date, end_date)
             elif normalized_source == "efinance":
                 df = self._fetch_daily_kline_via_efinance(symbol, start_date, end_date)
+            elif normalized_source == "tencent":
+                df = self._fetch_daily_kline_via_tencent(symbol, start_date, end_date)
             else:
                 # 新浪接口没有日期参数，会返回所有历史数据
                 df = ak.stock_zh_a_daily(symbol=f"sh{symbol}" if symbol.startswith('6') else f"sz{symbol}", adjust="qfq")
@@ -174,6 +243,9 @@ class DataDownloader:
             
             records_data = []
             for _, row in df_filtered.iterrows():
+                volume_value = _pick_frame_value(row, "volume", "成交量")
+                if normalized_source in {"tencent"} and volume_value is not None:
+                    volume_value = volume_value * 100
                 records_data.append({
                     "symbol": symbol,
                     "trade_date": row[date_column].date(),
@@ -181,20 +253,21 @@ class DataDownloader:
                     "high": _pick_frame_value(row, "high", "最高"),
                     "low": _pick_frame_value(row, "low", "最低"),
                     "close": _pick_frame_value(row, "close", "收盘"),
-                    "volume": _pick_frame_value(row, "volume", "成交量"),
+                    "volume": volume_value,
                     "amount": _pick_frame_value(row, "amount", "成交额"),
                     "turnover_rate": _pick_frame_value(row, "turnover", "换手率"),
                     "pre_close": _pick_frame_value(row, "pre_close", "昨收"),
                 })
 
-            ingest_result = ingest_raw_daily_rows(source=normalized_source, rows=records_data)
+            ingest_source = "akshare" if normalized_source == "tencent" else normalized_source
+            ingest_result = ingest_raw_daily_rows(source=ingest_source, rows=records_data)
             if not ingest_result.get("success"):
                 return {"success": False, "records": 0, "error": ingest_result.get("error", "raw ingest failed")}
             reconcile_daily_trade_dates(trade_dates=ingest_result.get("trade_dates") or [], symbols=[symbol])
 
             records_inserted = len(records_data)
             logger.info("成功下载 %s 日K线数据 %s 条 (source=%s)", symbol, records_inserted, normalized_source)
-            return {"success": True, "records": records_inserted, "source": normalized_source}
+            return {"success": True, "records": records_inserted, "source": normalized_source, "ingest_source": ingest_source}
             
         except Exception as e:
             logger.error(f"下载 {symbol} 日K线数据失败: {e}")
@@ -322,6 +395,63 @@ class DataDownloader:
             "昨收": "昨收",
         }
         return frame.rename(columns=rename_map)
+
+    def _fetch_daily_kline_via_tencent(self, symbol: str, start_date: date, end_date: date) -> pd.DataFrame:
+        session = requests.Session()
+        session.trust_env = False
+        tencent_symbol = _tencent_daily_symbol(symbol)
+        rows: list[dict[str, Any]] = []
+        for year in range(min(start_date.year, end_date.year), max(start_date.year, end_date.year) + 1):
+            adjust = "qfq"
+            response = session.get(
+                "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get",
+                params={
+                    "_var": f"kline_day{adjust}{year}",
+                    "param": f"{tencent_symbol},day,{year}-01-01,{year + 1}-12-31,640,{adjust}",
+                    "r": "0.8205512681390605",
+                },
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer": "https://gu.qq.com/",
+                },
+                timeout=float(os.getenv("TENCENT_DAILY_TIMEOUT_SECONDS", "10") or 10),
+            )
+            response.raise_for_status()
+            raw_text = response.text
+            json_start = raw_text.find("={")
+            payload = json.loads(raw_text[json_start + 1:] if json_start >= 0 else raw_text)
+            symbol_payload = ((payload.get("data") or {}).get(tencent_symbol) or {})
+            klines = symbol_payload.get("qfqday") or symbol_payload.get("day") or []
+            previous_close = None
+            for parts in klines:
+                if not isinstance(parts, list) or len(parts) < 6:
+                    continue
+                trade_date = pd.to_datetime(parts[0], errors="coerce")
+                if pd.isna(trade_date):
+                    continue
+                volume_hands = _pick_frame_value(pd.Series({"volume": parts[5]}), "volume")
+                amount_wan = _pick_frame_value(pd.Series({"amount": parts[8] if len(parts) > 8 else None}), "amount")
+                close_price = _pick_frame_value(pd.Series({"close": parts[2]}), "close")
+                pre_close = previous_close
+                if close_price is not None:
+                    previous_close = close_price
+                trade_day = trade_date.date()
+                if trade_day < start_date or trade_day > end_date:
+                    continue
+                rows.append(
+                    {
+                        "date": trade_day,
+                        "open": parts[1],
+                        "close": close_price,
+                        "high": parts[3],
+                        "low": parts[4],
+                        "volume": volume_hands,
+                        "amount": amount_wan * 10000 if amount_wan is not None else None,
+                        "turnover": parts[7] if len(parts) > 7 else None,
+                        "pre_close": pre_close,
+                    }
+                )
+        return pd.DataFrame(rows)
 
     def get_main_index_symbols(self) -> List[str]:
         """获取主要指数代码"""
@@ -828,11 +958,10 @@ class DataDownloader:
         source: str = "akshare",
     ) -> Dict[str, Any]:
         """下载股票1分钟K线数据，并写入 raw/norm/published 层。"""
-        import time
         import random
         
         # 添加请求延时，避免API限流
-        await asyncio.sleep(random.uniform(0.5, 1.5))
+        await asyncio.sleep(random.uniform(0.2, 0.8))
         
         try:
             logger.info("开始下载 %s 1分钟K线数据: %s ~ %s (source=%s)", symbol, start_date, end_date, source)
@@ -848,20 +977,28 @@ class DataDownloader:
                 end_date = date.today()
                 start_date = end_date - timedelta(days=30)
 
-            # 使用东方财富分钟K线接口（带重试机制）
-            max_retries = 3
+            # 使用东方财富分钟K线接口（带轻量重试机制）
+            max_retries = max(1, min(int(os.getenv("AKSHARE_MINUTE_RETRIES", "1") or 1), 3))
             df = None
+            query_symbol = _stock_code_for_minute_query(symbol)
+            akshare_error: Exception | None = None
             for attempt in range(max_retries):
                 try:
-                    df = ak.stock_zh_a_hist_min_em(symbol=symbol, period='1', adjust='qfq')
+                    df = ak.stock_zh_a_hist_min_em(symbol=query_symbol, period='1', adjust='qfq')
                     break
                 except Exception as e:
+                    akshare_error = e
                     if attempt < max_retries - 1:
                         wait_time = (attempt + 1) * 2  # 递增等待时间：2s, 4s, 6s
                         logger.warning(f"股票 {symbol} 第{attempt+1}次请求失败，{wait_time}秒后重试: {e}")
                         await asyncio.sleep(wait_time)
-                    else:
-                        raise e
+            if df is None:
+                try:
+                    lookback_days = max(1, min((end_date - start_date).days + 1, 5))
+                    df = _fetch_eastmoney_minute_frame(symbol, ndays=lookback_days)
+                    logger.info("股票 %s AKShare失败后使用EastMoney直连补缺", symbol)
+                except Exception as direct_exc:
+                    raise RuntimeError(f"AKShare失败：{akshare_error}; EastMoney直连失败：{direct_exc}") from direct_exc
 
             if df.empty:
                 logger.warning(f"股票 {symbol} 没有1分钟K线数据")
@@ -881,10 +1018,11 @@ class DataDownloader:
 
             # 批量数据准备
             records_data = []
+            normalized_symbol = _normalize_symbol_for_query(symbol)
             for _, row in df_filtered.iterrows():
                 try:
                     records_data.append({
-                        "symbol": symbol,
+                        "symbol": normalized_symbol,
                         "trade_time": row['时间'],
                         "open": float(row['开盘']) if pd.notna(row['开盘']) else None,
                         "high": float(row['最高']) if pd.notna(row['最高']) else None,
@@ -904,7 +1042,7 @@ class DataDownloader:
             if not ingest_result.get("success"):
                 return {"success": False, "records": 0, "error": ingest_result.get("error", "raw ingest failed")}
             for trade_day in ingest_result.get("trade_dates") or []:
-                publish_minute_trade_date(trade_date=trade_day, symbols=[symbol], minimum_coverage_ratio=0.0)
+                publish_minute_trade_date(trade_date=trade_day, symbols=[normalized_symbol], minimum_coverage_ratio=0.0)
             logger.info("成功下载 %s 1分钟K线数据 %s 条", symbol, len(records_data))
             return {"success": True, "records": len(records_data), "source": normalized_source}
 

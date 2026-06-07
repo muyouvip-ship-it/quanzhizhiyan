@@ -9,7 +9,17 @@ from api.core.strategy_db import strategy_engine
 from api.database import init_db
 from api.job_store import get_job_store
 from api.models.strategy_models import Base
-from api.services import backtest_data_auto_update_service, daily_review_service, news_eye_service, qmt_market_sync_service, qmt_sync_scheduler_service, realtime_monitor_service
+from api.core.utils import env_flag as _env_flag
+from api.services import (
+    backtest_data_auto_update_service,
+    daily_review_service,
+    minute_kline_gap_filler_service,
+    news_eye_service,
+    qmt_market_sync_service,
+    qmt_minute_subscription_service,
+    qmt_sync_scheduler_service,
+    realtime_monitor_service,
+)
 
 
 def _log(msg: str):
@@ -17,9 +27,6 @@ def _log(msg: str):
 
     logger.info(msg)
 
-
-def _env_flag(name: str, default: str = "0") -> bool:
-    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
 @asynccontextmanager
@@ -56,10 +63,15 @@ async def lifespan(app):
     asyncio.create_task(asyncio.to_thread(refresh_cn_stock_map_if_stale), name="stock-map-refresh")
     qmt_sync_enabled = _env_flag("ENABLE_QMT_SYNC_WORKER", "0")
     qmt_market_enabled = _env_flag("ENABLE_QMT_MARKET_SYNC_WORKER", "0")
+    qmt_minute_subscription_enabled = _env_flag(
+        "ENABLE_QMT_MINUTE_SUBSCRIPTION_WORKER",
+        "1" if qmt_market_enabled else "0",
+    )
     backtest_auto_enabled = _env_flag("ENABLE_BACKTEST_AUTO_UPDATE_WORKER", "0")
     news_eye_enabled = _env_flag("ENABLE_NEWS_EYE_WORKER", "1")
     realtime_monitor_enabled = _env_flag("ENABLE_REALTIME_MONITOR_WORKER", "0")
     daily_review_enabled = _env_flag("ENABLE_DAILY_REVIEW_WORKER", "1")
+    minute_gap_filler_enabled = _env_flag("ENABLE_MINUTE_KLINE_GAP_FILLER_WORKER", "0")
 
     if qmt_sync_enabled:
         await qmt_sync_scheduler_service.start_background_worker()
@@ -71,6 +83,11 @@ async def lifespan(app):
         _log("QMT market sync worker started.")
     else:
         _log("QMT market sync worker skipped.")
+    if qmt_minute_subscription_enabled:
+        await qmt_minute_subscription_service.start_background_worker()
+        _log("QMT minute subscription worker started.")
+    else:
+        _log("QMT minute subscription worker skipped.")
     if backtest_auto_enabled:
         await backtest_data_auto_update_service.start_background_worker()
         _log("Backtest data auto update worker started.")
@@ -91,7 +108,15 @@ async def lifespan(app):
         _log("Daily review background worker started.")
     else:
         _log("Daily review background worker skipped.")
+    if minute_gap_filler_enabled:
+        await minute_kline_gap_filler_service.start_background_worker()
+        _log("Minute kline gap filler worker started.")
+    else:
+        _log("Minute kline gap filler worker skipped.")
     yield
+    if minute_gap_filler_enabled:
+        await minute_kline_gap_filler_service.stop_background_worker()
+        _log("Minute kline gap filler worker stopped.")
     if daily_review_enabled:
         await daily_review_service.stop_background_worker()
         _log("Daily review background worker stopped.")
@@ -101,6 +126,9 @@ async def lifespan(app):
     if news_eye_enabled:
         await news_eye_service.stop_background_worker()
         _log("News eye background worker stopped.")
+    if qmt_minute_subscription_enabled:
+        await qmt_minute_subscription_service.stop_background_worker()
+        _log("QMT minute subscription worker stopped.")
     if qmt_market_enabled:
         await qmt_market_sync_service.stop_background_worker()
         _log("QMT market sync worker stopped.")

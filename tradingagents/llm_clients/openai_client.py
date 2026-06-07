@@ -12,6 +12,29 @@ _logger = logging.getLogger(__name__)
 from .base_client import BaseLLMClient
 from .validators import validate_model
 
+_OPENAI_COMPATIBLE_PROVIDER_BASE_URLS = {
+    "openai": "https://api.openai.com/v1",
+    "xai": "https://api.x.ai/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "ollama": "http://localhost:11434/v1",
+    "volcengine": "https://ark.cn-beijing.volces.com/api/coding/v3",
+    "volcengine-ark": "https://ark.cn-beijing.volces.com/api/coding/v3",
+    "ark": "https://ark.cn-beijing.volces.com/api/coding/v3",
+    "dashscope": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "moonshot": "https://api.moonshot.cn/v1",
+    "zhipu": "https://open.bigmodel.cn/api/paas/v4",
+    "siliconflow": "https://api.siliconflow.cn/v1",
+}
+
+_PROVIDER_API_KEY_ENV = {
+    "xai": "XAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "volcengine": "VOLCENGINE_API_KEY",
+    "volcengine-ark": "VOLCENGINE_API_KEY",
+    "ark": "ARK_API_KEY",
+}
+
 
 class UnifiedChatOpenAI(ChatOpenAI):
     """ChatOpenAI subclass that strips incompatible params for certain models."""
@@ -94,25 +117,21 @@ class OpenAIClient(BaseLLMClient):
         # 2. 超长超时：默认 300 秒，给足推理模型思考时间
         llm_kwargs["timeout"] = self.kwargs.get("timeout", 300.0)
         
-        target_url = self.base_url or "https://api.openai.com/v1"
-        if self.provider == "xai": target_url = "https://api.x.ai/v1"
-        elif self.provider == "openrouter": target_url = "https://openrouter.ai/api/v1"
-        elif self.provider == "ollama": target_url = self.base_url or "http://localhost:11434/v1"
+        target_url = self.base_url or _OPENAI_COMPATIBLE_PROVIDER_BASE_URLS.get(self.provider) or _OPENAI_COMPATIBLE_PROVIDER_BASE_URLS["openai"]
         
         print(f"[LLM Client] Init {self.provider} ({self.model}) at {target_url} (Retries=0, Timeout={llm_kwargs['timeout']}s)")
 
-        if self.provider == "xai":
-            llm_kwargs["base_url"] = "https://api.x.ai/v1"
-            api_key = os.environ.get("XAI_API_KEY")
-            if api_key: llm_kwargs["api_key"] = api_key
-        elif self.provider == "openrouter":
-            llm_kwargs["base_url"] = "https://openrouter.ai/api/v1"
-            api_key = os.environ.get("OPENROUTER_API_KEY")
-            if api_key: llm_kwargs["api_key"] = api_key
-        elif self.provider == "ollama":
+        if self.provider == "ollama":
             llm_kwargs["base_url"] = target_url
             llm_kwargs["api_key"] = "ollama"
-        elif self.base_url:
+        elif self.base_url or self.provider != "openai":
+            env_key_name = _PROVIDER_API_KEY_ENV.get(self.provider)
+            env_key = os.environ.get(env_key_name) if env_key_name else None
+            llm_kwargs["base_url"] = target_url
+            if env_key and "api_key" not in llm_kwargs:
+                llm_kwargs["api_key"] = env_key
+
+        if "base_url" not in llm_kwargs and self.base_url:
             llm_kwargs["base_url"] = self.base_url
 
         # Pass remaining keys

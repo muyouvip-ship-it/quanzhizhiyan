@@ -1,11 +1,19 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react'
-import { Activity, AlertTriangle, CalendarDays, Clock3, History, Loader2, RefreshCcw, Send, Sparkles } from 'lucide-react'
+import { Activity, AlertTriangle, BookOpenText, CalendarDays, CandlestickChart, Clock3, History, Loader2, RefreshCcw, Send, Sparkles, Target } from 'lucide-react'
 import { api } from '@/services/api'
 import type { DailyReview, DailyReviewConfig, DailyReviewHistoryItem, DailyReviewRisk, DailyReviewStock, DailyReviewStockDiagnostic, DailyReviewTheme } from '@/types'
 
 const MarkdownBlock = lazy(() => import('@/components/MarkdownBlock'))
+const KlinePanel = lazy(() => import('@/components/KlinePanel'))
 
 type LoadState = 'idle' | 'loading' | 'error'
+
+type NarrativeCard = {
+    id: string
+    title: string
+    body: string
+    level: number
+}
 
 function formatTime(value?: string | null) {
     if (!value) return '--'
@@ -56,6 +64,127 @@ function StatusBadge({ status }: { status?: string | null }) {
         success: '成功',
     }
     return <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${classes}`}>{labelMap[normalized] || status || '未知'}</span>
+}
+
+function textList(items: Array<string | undefined | null>, fallback = '暂无结论') {
+    const values = items.map((item) => String(item || '').trim()).filter(Boolean)
+    return values.length ? values.join('、') : fallback
+}
+
+function riskTone(level?: string) {
+    const normalized = String(level || '').toLowerCase()
+    if (normalized === 'high') {
+        return 'border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-900/50 dark:bg-rose-950/20 dark:text-rose-300'
+    }
+    if (normalized === 'medium') {
+        return 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/50 dark:bg-amber-950/20 dark:text-amber-300'
+    }
+    return 'border-slate-200 bg-slate-50 text-slate-600 dark:border-slate-700 dark:bg-slate-900/50 dark:text-slate-300'
+}
+
+function ReviewDecisionPanel({ review, onOpenKline }: { review: DailyReview; onOpenKline: (symbol: string) => void }) {
+    const marketBullets = Array.isArray(review.market_summary?.bullets) ? review.market_summary.bullets.slice(0, 3) : []
+    const diagnostics = review.portfolio_technical_diagnostics || []
+    const nextThemes = review.next_main_themes || []
+    const risks = review.risk_watchpoints || []
+    const nextCandidates = review.next_candidate_stocks || []
+    const topThemeNames = textList(nextThemes.slice(0, 3).map((item) => item.theme), '暂无次日主线')
+    const highRiskCount = risks.filter((item) => String(item.level || '').toLowerCase() === 'high').length
+
+    return (
+        <section className="space-y-3">
+            <div className="flex flex-wrap items-end justify-between gap-3">
+                <div>
+                    <div className="text-xs font-medium text-slate-400">复盘摘要</div>
+                    <h2 className="mt-1 text-lg font-semibold text-slate-900 dark:text-slate-100">{review.trade_date} 决策看板</h2>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+                    <span className="rounded-full bg-slate-100 px-2.5 py-1 dark:bg-slate-800">主线 {nextThemes.length}</span>
+                    <span className="rounded-full bg-slate-100 px-2.5 py-1 dark:bg-slate-800">候选 {nextCandidates.length}</span>
+                    <span className="rounded-full bg-slate-100 px-2.5 py-1 dark:bg-slate-800">风险 {risks.length}</span>
+                </div>
+            </div>
+
+            <div className="grid gap-3 xl:grid-cols-4">
+                <section className="card border-l-4 border-blue-500 p-4">
+                    <div className="flex items-center gap-2 text-sm font-semibold text-slate-900 dark:text-slate-100">
+                        <Activity className="h-4 w-4 text-blue-500" />
+                        市场状态
+                    </div>
+                    <p className="mt-3 line-clamp-4 text-sm leading-6 text-slate-600 dark:text-slate-300">
+                        {review.market_summary?.headline || '暂无市场摘要'}
+                    </p>
+                    {marketBullets.length > 0 && (
+                        <div className="mt-3 space-y-1.5 text-xs text-slate-500 dark:text-slate-400">
+                            {marketBullets.map((item, index) => (
+                                <div key={`market-pulse-${index}`} className="line-clamp-1">{item}</div>
+                            ))}
+                        </div>
+                    )}
+                </section>
+
+                <section className="card border-l-4 border-emerald-500 p-4">
+                    <div className="flex items-center gap-2 text-sm font-semibold text-slate-900 dark:text-slate-100">
+                        <CandlestickChart className="h-4 w-4 text-emerald-500" />
+                        持仓动作
+                    </div>
+                    <p className="mt-3 line-clamp-3 text-sm leading-6 text-slate-600 dark:text-slate-300">
+                        {review.portfolio_summary?.headline || '暂无持仓摘要'}
+                    </p>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                        {diagnostics.slice(0, 4).map((item) => (
+                            <button
+                                key={`decision-${item.symbol}`}
+                                type="button"
+                                onClick={() => onOpenKline(item.symbol)}
+                                className="rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs text-emerald-700 transition hover:border-emerald-300 hover:bg-emerald-100 dark:border-emerald-900/60 dark:bg-emerald-950/20 dark:text-emerald-300"
+                            >
+                                {item.name || item.symbol}
+                            </button>
+                        ))}
+                        {!diagnostics.length && <span className="text-xs text-slate-400">暂无诊断标的</span>}
+                    </div>
+                </section>
+
+                <section className="card border-l-4 border-amber-500 p-4">
+                    <div className="flex items-center gap-2 text-sm font-semibold text-slate-900 dark:text-slate-100">
+                        <Target className="h-4 w-4 text-amber-500" />
+                        次日主线
+                    </div>
+                    <p className="mt-3 text-sm leading-6 text-slate-600 dark:text-slate-300">{topThemeNames}</p>
+                    <div className="mt-3 space-y-2">
+                        {nextThemes.slice(0, 2).map((item, index) => (
+                            <div key={`next-theme-${item.theme}-${index}`} className="rounded-xl bg-slate-50 px-3 py-2 dark:bg-slate-900/50">
+                                <div className="text-xs font-medium text-slate-700 dark:text-slate-200">{item.theme}</div>
+                                <div className="mt-1 line-clamp-2 text-xs leading-5 text-slate-500 dark:text-slate-400">{item.catalyst || item.summary || '等待催化确认'}</div>
+                            </div>
+                        ))}
+                    </div>
+                </section>
+
+                <section className="card border-l-4 border-rose-500 p-4">
+                    <div className="flex items-center gap-2 text-sm font-semibold text-slate-900 dark:text-slate-100">
+                        <AlertTriangle className="h-4 w-4 text-rose-500" />
+                        风险执行
+                    </div>
+                    <p className="mt-3 text-sm leading-6 text-slate-600 dark:text-slate-300">
+                        {highRiskCount ? `${highRiskCount} 个高风险项需要优先处理` : '暂无高风险项'}
+                    </p>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                        {risks.slice(0, 4).map((item, index) => (
+                            <span
+                                key={`risk-chip-${item.title}-${index}`}
+                                className={`rounded-full border px-2.5 py-1 text-xs ${riskTone(item.level)}`}
+                            >
+                                {item.title}
+                            </span>
+                        ))}
+                        {!risks.length && <span className="text-xs text-slate-400">暂无风险提醒</span>}
+                    </div>
+                </section>
+            </div>
+        </section>
+    )
 }
 
 function SummaryBlock({ title, summary }: { title: string; summary: { headline?: string; bullets?: string[] } | undefined }) {
@@ -149,21 +278,195 @@ function RiskList({ items }: { items: DailyReviewRisk[] }) {
     )
 }
 
-function NarrativeMarkdown({ content }: { content?: string | null }) {
+function stripMarkdownInline(value: string) {
+    return value
+        .replace(/^#+\s*/, '')
+        .replace(/\*\*/g, '')
+        .replace(/`/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+}
+
+function splitNarrativeMarkdown(content: string): { title: string; cards: NarrativeCard[] } {
+    const lines = content.split(/\r?\n/)
+    let title = '深度复盘'
+    const cards: NarrativeCard[] = []
+    let current: NarrativeCard | null = null
+    const introLines: string[] = []
+
+    const pushCurrent = () => {
+        if (!current) return
+        const body = current.body.trim()
+        if (!body) return
+        cards.push({ ...current, body })
+    }
+
+    for (const line of lines) {
+        const heading = line.match(/^(#{1,4})\s+(.+?)\s*$/)
+        if (heading) {
+            const level = heading[1].length
+            const headingText = stripMarkdownInline(heading[2])
+            if (level === 1 && cards.length === 0 && !current) {
+                title = headingText || title
+                continue
+            }
+            pushCurrent()
+            current = {
+                id: `${cards.length}-${headingText || 'section'}`,
+                title: headingText || '复盘片段',
+                body: '',
+                level,
+            }
+            continue
+        }
+
+        if (current) {
+            current.body += `${line}\n`
+        } else if (line.trim()) {
+            introLines.push(line)
+        }
+    }
+
+    pushCurrent()
+
+    const intro = introLines.join('\n').trim()
+    if (intro) {
+        cards.unshift({
+            id: 'intro',
+            title,
+            body: intro,
+            level: 2,
+        })
+    }
+
+    if (cards.length > 0) {
+        return { title, cards }
+    }
+
+    const paragraphs = content
+        .split(/\n{2,}/)
+        .map((item) => item.trim())
+        .filter(Boolean)
+    const fallbackCards = paragraphs.reduce<NarrativeCard[]>((acc, paragraph, index) => {
+        const groupIndex = Math.floor(index / 3)
+        const existing = acc[groupIndex]
+        if (existing) {
+            existing.body = `${existing.body}\n\n${paragraph}`
+        } else {
+            acc.push({
+                id: `paragraph-${groupIndex}`,
+                title: groupIndex === 0 ? title : `复盘片段 ${groupIndex + 1}`,
+                body: paragraph,
+                level: 3,
+            })
+        }
+        return acc
+    }, [])
+    return { title, cards: fallbackCards }
+}
+
+function narrativeCardTone(index: number) {
+    const tones = [
+        {
+            bar: 'bg-blue-500',
+            badge: 'bg-blue-50 text-blue-700 dark:bg-blue-950/40 dark:text-blue-300',
+        },
+        {
+            bar: 'bg-emerald-500',
+            badge: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300',
+        },
+        {
+            bar: 'bg-amber-500',
+            badge: 'bg-amber-50 text-amber-700 dark:bg-amber-950/40 dark:text-amber-300',
+        },
+        {
+            bar: 'bg-rose-500',
+            badge: 'bg-rose-50 text-rose-700 dark:bg-rose-950/40 dark:text-rose-300',
+        },
+    ]
+    return tones[index % tones.length]
+}
+
+function NarrativeMarkdown({ content, showHeader = true }: { content?: string | null; showHeader?: boolean }) {
     if (!content) return null
+    const { title, cards } = splitNarrativeMarkdown(content)
+    if (!cards.length) return null
     return (
-        <section className="card space-y-4 p-5">
-            <div className="text-base font-semibold text-slate-900 dark:text-slate-100">深度复盘长文</div>
-            <div className="prose dark:prose-invert prose-sm md:prose-base max-w-none leading-7">
-                <Suspense fallback={<div className="text-sm text-slate-400">长文加载中...</div>}>
-                    <MarkdownBlock content={content} />
-                </Suspense>
+        <section className="space-y-3">
+            {showHeader && (
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex min-w-0 items-center gap-2 text-slate-900 dark:text-slate-100">
+                        <BookOpenText className="h-5 w-5 shrink-0 text-blue-500" />
+                        <h2 className="min-w-0 truncate text-base font-semibold">{title}</h2>
+                    </div>
+                    <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs text-slate-500 dark:bg-slate-800 dark:text-slate-300">
+                        {cards.length} 张卡片
+                    </span>
+                </div>
+            )}
+            <div className="grid gap-3 lg:grid-cols-2">
+                {cards.map((card, index) => {
+                    const tone = narrativeCardTone(index)
+                    const isMajor = card.level <= 2
+                    return (
+                        <article
+                            key={`${card.id}-${index}`}
+                            className={`card overflow-hidden p-0 ${isMajor ? 'lg:col-span-2' : ''}`}
+                        >
+                            <div className={`h-1.5 ${tone.bar}`} />
+                            <div className="p-4">
+                                <div className="flex flex-wrap items-start justify-between gap-3">
+                                    <h3 className="min-w-0 text-sm font-semibold leading-6 text-slate-900 dark:text-slate-100">
+                                        {card.title}
+                                    </h3>
+                                    <span className={`shrink-0 rounded-full px-2 py-1 text-[11px] ${tone.badge}`}>
+                                        {isMajor ? '主线' : '细节'}
+                                    </span>
+                                </div>
+                                <div className="mt-3 max-h-[360px] overflow-y-auto pr-1">
+                                    <div className="prose prose-sm max-w-none leading-6 text-slate-600 prose-p:my-2 prose-ul:my-2 prose-li:my-1 prose-strong:text-slate-800 dark:prose-invert dark:text-slate-300 dark:prose-strong:text-slate-100">
+                                        <Suspense fallback={<div className="text-sm text-slate-400">内容加载中...</div>}>
+                                            <MarkdownBlock content={card.body} />
+                                        </Suspense>
+                                    </div>
+                                </div>
+                            </div>
+                        </article>
+                    )
+                })}
             </div>
         </section>
     )
 }
 
-function TechnicalDiagnostics({ items }: { items: DailyReviewStockDiagnostic[] }) {
+function DeepReviewArchive({ content }: { content?: string | null }) {
+    if (!content) return null
+    const { title, cards } = splitNarrativeMarkdown(content)
+    if (!cards.length) return null
+    return (
+        <section className="space-y-3">
+            <details className="group">
+                <summary className="card flex cursor-pointer list-none items-center justify-between gap-3 p-5 transition hover:border-blue-200 dark:hover:border-blue-800">
+                    <div className="flex min-w-0 items-center gap-3">
+                        <BookOpenText className="h-5 w-5 shrink-0 text-blue-500" />
+                        <div className="min-w-0">
+                            <div className="text-base font-semibold text-slate-900 dark:text-slate-100">深度复盘</div>
+                            <div className="mt-1 truncate text-xs text-slate-400">{title}</div>
+                        </div>
+                    </div>
+                    <span className="shrink-0 rounded-full bg-slate-100 px-2.5 py-1 text-xs text-slate-500 dark:bg-slate-800 dark:text-slate-300">
+                        {cards.length} 张
+                    </span>
+                </summary>
+                <div className="mt-3">
+                    <NarrativeMarkdown content={content} showHeader={false} />
+                </div>
+            </details>
+        </section>
+    )
+}
+
+function TechnicalDiagnostics({ items, onOpenKline }: { items: DailyReviewStockDiagnostic[]; onOpenKline?: (symbol: string) => void }) {
     if (!items.length) return null
     return (
         <section className="card space-y-3 p-5">
@@ -186,9 +489,20 @@ function TechnicalDiagnostics({ items }: { items: DailyReviewStockDiagnostic[] }
                                     <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">{item.name}</div>
                                     <div className="text-xs text-slate-400">{item.symbol}</div>
                                 </div>
-                                <div className="text-right text-xs">
-                                    <div className="font-medium text-slate-700 dark:text-slate-200">{formatNumber(item.latest_price)}</div>
-                                    <div className={Number(item.change_pct) >= 0 ? 'text-rose-500' : 'text-emerald-500'}>{formatPercent(item.change_pct)}</div>
+                                <div className="flex items-start gap-2">
+                                    <div className="text-right text-xs">
+                                        <div className="font-medium text-slate-700 dark:text-slate-200">{formatNumber(item.latest_price)}</div>
+                                        <div className={Number(item.change_pct) >= 0 ? 'text-rose-500' : 'text-emerald-500'}>{formatPercent(item.change_pct)}</div>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        onClick={() => onOpenKline?.(item.symbol)}
+                                        className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:border-blue-300 hover:text-blue-600 dark:border-slate-700 dark:text-slate-300 dark:hover:border-blue-600"
+                                        title="打开K线"
+                                        aria-label={`打开${item.name || item.symbol}K线`}
+                                    >
+                                        <CandlestickChart className="h-4 w-4" />
+                                    </button>
                                 </div>
                             </div>
                             <div className="mt-3 grid gap-2 text-xs text-slate-600 dark:text-slate-300">
@@ -219,6 +533,44 @@ function TechnicalDiagnostics({ items }: { items: DailyReviewStockDiagnostic[] }
     )
 }
 
+function T0ActionRail({ items, onOpenKline }: { items: DailyReviewStockDiagnostic[]; onOpenKline: (symbol: string) => void }) {
+    if (!items.length) return null
+    return (
+        <section className="card space-y-3 p-5">
+            <div className="flex items-center gap-2 text-base font-semibold text-slate-900 dark:text-slate-100">
+                <Target className="h-4 w-4 text-rose-500" />
+                次日 T+0 轨道
+            </div>
+            <div className="space-y-3">
+                {items.slice(0, 8).map((item) => {
+                    const pressure = item.t0_plan?.pressure_zone as Record<string, unknown> | null | undefined
+                    const support = item.t0_plan?.support_zone as Record<string, unknown> | null | undefined
+                    return (
+                        <button
+                            key={item.symbol}
+                            type="button"
+                            onClick={() => onOpenKline(item.symbol)}
+                            className="w-full rounded-xl border border-slate-200 bg-white px-3 py-3 text-left transition hover:border-blue-300 hover:bg-blue-50/50 dark:border-slate-700 dark:bg-slate-950/30 dark:hover:border-blue-700 dark:hover:bg-blue-950/20"
+                        >
+                            <div className="flex items-center justify-between gap-2">
+                                <div className="min-w-0">
+                                    <div className="truncate text-sm font-semibold text-slate-900 dark:text-slate-100">{item.name}</div>
+                                    <div className="text-xs text-slate-400">{item.symbol}</div>
+                                </div>
+                                <CandlestickChart className="h-4 w-4 shrink-0 text-slate-400" />
+                            </div>
+                            <div className="mt-3 grid gap-2 text-xs text-slate-600 dark:text-slate-300">
+                                <div className="rounded-lg bg-rose-50 px-2.5 py-2 text-rose-700 dark:bg-rose-950/20 dark:text-rose-300">压力 {zoneLabel(pressure)}</div>
+                                <div className="rounded-lg bg-emerald-50 px-2.5 py-2 text-emerald-700 dark:bg-emerald-950/20 dark:text-emerald-300">支撑 {zoneLabel(support)}</div>
+                            </div>
+                        </button>
+                    )
+                })}
+            </div>
+        </section>
+    )
+}
+
 export default function DailyReviewPage() {
     const [selectedDate, setSelectedDate] = useState(new Date().toISOString().slice(0, 10))
     const [review, setReview] = useState<DailyReview | null>(null)
@@ -227,6 +579,7 @@ export default function DailyReviewPage() {
     const [state, setState] = useState<LoadState>('idle')
     const [error, setError] = useState<string | null>(null)
     const [generating, setGenerating] = useState(false)
+    const [klineSymbol, setKlineSymbol] = useState<string | null>(null)
 
     const loadReview = useCallback(async (tradeDate?: string) => {
         setState('loading')
@@ -243,6 +596,8 @@ export default function DailyReviewPage() {
             if (reviewData?.trade_date) {
                 setSelectedDate(reviewData.trade_date)
             }
+            const diagnosticSymbols = reviewData?.portfolio_technical_diagnostics?.map((item) => item.symbol).filter(Boolean) || []
+            setKlineSymbol((prev) => (prev && diagnosticSymbols.includes(prev) ? prev : diagnosticSymbols[0] || null))
             setState('idle')
         } catch (err) {
             setError(err instanceof Error ? err.message : '加载每日复盘失败')
@@ -268,6 +623,7 @@ export default function DailyReviewPage() {
         try {
             const result = await api.generateDailyReview({ trade_date: selectedDate, push_after_generate: false })
             setReview(result)
+            setKlineSymbol(result.portfolio_technical_diagnostics?.[0]?.symbol || null)
             const historyData = await api.getDailyReviewHistory(90)
             setHistory(historyData.items || [])
         } catch (err) {
@@ -349,15 +705,29 @@ export default function DailyReviewPage() {
                 <div className="space-y-5">
                     {review ? (
                         <>
-                            <NarrativeMarkdown content={review.narrative_markdown} />
+                            <ReviewDecisionPanel review={review} onOpenKline={setKlineSymbol} />
+                            <div className="flex flex-wrap items-center justify-between gap-3">
+                                <div>
+                                    <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">执行清单</h2>
+                                    <div className="mt-1 text-xs text-slate-400">市场、持仓、主线、候选与风险</div>
+                                </div>
+                            </div>
                             <SummaryBlock title="今日市场总览" summary={review.market_summary} />
                             <SummaryBlock title="我的持仓与自选复盘" summary={review.portfolio_summary} />
-                            <TechnicalDiagnostics items={review.portfolio_technical_diagnostics || []} />
+                            <TechnicalDiagnostics items={review.portfolio_technical_diagnostics || []} onOpenKline={setKlineSymbol} />
+                            {klineSymbol && (
+                                <section className="h-[560px] min-h-[420px]">
+                                    <Suspense fallback={<div className="card flex h-full items-center justify-center text-sm text-slate-400">K线加载中...</div>}>
+                                        <KlinePanel symbol={klineSymbol} onSymbolChange={setKlineSymbol} focusDate={review.trade_date} showChanlunOverlay={false} />
+                                    </Suspense>
+                                </section>
+                            )}
                             <ThemeList title="当前主线与核心个股" items={review.current_main_themes} />
                             <StockList title="当前重点个股" items={review.current_key_stocks} />
                             <ThemeList title="次日主线与候选股" items={review.next_main_themes} />
                             <StockList title="次日候选股" items={review.next_candidate_stocks} />
                             <RiskList items={review.risk_watchpoints} />
+                            <DeepReviewArchive content={review.narrative_markdown} />
 
                             <section className="card p-5">
                                 <details>
@@ -409,6 +779,10 @@ export default function DailyReviewPage() {
                             )) : <div className="text-sm text-slate-400">暂无历史记录</div>}
                         </div>
                     </section>
+
+                    {review && (
+                        <T0ActionRail items={review.portfolio_technical_diagnostics || []} onOpenKline={setKlineSymbol} />
+                    )}
 
                     <section className="card p-5">
                         <div className="flex items-center gap-2 text-slate-900 dark:text-slate-100">

@@ -845,6 +845,25 @@ def _run_monitor_cycle(monitor_id: str, *, force: bool = False, trigger_source: 
         _update_state_stats(monitor, latest_cycle=cycle_id)
         strategy_db.add(monitor)
         strategy_db.commit()
+        _capture_catalyst_feedback_after_cycle(strategy_db, main_db, monitor)
+
+
+def _capture_catalyst_feedback_after_cycle(strategy_db: Session, main_db: Session, monitor: RealtimeMonitorDB) -> None:
+    pool = monitor.monitor_pool_json if isinstance(monitor.monitor_pool_json, dict) else {}
+    if str(pool.get("source") or "").strip() != "catalyst-selection":
+        return
+    try:
+        from api.services import catalyst_selection_service
+
+        catalyst_selection_service.capture_realtime_monitor_feedback(
+            strategy_db,
+            main_db,
+            monitor_id=monitor.id,
+            limit=100,
+            refresh_profiles=True,
+        )
+    except Exception:
+        logger.exception("[realtime-monitor] catalyst feedback capture failed monitor=%s", monitor.id)
 
 
 def _monitor_due(monitor: RealtimeMonitorDB) -> bool:

@@ -2,6 +2,34 @@
 
 本文件记录最近交接进度。每次任务收尾时更新，保持最新内容在最上方。
 
+## 2026-06-03 AI量化闭环最终版使用说明
+
+### 本次做了什么
+
+- 新增最终版使用说明文档，覆盖启动、配置、催化选股、AI量化闭环状态、AI监控池、实时监控、结算反馈、接口、异常处理和验收命令。
+- 明确最终版判断标准：`主动触发 event_driven`、端到端 `active`、闭环 `6/6`、远程 LLM 就绪、AI监控池带门禁分布。
+- 文档强调安全边界：默认 `monitor_only`，实盘仓只读，不明文泄露 LLM key，页面结论仅用于研究和复盘。
+
+### 改动文件
+
+- `AI_QUANT_FINAL_USAGE.md`
+- `AI_PROGRESS.md`
+
+### 验证结果
+
+- 本次为文档生成，内容依据当前运行态、前端路由、后端 catalyst-selection 接口和最新闭环验收结果整理。
+- 最近运行态确认：后端 `127.0.0.1:8500` 健康，前端 `127.0.0.1:5174` 运行中；催化选股接口显示 `e2e_status=active`、`pass_rate=1.0`、`discovery_mode=event_driven`；AI监控池为 `monitor_only` 且 `monitor_pool` / `risk_config` 均带 `gate_counts`。
+
+### 当前风险或未完成事项
+
+- 文档没有重新跑完整测试；最近闭环收口已跑过 `tests/test_catalyst_selection_service.py tests/test_daily_review_market_behavior.py`、`tests/test_market_routes_formal.py tests/test_data_source_governance.py` 和前端 `npm run build`。
+- 若后续 LLM provider、模型名、端口或默认执行模式调整，需要同步更新本文档。
+
+### 下一步建议
+
+- 在 README 的核心模块表中补一行 `/catalyst-selection`，让新入口在总览里也可见。
+- 如果要发版，可把 `AI_QUANT_FINAL_USAGE.md` 作为最终验收说明附带给使用者。
+
 ## 2026-05-25 项目排查问题修复收口
 
 ### 本次做了什么

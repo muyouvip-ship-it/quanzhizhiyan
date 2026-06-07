@@ -158,27 +158,20 @@ class TradingAgentsGraph:
         """Get provider-specific kwargs for LLM client creation."""
         kwargs = {}
         provider = self.config.get("llm_provider", "").lower()
+        api_key = self.config.get("api_key")
+
+        if api_key and provider != "ollama":
+            kwargs["api_key"] = api_key
 
         if provider == "google":
             thinking_level = self.config.get("google_thinking_level")
             if thinking_level:
                 kwargs["thinking_level"] = thinking_level
-            api_key = self.config.get("api_key")
-            if api_key:
-                kwargs["api_key"] = api_key
 
         elif provider == "openai":
             reasoning_effort = self.config.get("openai_reasoning_effort")
             if reasoning_effort:
                 kwargs["reasoning_effort"] = reasoning_effort
-            api_key = self.config.get("api_key")
-            if api_key:
-                kwargs["api_key"] = api_key
-
-        elif provider == "anthropic":
-            api_key = self.config.get("api_key")
-            if api_key:
-                kwargs["api_key"] = api_key
 
         return kwargs
 

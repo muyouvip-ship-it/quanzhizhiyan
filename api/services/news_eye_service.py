@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterable
@@ -17,10 +19,14 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from api.core.runtime_config import build_runtime_config
+from api.core.runtime_config import (
+    account_llm_runtime_sources,
+    build_news_runtime_config,
+    has_mixed_account_llm_runtime,
+    llm_runtime_package_source,
+)
 from api.core.stock_map import get_reverse_stock_map, get_stock_map_version
 from api.database import SessionLocal, ScheduledAnalysisDB, WatchlistItemDB
-from api.services import auth_service
 from api.services.data_source_governance import build_news_eye_governance
 from tradingagents.llm_clients.factory import create_llm_client
 
@@ -157,19 +163,27 @@ OVERSEAS_NOISE_KEYWORDS = (
 
 _TASK: asyncio.Task | None = None
 _STOP_EVENT: asyncio.Event | None = None
-_SEARCH_INDEX_BACKFILLED = False
-_DEDUPE_KEYS_BACKFILLED = False
+_NEWS_SCHEMA_LOCK = threading.RLock()
+_NEWS_SCHEMA_ENSURED_BINDS: set[str] = set()
+_SEARCH_INDEX_BACKFILLED_BINDS: set[str] = set()
+_DEDUPE_KEYS_BACKFILLED_BINDS: set[str] = set()
 _POLL_SECONDS = max(int(os.getenv("NEWS_EYE_POLL_SECONDS", "45")), 15)
 _BACKGROUND_LIMIT = max(int(os.getenv("NEWS_EYE_BACKGROUND_LIMIT", "120")), 20)
 _MANUAL_LIMIT = max(int(os.getenv("NEWS_EYE_MANUAL_LIMIT", "160")), 20)
 _WATCHLIST_SYMBOL_LIMIT = max(int(os.getenv("NEWS_EYE_WATCHLIST_SYMBOL_LIMIT", "12")), 0)
 _SYMBOL_SOURCE_LIMIT = max(int(os.getenv("NEWS_EYE_SYMBOL_SOURCE_LIMIT", "6")), 1)
+_SOURCE_TIMEOUT_SECONDS = max(float(os.getenv("NEWS_EYE_SOURCE_TIMEOUT_SECONDS", "8")), 2.0)
+_SOURCE_FETCH_WORKERS = max(int(os.getenv("NEWS_EYE_SOURCE_FETCH_WORKERS", "6")), 2)
+_SOURCE_FETCH_EXECUTOR = ThreadPoolExecutor(max_workers=_SOURCE_FETCH_WORKERS, thread_name_prefix="news-eye-source")
 _SYNC_STATE_KEY = "news_eye"
 _CLAUSE_SPLIT_PATTERN = re.compile(r"[。！？!?\n；;]+|(?<=\S)，")
 _A_SHARE_CODE_PATTERN = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 _SYMBOL_NAME_FRAGMENT_PATTERN = re.compile(r"[0-9A-Za-z\u4e00-\u9fff]{2,}")
 _NEWS_CONTENT_DUPE_STRIP_PATTERN = re.compile(r"[\s\u3000【】\[\]（）()《》<>“”\"'‘’、，,。；;：:！？!?·.\-_/|]+")
 _SYMBOL_PREFIX_LENGTH = 2
+_EVENT_SELECTION_REFRESH_LOCK = threading.RLock()
+_EVENT_SELECTION_REFRESH_TASKS: set[str] = set()
+_EVENT_SELECTION_REFRESH_PENDING: dict[str, dict[str, Any]] = {}
 
 
 @dataclass(frozen=True)
@@ -247,16 +261,22 @@ async def _run_loop() -> None:
 def _scan_and_refresh_once() -> None:
     with SessionLocal() as db:
         ensure_news_tables(db)
-        symbols = _load_global_focus_symbols(db, limit=_WATCHLIST_SYMBOL_LIMIT)
+        background_user_id = _load_background_refresh_user_id(db)
+        user_symbols = load_user_focus_symbols(db, background_user_id, limit=_WATCHLIST_SYMBOL_LIMIT) if background_user_id else []
+        symbols = _dedupe_symbols([*user_symbols, *_load_global_focus_symbols(db, limit=_WATCHLIST_SYMBOL_LIMIT)])[:_WATCHLIST_SYMBOL_LIMIT]
+        db.rollback()
         result = refresh_news_cache(
             db,
             limit=_BACKGROUND_LIMIT,
             symbols=symbols,
             trigger="background",
+            user_id=background_user_id,
+            async_event_driven_selection=True,
         )
         logger.info(
-            "[news-eye] background refresh saved=%s sources=%s symbols=%s warnings=%s",
+            "[news-eye] background refresh saved=%s user=%s sources=%s symbols=%s warnings=%s",
             result.get("saved", 0),
+            background_user_id or "system",
             ",".join(result.get("active_sources", [])[:8]) or "none",
             ",".join(result.get("tracked_symbols", [])[:8]) or "none",
             len(result.get("warnings", [])),
@@ -264,7 +284,31 @@ def _scan_and_refresh_once() -> None:
 
 
 def ensure_news_tables(db: Session) -> None:
-    global _DEDUPE_KEYS_BACKFILLED, _SEARCH_INDEX_BACKFILLED
+    bind_key = _schema_bind_key(db)
+    if bind_key in _NEWS_SCHEMA_ENSURED_BINDS:
+        return
+    with _NEWS_SCHEMA_LOCK:
+        if bind_key in _NEWS_SCHEMA_ENSURED_BINDS:
+            return
+        _ensure_news_tables_uncached(db, bind_key=bind_key)
+        _NEWS_SCHEMA_ENSURED_BINDS.add(bind_key)
+
+
+def _schema_bind_key(db: Session) -> str:
+    try:
+        bind = db.get_bind()
+    except Exception:
+        return f"session:{id(db)}"
+    bind_url = getattr(bind, "url", None)
+    if bind_url is not None:
+        try:
+            return bind_url.render_as_string(hide_password=False)
+        except Exception:
+            return str(bind_url)
+    return f"bind:{id(bind)}"
+
+
+def _ensure_news_tables_uncached(db: Session, *, bind_key: int) -> None:
     db.execute(
         text(
             """
@@ -332,20 +376,30 @@ def ensure_news_tables(db: Session) -> None:
                 active_sources_json TEXT DEFAULT '[]',
                 tracked_symbols_json TEXT DEFAULT '[]',
                 saved_count INTEGER DEFAULT 0,
+                new_count INTEGER DEFAULT 0,
+                updated_count INTEGER DEFAULT 0,
+                unchanged_count INTEGER DEFAULT 0,
+                fresh_event_count INTEGER DEFAULT 0,
+                event_selection_json TEXT DEFAULT '{}',
                 updated_at TIMESTAMP NOT NULL
             )
             """
         )
     )
+    db.execute(text("ALTER TABLE market_news_sync_state ADD COLUMN IF NOT EXISTS new_count INTEGER DEFAULT 0"))
+    db.execute(text("ALTER TABLE market_news_sync_state ADD COLUMN IF NOT EXISTS updated_count INTEGER DEFAULT 0"))
+    db.execute(text("ALTER TABLE market_news_sync_state ADD COLUMN IF NOT EXISTS unchanged_count INTEGER DEFAULT 0"))
+    db.execute(text("ALTER TABLE market_news_sync_state ADD COLUMN IF NOT EXISTS fresh_event_count INTEGER DEFAULT 0"))
+    db.execute(text("ALTER TABLE market_news_sync_state ADD COLUMN IF NOT EXISTS event_selection_json TEXT DEFAULT '{}'"))
     db.commit()
-    if not _DEDUPE_KEYS_BACKFILLED:
+    if bind_key not in _DEDUPE_KEYS_BACKFILLED_BINDS:
         _backfill_news_dedupe_keys_if_needed(db)
-        _DEDUPE_KEYS_BACKFILLED = True
+        _DEDUPE_KEYS_BACKFILLED_BINDS.add(bind_key)
     db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_market_news_items_dedupe_key ON market_news_items (dedupe_key)"))
     db.commit()
-    if not _SEARCH_INDEX_BACKFILLED:
+    if bind_key not in _SEARCH_INDEX_BACKFILLED_BINDS:
         _backfill_news_search_index_if_needed(db)
-        _SEARCH_INDEX_BACKFILLED = True
+        _SEARCH_INDEX_BACKFILLED_BINDS.add(bind_key)
 
 
 def list_news_items(
@@ -449,6 +503,11 @@ def list_news_items(
             "active_sources": _loads(state.get("active_sources_json")),
             "tracked_symbols": _loads(state.get("tracked_symbols_json")),
             "saved_count": int(state.get("saved_count") or 0),
+            "new_count": int(state.get("new_count") or 0),
+            "updated_count": int(state.get("updated_count") or 0),
+            "unchanged_count": int(state.get("unchanged_count") or 0),
+            "fresh_event_count": int(state.get("fresh_event_count") or 0),
+            "event_driven_selection": _loads_dict(state.get("event_selection_json")),
         },
         "history": {
             "offset": int(offset),
@@ -467,9 +526,15 @@ def list_news_items(
 def analyze_news_item(db: Session, *, user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     config = _resolve_news_llm_config(db, user_id=user_id)
     provider = str(config.get("llm_provider") or "").strip().lower()
-    model = str(config.get("news_analysis_llm") or config.get("quick_think_llm") or config.get("deep_think_llm") or "").strip()
+    model = str(config.get("quick_think_llm") or config.get("deep_think_llm") or "").strip()
     if not provider or not model:
         raise HTTPException(status_code=400, detail="请先在设置页配置可用的模型后再执行资讯分析。")
+    diagnostic = _news_llm_runtime_diagnostic(config)
+    if diagnostic.get("mixed_account_runtime"):
+        raise HTTPException(
+            status_code=400,
+            detail="资讯分析 LLM 配置不是同源运行包；请在设置页同时保存 provider、Base URL、模型和 Key。",
+        )
 
     client_kwargs: dict[str, Any] = {}
     api_key = str(config.get("api_key") or "").strip()
@@ -544,22 +609,19 @@ def analyze_news_item(db: Session, *, user_id: str, payload: dict[str, Any]) -> 
 
 
 def _resolve_news_llm_config(db: Session, *, user_id: str) -> dict[str, Any]:
-    config = build_runtime_config({}, user_id=user_id, db=db)
-    user_cfg = auth_service.get_user_llm_config(db, user_id)
-    if user_cfg:
-        news_provider = str(getattr(user_cfg, "news_llm_provider", None) or "").strip()
-        news_backend_url = str(getattr(user_cfg, "news_backend_url", None) or "").strip()
-        news_model = str(getattr(user_cfg, "news_analysis_llm", None) or "").strip()
-        news_api_key = auth_service.decrypt_secret(getattr(user_cfg, "news_api_key_encrypted", None))
-        if news_provider:
-            config["llm_provider"] = news_provider
-        if news_backend_url:
-            config["backend_url"] = news_backend_url
-        if news_model:
-            config["news_analysis_llm"] = news_model
-        if news_api_key:
-            config["api_key"] = news_api_key
-    return config
+    return build_news_runtime_config(user_id=user_id, db=db)
+
+
+def _news_llm_runtime_diagnostic(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "runtime_package_source": llm_runtime_package_source(config),
+        "api_key_source": str(config.get("_api_key_source") or "").strip() or None,
+        "provider_source": str(config.get("_llm_provider_source") or "").strip() or None,
+        "base_url_source": str(config.get("_backend_url_source") or "").strip() or None,
+        "model_source": str(config.get("_quick_think_llm_source") or config.get("_deep_think_llm_source") or "").strip() or None,
+        "account_runtime_sources": sorted(account_llm_runtime_sources(config)),
+        "mixed_account_runtime": has_mixed_account_llm_runtime(config),
+    }
 
 
 def refresh_news_cache(
@@ -568,6 +630,8 @@ def refresh_news_cache(
     limit: int,
     symbols: list[str] | None = None,
     trigger: str = "manual",
+    user_id: str | None = None,
+    async_event_driven_selection: bool = False,
 ) -> dict[str, Any]:
     ensure_news_tables(db)
     run_started_at = _utcnow_naive()
@@ -578,8 +642,21 @@ def refresh_news_cache(
         sync_last_error = _sync_state_error_from_warnings(warnings, active_sources)
         sync_status = "success" if active_sources and not sync_last_error else ("degraded" if active_sources else "degraded")
         saved = 0
+        new_count = 0
+        updated_count = 0
+        unchanged_count = 0
+        fresh_news_events: list[dict[str, Any]] = []
         for item in items:
             enriched = _enrich_news_item(item)
+            existing = _load_existing_news_item_for_dedupe(db, str(enriched.get("dedupe_key") or ""))
+            is_new = not existing
+            material_changed = bool(existing and _news_material_changed(existing, enriched))
+            if is_new:
+                new_count += 1
+            elif material_changed:
+                updated_count += 1
+            else:
+                unchanged_count += 1
             saved_row = db.execute(
                 text(
                     """
@@ -613,7 +690,39 @@ def refresh_news_cache(
             if saved_row and saved_row.get("digest"):
                 enriched["digest"] = saved_row["digest"]
             _replace_news_search_index(db, enriched)
+            if is_new or material_changed:
+                fresh_news_events.append(
+                    _public_fresh_news_event(
+                        enriched,
+                        change_type="new" if is_new else "updated",
+                    )
+                )
             saved += 1
+        fresh_event_count = new_count + updated_count
+        fresh_event_context = _build_fresh_event_context(fresh_news_events)
+        news_ingest = {
+            "saved": saved,
+            "new": new_count,
+            "updated": updated_count,
+            "unchanged": unchanged_count,
+        }
+        initial_event_driven_selection = (
+            {
+                "trigger": f"news-eye:{trigger}",
+                "generated": [],
+                "errors": [],
+                "skipped": False,
+                "triggered": True,
+                "status": "running",
+                "fresh_event_count": fresh_event_count,
+                "news_ingest": news_ingest,
+                "fresh_news_events": fresh_event_context.get("fresh_news_events") or [],
+                "fresh_news_summary": fresh_event_context.get("fresh_news_summary") or {},
+                "updated_at": _iso_or_none(_utcnow_naive()),
+            }
+            if fresh_event_count > 0
+            else {}
+        )
         _record_sync_state(
             db,
             status=sync_status,
@@ -623,6 +732,10 @@ def refresh_news_cache(
             active_sources=active_sources,
             tracked_symbols=symbols,
             saved_count=saved,
+            new_count=new_count,
+            updated_count=updated_count,
+            unchanged_count=unchanged_count,
+            event_driven_selection=initial_event_driven_selection,
         )
         try:
             from api.services import news_theme_service
@@ -632,12 +745,119 @@ def refresh_news_cache(
                 windows=("premarket", "24h", "72h", "7d"),
                 limit=20,
                 persist=True,
+                user_id=user_id,
+                allow_async_llm=True,
+                trigger_context={
+                    "source": "news_eye",
+                    "trigger": trigger,
+                    "reason": "news_eye_theme_refresh",
+                    "fresh_event_count": fresh_event_count,
+                    "news_ingest": news_ingest,
+                    **fresh_event_context,
+                    "triggered_at": _iso_or_none(_utcnow_naive()),
+                },
             )
         except Exception:
             logger.exception("[news-eye] theme ranking refresh failed trigger=%s", trigger)
         db.commit()
+        event_driven_selection: dict[str, Any] | None = None
+        if fresh_event_count > 0:
+            try:
+                if async_event_driven_selection:
+                    event_driven_selection = _schedule_event_driven_selection_refresh(
+                        trigger=f"news-eye:{trigger}",
+                        windows=("premarket", "24h"),
+                        limit=10,
+                        user_id=user_id,
+                        fresh_event_count=fresh_event_count,
+                        news_ingest=news_ingest,
+                        fresh_event_context=fresh_event_context,
+                    )
+                else:
+                    from api.services import catalyst_selection_service
+
+                    refreshed = catalyst_selection_service.refresh_event_driven_selection(
+                        db,
+                        trigger=f"news-eye:{trigger}",
+                        windows=("premarket", "24h"),
+                        limit=10,
+                        user_id=user_id,
+                        trigger_context={
+                            "source": "news_eye",
+                            "trigger": trigger,
+                            "reason": "news_eye_fresh_events",
+                            "fresh_event_count": fresh_event_count,
+                            "news_ingest": news_ingest,
+                            **fresh_event_context,
+                        },
+                    )
+                    event_driven_selection = _public_event_driven_selection_state(
+                        refreshed,
+                        trigger=f"news-eye:{trigger}",
+                        windows=("premarket", "24h"),
+                        fresh_event_count=fresh_event_count,
+                        news_ingest=news_ingest,
+                        fresh_event_context=fresh_event_context,
+                    )
+            except Exception as exc:
+                try:
+                    db.rollback()
+                except Exception:
+                    logger.exception("[news-eye] rollback failed after event-driven selection error")
+                logger.exception("[news-eye] event-driven selection refresh failed trigger=%s", trigger)
+                event_driven_selection = {
+                    "trigger": f"news-eye:{trigger}",
+                    "generated": [],
+                    "errors": [{"window": "premarket", "error": str(exc)}],
+                    "skipped": False,
+                    "triggered": True,
+                    "status": "failed",
+                    "fresh_event_count": fresh_event_count,
+                    "news_ingest": news_ingest,
+                    "fresh_news_events": fresh_event_context.get("fresh_news_events") or [],
+                    "fresh_news_summary": fresh_event_context.get("fresh_news_summary") or {},
+                    "updated_at": _iso_or_none(_utcnow_naive()),
+                }
+        else:
+            event_driven_selection = {
+                "trigger": f"news-eye:{trigger}",
+                "generated": [],
+                "errors": [],
+                "skipped": True,
+                "triggered": False,
+                "status": "skipped",
+                "reason": "no_new_or_changed_news",
+                "fresh_event_count": 0,
+                "news_ingest": news_ingest,
+                "updated_at": _iso_or_none(_utcnow_naive()),
+            }
+        skip_final_event_state_write = (
+            async_event_driven_selection
+            and fresh_event_count > 0
+            and str((event_driven_selection or {}).get("status") or "") in {"scheduled", "running"}
+        )
+        if not skip_final_event_state_write:
+            _record_sync_state(
+                db,
+                status=sync_status,
+                last_run_at=run_started_at,
+                last_success_at=run_started_at if active_sources else None,
+                last_error=sync_last_error,
+                active_sources=active_sources,
+                tracked_symbols=symbols,
+                saved_count=saved,
+                new_count=new_count,
+                updated_count=updated_count,
+                unchanged_count=unchanged_count,
+                event_driven_selection=event_driven_selection,
+            )
+            db.commit()
         return {
             "saved": saved,
+            "new": new_count,
+            "updated": updated_count,
+            "unchanged": unchanged_count,
+            "fresh_event_count": fresh_event_count,
             "source": ", ".join(active_sources) if active_sources else "external",
             "fallback": not bool(active_sources),
             "message": sync_last_error or f"资讯刷新完成（{trigger}）",
@@ -645,6 +865,9 @@ def refresh_news_cache(
             "active_sources": active_sources,
             "tracked_symbols": symbols,
             "warnings": warnings,
+            "fresh_news_events": fresh_event_context.get("fresh_news_events") or [],
+            "fresh_news_summary": fresh_event_context.get("fresh_news_summary") or {},
+            "event_driven_selection": event_driven_selection,
         }
     except Exception as exc:
         db.rollback()
@@ -657,9 +880,190 @@ def refresh_news_cache(
             active_sources=[],
             tracked_symbols=symbols,
             saved_count=0,
+            new_count=0,
+            updated_count=0,
+            unchanged_count=0,
+            event_driven_selection={},
         )
         db.commit()
         raise
+
+
+def _public_event_driven_selection_state(
+    payload: dict[str, Any] | None,
+    *,
+    trigger: str,
+    windows: Iterable[str],
+    fresh_event_count: int,
+    news_ingest: dict[str, Any],
+    fresh_event_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = dict(payload or {})
+    errors = list(result.get("errors") or [])
+    status = "skipped" if result.get("skipped") else ("partial_failed" if errors else "completed")
+    fresh_context = fresh_event_context if isinstance(fresh_event_context, dict) else {}
+    result.update(
+        {
+            "trigger": result.get("trigger") or trigger,
+            "triggered": True,
+            "status": status,
+            "windows": [str(window) for window in windows],
+            "fresh_event_count": int(fresh_event_count or 0),
+            "news_ingest": news_ingest,
+            "fresh_news_events": fresh_context.get("fresh_news_events") or result.get("fresh_news_events") or [],
+            "fresh_news_summary": fresh_context.get("fresh_news_summary") or result.get("fresh_news_summary") or {},
+            "updated_at": result.get("updated_at") or _iso_or_none(_utcnow_naive()),
+        }
+    )
+    return result
+
+
+def _event_selection_refresh_key(*, trigger: str, windows: Iterable[str], limit: int, user_id: str | None) -> str:
+    window_key = ",".join(str(window).strip() for window in windows if str(window).strip())
+    return f"{trigger}:{window_key}:{int(limit or 0)}:{user_id or ''}"
+
+
+def _schedule_event_driven_selection_refresh(
+    *,
+    trigger: str,
+    windows: Iterable[str],
+    limit: int,
+    user_id: str | None,
+    fresh_event_count: int,
+    news_ingest: dict[str, Any],
+    fresh_event_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized_windows = tuple(str(window).strip() for window in windows if str(window).strip())
+    from api.services import catalyst_selection_service
+    fresh_context = fresh_event_context if isinstance(fresh_event_context, dict) else {}
+
+    scheduled = catalyst_selection_service.schedule_event_driven_selection_refresh(
+        trigger=trigger,
+        windows=normalized_windows,
+        limit=limit,
+        user_id=user_id,
+        reason="news_eye_fresh_events",
+        context={
+            "source": "news_eye",
+            "fresh_event_count": int(fresh_event_count or 0),
+            "news_ingest": news_ingest,
+            **fresh_context,
+        },
+    )
+    status = str(scheduled.get("status") or "scheduled")
+    return {
+        "refresh_key": scheduled.get("refresh_key"),
+        "trigger": trigger,
+        "generated": list(scheduled.get("generated") or []),
+        "errors": list(scheduled.get("errors") or []),
+        "skipped": bool(scheduled.get("skipped")),
+        "triggered": True,
+        "status": status,
+        "deduped": bool(scheduled.get("deduped")),
+        "reason": scheduled.get("reason"),
+        "windows": list(normalized_windows),
+        "fresh_event_count": int(fresh_event_count or 0),
+        "news_ingest": news_ingest,
+        "fresh_news_events": fresh_context.get("fresh_news_events") or [],
+        "fresh_news_summary": fresh_context.get("fresh_news_summary") or {},
+        "updated_at": scheduled.get("updated_at") or _iso_or_none(_utcnow_naive()),
+    }
+
+
+def _run_event_driven_selection_refresh_task(
+    *,
+    refresh_key: str,
+    trigger: str,
+    windows: tuple[str, ...],
+    limit: int,
+    user_id: str | None,
+    fresh_event_count: int,
+    news_ingest: dict[str, Any],
+    fresh_event_context: dict[str, Any] | None = None,
+) -> None:
+    fresh_context = fresh_event_context if isinstance(fresh_event_context, dict) else {}
+    try:
+        with SessionLocal() as db:
+            from api.services import catalyst_selection_service
+
+            refreshed = catalyst_selection_service.refresh_event_driven_selection(
+                db,
+                trigger=trigger,
+                windows=windows,
+                limit=limit,
+                user_id=user_id,
+                trigger_context={
+                    "source": "news_eye",
+                    "trigger": trigger,
+                    "reason": "news_eye_fresh_events",
+                    "fresh_event_count": int(fresh_event_count or 0),
+                    "news_ingest": news_ingest,
+                    **fresh_context,
+                },
+            )
+            event_driven_selection = _public_event_driven_selection_state(
+                refreshed,
+                trigger=trigger,
+                windows=windows,
+                fresh_event_count=fresh_event_count,
+                news_ingest=news_ingest,
+                fresh_event_context=fresh_context,
+            )
+    except Exception as exc:
+        logger.exception("[news-eye] async event-driven selection refresh failed trigger=%s", trigger)
+        event_driven_selection = {
+            "trigger": trigger,
+            "generated": [],
+            "errors": [{"window": ",".join(windows), "error": str(exc)}],
+            "skipped": False,
+            "triggered": True,
+            "status": "failed",
+            "windows": list(windows),
+            "fresh_event_count": int(fresh_event_count or 0),
+            "news_ingest": news_ingest,
+            "fresh_news_events": fresh_context.get("fresh_news_events") or [],
+            "fresh_news_summary": fresh_context.get("fresh_news_summary") or {},
+            "updated_at": _iso_or_none(_utcnow_naive()),
+        }
+    finally:
+        with _EVENT_SELECTION_REFRESH_LOCK:
+            _EVENT_SELECTION_REFRESH_TASKS.discard(refresh_key)
+            _EVENT_SELECTION_REFRESH_PENDING.pop(refresh_key, None)
+    _record_event_driven_selection_state(event_driven_selection)
+
+
+def _record_event_driven_selection_state(event_driven_selection: dict[str, Any]) -> None:
+    try:
+        with SessionLocal() as db:
+            ensure_news_tables(db)
+            db.execute(
+                text(
+                    """
+                    INSERT INTO market_news_sync_state (
+                        worker_name, status, active_sources_json, tracked_symbols_json,
+                        saved_count, new_count, updated_count, unchanged_count, fresh_event_count,
+                        event_selection_json, updated_at
+                    )
+                    VALUES (
+                        :worker_name, 'success', '[]', '[]',
+                        0, 0, 0, 0, :fresh_event_count,
+                        :event_selection_json, :updated_at
+                    )
+                    ON CONFLICT (worker_name) DO UPDATE SET
+                        event_selection_json = EXCLUDED.event_selection_json,
+                        updated_at = EXCLUDED.updated_at
+                    """
+                ),
+                {
+                    "worker_name": _SYNC_STATE_KEY,
+                    "fresh_event_count": int(event_driven_selection.get("fresh_event_count") or 0),
+                    "event_selection_json": json.dumps(event_driven_selection or {}, ensure_ascii=False, default=str),
+                    "updated_at": _utcnow_naive(),
+                },
+            )
+            db.commit()
+    except Exception:
+        logger.exception("[news-eye] failed to record async event-driven selection state")
 
 
 def load_user_focus_symbols(db: Session, user_id: str, *, limit: int = _WATCHLIST_SYMBOL_LIMIT) -> list[str]:
@@ -687,6 +1091,31 @@ def load_user_focus_symbols(db: Session, user_id: str, *, limit: int = _WATCHLIS
         if len(symbols) >= limit:
             break
     return symbols
+
+
+def _load_background_refresh_user_id(db: Session) -> str | None:
+    row = db.execute(
+        text(
+            """
+            SELECT u.id
+            FROM users u
+            WHERE u.is_active = true
+              AND (
+                EXISTS (SELECT 1 FROM watchlist_items w WHERE w.user_id = u.id)
+                OR EXISTS (
+                    SELECT 1
+                    FROM scheduled_analyses s
+                    WHERE s.user_id = u.id
+                      AND COALESCE(s.is_active, true) = true
+                )
+                OR EXISTS (SELECT 1 FROM user_llm_configs c WHERE c.user_id = u.id)
+              )
+            ORDER BY u.last_login_at DESC NULLS LAST, u.created_at DESC NULLS LAST
+            LIMIT 1
+            """
+        )
+    ).mappings().first()
+    return str(row["id"]) if row and row.get("id") else None
 
 
 def _load_global_focus_symbols(db: Session, *, limit: int) -> list[str]:
@@ -717,6 +1146,18 @@ def _load_global_focus_symbols(db: Session, *, limit: int) -> list[str]:
     return symbols
 
 
+def _dedupe_symbols(symbols: Iterable[Any]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in symbols:
+        symbol = str(raw or "").strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        result.append(symbol)
+    return result
+
+
 def _fetch_external_news(limit: int, *, symbols: list[str]) -> tuple[list[dict[str, Any]], list[str], list[str]]:
     import akshare as ak
 
@@ -731,7 +1172,7 @@ def _fetch_external_news(limit: int, *, symbols: list[str]) -> tuple[list[dict[s
             warnings.append(f"{spec.label} 接口不存在")
             continue
         try:
-            frame = func(**spec.kwargs)
+            frame = _call_news_source(func, spec.kwargs, label=spec.label)
             normalized = _normalize_news_frame(frame, spec.label, limit=per_source_limit)
             normalized = [item for item in normalized if _is_a_share_relevant_news(item)]
             if normalized:
@@ -751,7 +1192,8 @@ def _fetch_external_news(limit: int, *, symbols: list[str]) -> tuple[list[dict[s
             transformed_symbol = spec.symbol_transform(symbol) if callable(spec.symbol_transform) else symbol
             call_kwargs[spec.symbol_param] = transformed_symbol
             try:
-                frame = func(**call_kwargs)
+                active_label = f"{spec.label}:{symbol}"
+                frame = _call_news_source(func, call_kwargs, label=active_label)
                 normalized = _normalize_news_frame(
                     frame,
                     spec.label,
@@ -760,13 +1202,21 @@ def _fetch_external_news(limit: int, *, symbols: list[str]) -> tuple[list[dict[s
                 )
                 if normalized:
                     items.extend(normalized)
-                    active_label = f"{spec.label}:{symbol}"
                     if active_label not in active_sources:
                         active_sources.append(active_label)
             except Exception as exc:
                 warnings.append(f"{spec.label}({symbol}) 拉取失败: {exc}")
 
     return _dedupe_items(items)[: max(limit, 20)], active_sources, warnings
+
+
+def _call_news_source(func: Any, kwargs: dict[str, Any], *, label: str) -> Any:
+    future = _SOURCE_FETCH_EXECUTOR.submit(func, **dict(kwargs or {}))
+    try:
+        return future.result(timeout=_SOURCE_TIMEOUT_SECONDS)
+    except FutureTimeoutError as exc:
+        future.cancel()
+        raise TimeoutError(f"{label} 拉取超过 {_SOURCE_TIMEOUT_SECONDS:g}s") from exc
 
 
 def _sync_state_error_from_warnings(warnings: list[str], active_sources: list[str]) -> str | None:
@@ -780,7 +1230,7 @@ def _sync_state_error_from_warnings(warnings: list[str], active_sources: list[st
 
 def _is_noncritical_news_warning(warning: str) -> bool:
     text_value = str(warning or "")
-    return "个股新闻(" in text_value or "暂无高相关资讯" in text_value
+    return "个股新闻(" in text_value or "暂无高相关资讯" in text_value or "拉取超过" in text_value
 
 
 def _normalize_news_frame(
@@ -950,6 +1400,117 @@ def _enrich_news_item(item: dict[str, Any]) -> dict[str, Any]:
         "related_symbols_json": json.dumps(symbols_to_payload(symbols), ensure_ascii=False),
         "fetched_at": _iso_or_none(_utcnow_naive()),
     }
+
+
+def _public_fresh_news_event(enriched: dict[str, Any], *, change_type: str) -> dict[str, Any]:
+    content = str(enriched.get("content") or "").strip()
+    positive_symbols = _loads(enriched.get("positive_symbols_json"))
+    related_symbols = _loads(enriched.get("related_symbols_json"))
+    positive_sectors = _loads(enriched.get("positive_sectors_json"))
+    negative_sectors = _loads(enriched.get("negative_sectors_json"))
+    symbols = positive_symbols if positive_symbols else related_symbols
+    return {
+        "digest": str(enriched.get("digest") or "")[:64],
+        "dedupe_key": str(enriched.get("dedupe_key") or "")[:80],
+        "change_type": str(change_type or "new"),
+        "source": str(enriched.get("source") or "")[:80],
+        "published_at": _iso_or_none(enriched.get("published_at")),
+        "sentiment": str(enriched.get("sentiment") or "neutral"),
+        "content": content[:180],
+        "positive_sectors": _string_list(positive_sectors),
+        "negative_sectors": _string_list(negative_sectors),
+        "symbols": _symbol_labels(symbols),
+    }
+
+
+def _build_fresh_event_context(events: list[dict[str, Any]], *, limit: int = 8) -> dict[str, Any]:
+    compact_events = [event for event in events if isinstance(event, dict)][: max(0, int(limit or 0))]
+    if not compact_events:
+        return {"fresh_news_events": [], "fresh_news_summary": {"event_count": 0}}
+    source_counts: dict[str, int] = {}
+    sector_counts: dict[str, int] = {}
+    symbol_counts: dict[str, int] = {}
+    sentiment_counts: dict[str, int] = {}
+    for event in compact_events:
+        source = str(event.get("source") or "unknown")
+        sentiment = str(event.get("sentiment") or "neutral")
+        source_counts[source] = source_counts.get(source, 0) + 1
+        sentiment_counts[sentiment] = sentiment_counts.get(sentiment, 0) + 1
+        for sector in [*event.get("positive_sectors", []), *event.get("negative_sectors", [])]:
+            key = str(sector or "").strip()
+            if key:
+                sector_counts[key] = sector_counts.get(key, 0) + 1
+        for symbol in event.get("symbols", []):
+            key = str(symbol.get("symbol") if isinstance(symbol, dict) else symbol or "").strip()
+            if key:
+                symbol_counts[key] = symbol_counts.get(key, 0) + 1
+    return {
+        "fresh_news_events": compact_events,
+        "fresh_news_summary": {
+            "event_count": len(events),
+            "included_count": len(compact_events),
+            "source_counts": source_counts,
+            "sentiment_counts": sentiment_counts,
+            "top_sectors": sorted(sector_counts, key=sector_counts.get, reverse=True)[:6],
+            "top_symbols": sorted(symbol_counts, key=symbol_counts.get, reverse=True)[:8],
+        },
+    }
+
+
+def _load_existing_news_item_for_dedupe(db: Session, dedupe_key: str) -> dict[str, Any] | None:
+    if not dedupe_key:
+        return None
+    row = db.execute(
+        text(
+            """
+            SELECT digest, content, published_at, source, url, sentiment,
+                   positive_sectors_json, negative_sectors_json,
+                   positive_symbols_json, negative_symbols_json,
+                   related_symbols_json
+            FROM market_news_items
+            WHERE dedupe_key = :dedupe_key
+            LIMIT 1
+            """
+        ),
+        {"dedupe_key": dedupe_key},
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def _news_material_changed(existing: dict[str, Any], incoming: dict[str, Any]) -> bool:
+    scalar_keys = ("content", "source", "url", "sentiment")
+    for key in scalar_keys:
+        if str(existing.get(key) or "") != str(incoming.get(key) or ""):
+            return True
+    if _iso_or_none(existing.get("published_at")) != _iso_or_none(incoming.get("published_at")):
+        return True
+    json_keys = (
+        "positive_sectors_json",
+        "negative_sectors_json",
+        "positive_symbols_json",
+        "negative_symbols_json",
+        "related_symbols_json",
+    )
+    return any(
+        _canonical_json_text(existing.get(key)) != _canonical_json_text(incoming.get(key))
+        for key in json_keys
+    )
+
+
+def _canonical_json_text(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return value.strip()
+    else:
+        parsed = value
+    try:
+        return json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return str(parsed)
 
 
 def _classify_sentiment(content: str) -> str:
@@ -1435,17 +1996,26 @@ def _record_sync_state(
     active_sources: list[str],
     tracked_symbols: list[str],
     saved_count: int,
+    new_count: int,
+    updated_count: int,
+    unchanged_count: int,
+    event_driven_selection: dict[str, Any] | None = None,
 ) -> None:
+    fresh_event_count = int(new_count or 0) + int(updated_count or 0)
     db.execute(
         text(
             """
             INSERT INTO market_news_sync_state (
                 worker_name, status, last_run_at, last_success_at, last_error,
-                active_sources_json, tracked_symbols_json, saved_count, updated_at
+                active_sources_json, tracked_symbols_json, saved_count,
+                new_count, updated_count, unchanged_count, fresh_event_count,
+                event_selection_json, updated_at
             )
             VALUES (
                 :worker_name, :status, :last_run_at, :last_success_at, :last_error,
-                :active_sources_json, :tracked_symbols_json, :saved_count, :updated_at
+                :active_sources_json, :tracked_symbols_json, :saved_count,
+                :new_count, :updated_count, :unchanged_count, :fresh_event_count,
+                :event_selection_json, :updated_at
             )
             ON CONFLICT (worker_name) DO UPDATE SET
                 status = EXCLUDED.status,
@@ -1455,6 +2025,11 @@ def _record_sync_state(
                 active_sources_json = EXCLUDED.active_sources_json,
                 tracked_symbols_json = EXCLUDED.tracked_symbols_json,
                 saved_count = EXCLUDED.saved_count,
+                new_count = EXCLUDED.new_count,
+                updated_count = EXCLUDED.updated_count,
+                unchanged_count = EXCLUDED.unchanged_count,
+                fresh_event_count = EXCLUDED.fresh_event_count,
+                event_selection_json = EXCLUDED.event_selection_json,
                 updated_at = EXCLUDED.updated_at
             """
         ),
@@ -1467,6 +2042,11 @@ def _record_sync_state(
             "active_sources_json": json.dumps(active_sources, ensure_ascii=False),
             "tracked_symbols_json": json.dumps(tracked_symbols, ensure_ascii=False),
             "saved_count": int(saved_count or 0),
+            "new_count": int(new_count or 0),
+            "updated_count": int(updated_count or 0),
+            "unchanged_count": int(unchanged_count or 0),
+            "fresh_event_count": fresh_event_count,
+            "event_selection_json": json.dumps(event_driven_selection or {}, ensure_ascii=False, default=str),
             "updated_at": _utcnow_naive(),
         },
     )
@@ -1477,7 +2057,9 @@ def _load_sync_state(db: Session) -> dict[str, Any]:
         text(
             """
             SELECT worker_name, status, last_run_at, last_success_at, last_error,
-                   active_sources_json, tracked_symbols_json, saved_count, updated_at
+                   active_sources_json, tracked_symbols_json, saved_count,
+                   new_count, updated_count, unchanged_count, fresh_event_count,
+                   event_selection_json, updated_at
             FROM market_news_sync_state
             WHERE worker_name = :worker_name
             """
@@ -1495,6 +2077,16 @@ def _loads(value: str | None) -> list[Any]:
         return parsed if isinstance(parsed, list) else []
     except Exception:
         return []
+
+
+def _loads_dict(value: str | None) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
 
 
 def _utcnow_naive() -> datetime:

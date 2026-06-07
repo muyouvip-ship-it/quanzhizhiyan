@@ -12,4 +12,6 @@ def get_version() -> str:
         from importlib.metadata import version as pkg_version
         return pkg_version("tradingagents")
     except Exception:
+        import logging
+        logging.getLogger(__name__).debug("Could not determine package version, using 'dev'")
         return "dev"

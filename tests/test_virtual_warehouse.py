@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
@@ -7,6 +8,7 @@ from uuid import uuid4
 from api.database import ImportedPortfolioPositionDB, QmtAccountSnapshotDB, QmtSyncProfileDB, get_db_ctx
 from api.data_downloader import DataDownloader
 from api.services import auth_service
+from api.services import qmt_virtual_account_service
 from api.services.qmt_virtual_account_service import QmtRuntimeConfig
 
 
@@ -50,6 +52,31 @@ def test_default_qmt_account_configs_do_not_import_env_accounts(monkeypatch):
     assert configs["paper"]["enabled"] is False
     assert configs["paper"]["account_id"] == ""
     assert configs["paper"]["bridge_base_url"] == ""
+
+
+def test_qmt_bridge_error_calls_out_local_backend_address():
+    config = QmtRuntimeConfig(
+        key="paper_sim",
+        enabled=True,
+        host="127.0.0.1",
+        port=58610,
+        account_id="39027628",
+        account_type="STOCK",
+        account_name="QMT 模拟账户",
+        userdata_path="",
+        role="paper",
+        bridge_base_url="http://127.0.0.1:8710",
+        bridge_token="",
+        refresh_interval_seconds=10,
+    )
+
+    message = qmt_virtual_account_service._compact_qmt_snapshot_error(
+        RuntimeError("HTTPConnectionPool: Failed to establish a new connection"),
+        config,
+    )
+
+    assert "当前后端本机地址" in message
+    assert "Windows bridge" in message
 
 
 def test_qmt_virtual_warehouse_overview(monkeypatch):
@@ -693,6 +720,51 @@ def test_qmt_overview_uses_sync_profile_for_background_health(monkeypatch):
     assert payload["connection"]["health_status"] == "background_live"
     assert payload["connection"]["health_label"] == "后台在线"
     assert payload["connection"]["effective_connected"] is True
+
+
+def test_qmt_background_refresh_skips_recent_bridge_failure(monkeypatch):
+    monkeypatch.setattr(
+        qmt_virtual_account_service,
+        "_resolve_runtime_config",
+        lambda account_key, db=None, user_id=None: QmtRuntimeConfig(
+            key="paper_bridge",
+            enabled=True,
+            host="192.168.10.1",
+            port=58610,
+            account_id="39027628",
+            account_type="STOCK",
+            account_name="QMT 模拟仓",
+            userdata_path="",
+            role="paper",
+            bridge_base_url="http://127.0.0.1:8710",
+            bridge_token="bridge-token",
+            refresh_interval_seconds=10,
+        ),
+    )
+    qmt_virtual_account_service._QMT_RECENT_FAILURES.clear()
+    qmt_virtual_account_service._QMT_BACKGROUND_REFRESH_STATE.clear()
+    qmt_virtual_account_service._remember_fetch_failure("user-1:paper_bridge", "QMT 连接失败：bridge timeout")
+
+    calls = {"count": 0}
+
+    def fail_query(config):
+        calls["count"] += 1
+        raise RuntimeError("bridge should not be called")
+
+    monkeypatch.setattr(qmt_virtual_account_service, "_query_qmt_snapshot_via_bridge_async", fail_query)
+
+    @contextmanager
+    def fake_db_ctx():
+        yield object()
+
+    monkeypatch.setattr("api.database.get_db_ctx", fake_db_ctx)
+
+    qmt_virtual_account_service._run_qmt_background_refresh("user-1", "paper_bridge")
+
+    assert calls["count"] == 0
+    state = qmt_virtual_account_service._get_background_refresh_status("user-1:paper_bridge")
+    assert state is not None
+    assert "bridge timeout" in str(state.get("last_error") or "")
 
 
 def test_qmt_overview_uses_cached_summary_for_inactive_account(monkeypatch):

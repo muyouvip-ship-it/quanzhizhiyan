@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import asyncio
+import ipaddress
 import logging
 import math
 import os
@@ -11,6 +12,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlparse
 from uuid import uuid4
 
 import httpx
@@ -22,6 +24,7 @@ from api.core.settings import settings
 from api.database import ImportedPortfolioPositionDB, QmtAccountSnapshotDB, QmtSyncProfileDB, VirtualPositionStateDB
 from api.services import auth_service, portfolio_import_service
 from api.services.data_source_governance import build_virtual_warehouse_governance
+from api.core.utils import run_async
 
 
 logger = logging.getLogger(__name__)
@@ -32,7 +35,7 @@ _BULK_SELL_TASKS_LOCK = threading.RLock()
 _BULK_SELL_TASK_RETENTION_SECONDS = 60 * 60 * 6
 _QMT_SNAPSHOT_TIMEOUT_SECONDS = max(float(os.getenv("QMT_SNAPSHOT_TIMEOUT_SECONDS", "6")), 1.0)
 _QMT_RECENT_PAYLOAD_TTL_SECONDS = max(float(os.getenv("QMT_RECENT_PAYLOAD_TTL_SECONDS", "5")), 1.0)
-_QMT_FAILURE_COOLDOWN_SECONDS = max(float(os.getenv("QMT_FAILURE_COOLDOWN_SECONDS", "15")), 1.0)
+_QMT_FAILURE_COOLDOWN_SECONDS = max(float(os.getenv("QMT_FAILURE_COOLDOWN_SECONDS", "120")), 1.0)
 _QMT_RECENT_PAYLOADS: dict[str, dict[str, Any]] = {}
 _QMT_RECENT_FAILURES: dict[str, dict[str, Any]] = {}
 _QMT_FETCH_LOCKS: dict[str, threading.Lock] = {}
@@ -880,8 +883,11 @@ def _load_account_payload(
         cached = _load_cached_payload(db, user_id, config, connection_override=connection)
         return cached or empty
     except Exception as exc:
-        logger.exception("[qmt] fetch overview failed for %s", config.key)
-        connection["message"] = f"QMT 连接失败：{exc}"
+        connection["message"] = _compact_qmt_snapshot_error(exc, config)
+        if config.bridge_base_url:
+            logger.warning("[qmt] fetch overview failed for %s: %s", config.key, connection["message"])
+        else:
+            logger.exception("[qmt] fetch overview failed for %s", config.key)
         _remember_fetch_failure(cache_key, connection["message"])
         if not allow_cache_fallback:
             return empty
@@ -1069,13 +1075,22 @@ def _schedule_qmt_background_refresh(user_id: str, account_key: str) -> bool:
 
 def _run_qmt_background_refresh(user_id: str, account_key: str) -> None:
     cache_key = _qmt_fetch_cache_key(user_id, account_key)
+    config: QmtRuntimeConfig | None = None
     try:
         from api.database import get_db_ctx
 
         with get_db_ctx() as db:
             config = _resolve_runtime_config(account_key, db=db, user_id=user_id)
+            recent_failure = _get_recent_fetch_failure(cache_key)
+            if recent_failure:
+                logger.info("[qmt] background refresh skipped for %s due to recent failure: %s", cache_key, recent_failure)
+                with _QMT_FETCH_STATE_LOCK:
+                    state = _QMT_BACKGROUND_REFRESH_STATE.get(cache_key) or {}
+                    state["last_error"] = recent_failure
+                    _QMT_BACKGROUND_REFRESH_STATE[cache_key] = state
+                return
             if config.bridge_base_url:
-                snapshot = asyncio.run(_query_qmt_snapshot_via_bridge_async(config))
+                snapshot = run_async(_query_qmt_snapshot_via_bridge_async(config))
                 _materialize_qmt_snapshot_payload(db, user_id, config, snapshot)
             else:
                 _load_account_payload(db, user_id, config, prefer_cache=False, sync_to_imports=False)
@@ -1085,10 +1100,12 @@ def _run_qmt_background_refresh(user_id: str, account_key: str) -> None:
             state["last_success_at"] = time.time()
             _QMT_BACKGROUND_REFRESH_STATE[cache_key] = state
     except Exception as exc:
-        logger.exception("[qmt] background refresh failed for %s", cache_key)
+        message = _compact_qmt_snapshot_error(exc, config)
+        _remember_fetch_failure(cache_key, message)
+        logger.warning("[qmt] background refresh failed for %s: %s", cache_key, message)
         with _QMT_FETCH_STATE_LOCK:
             state = _QMT_BACKGROUND_REFRESH_STATE.get(cache_key) or {}
-            state["last_error"] = str(exc)
+            state["last_error"] = message
             _QMT_BACKGROUND_REFRESH_STATE[cache_key] = state
     finally:
         with _QMT_FETCH_STATE_LOCK:
@@ -1224,11 +1241,33 @@ def _clear_recent_fetch_failure(cache_key: str) -> None:
         _QMT_RECENT_FAILURES.pop(cache_key, None)
 
 
+def _compact_qmt_snapshot_error(exc: Exception, config: QmtRuntimeConfig | None = None) -> str:
+    message = str(exc) or exc.__class__.__name__
+    lowered = message.lower()
+    base_url = str(getattr(config, "bridge_base_url", "") or "").strip().rstrip("/")
+    if base_url and _bridge_url_points_to_local_machine(base_url) and (
+        "connection" in lowered
+        or "max retries" in lowered
+        or "failed to establish" in lowered
+        or "timeout" in lowered
+        or "timed out" in lowered
+    ):
+        return f"QMT bridge地址疑似配成当前后端本机地址：{base_url}；请改为 Windows bridge 的实际 IP。"
+    if base_url and ("timeout" in lowered or "timed out" in lowered):
+        return f"QMT bridge连接超时：{base_url}"
+    if base_url and ("connection" in lowered or "max retries" in lowered or "failed to establish" in lowered):
+        return f"QMT bridge不可达：{base_url}"
+    return f"QMT 连接失败：{message}"[:240]
+
+
 def _diagnose_single_account(config: QmtRuntimeConfig, *, run_connect_test: bool) -> dict[str, Any]:
     userdata_path_exists = bool(config.userdata_path) and os.path.exists(config.userdata_path)
     xtquant_installed, xtquant_message = _check_xtquant_available()
     tcp_reachable, tcp_message = _probe_tcp_port(config.host, config.port)
     bridge_reachable, bridge_message = _probe_bridge(config)
+    qmt_host_is_local = _host_points_to_local_machine(config.host)
+    bridge_host = _bridge_url_host(config.bridge_base_url)
+    bridge_host_is_local = _host_points_to_local_machine(bridge_host)
     checks = {
         "enabled": config.enabled,
         "account_id_configured": bool(config.account_id),
@@ -1238,6 +1277,8 @@ def _diagnose_single_account(config: QmtRuntimeConfig, *, run_connect_test: bool
         "tcp_port_reachable": tcp_reachable,
         "bridge_configured": bool(config.bridge_base_url),
         "bridge_reachable": bridge_reachable,
+        "qmt_host_is_local_machine": qmt_host_is_local,
+        "bridge_host_is_local_machine": bridge_host_is_local,
     }
     warnings: list[str] = []
     if config.enabled and not config.account_id:
@@ -1252,6 +1293,10 @@ def _diagnose_single_account(config: QmtRuntimeConfig, *, run_connect_test: bool
         warnings.append("QMT 端口不可达")
     if config.enabled and config.bridge_base_url and not bridge_reachable:
         warnings.append("QMT bridge 不可达")
+    if config.enabled and qmt_host_is_local and not tcp_reachable:
+        warnings.append(f"QMT host {config.host} 是当前后端机器本机地址，请改成 Windows QMT/bridge 的实际 IP")
+    if config.enabled and config.bridge_base_url and bridge_host_is_local and not bridge_reachable:
+        warnings.append(f"bridge_base_url 指向当前后端机器本机地址（{bridge_host}），请改成 Windows bridge 的实际 IP")
 
     connect_test = {
         "attempted": False,
@@ -1339,6 +1384,57 @@ def _probe_tcp_port(host: str, port: int, timeout: float = 1.5) -> tuple[bool, s
         return True, f"{host}:{port} 可达"
     except Exception as exc:
         return False, str(exc)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def _bridge_url_host(base_url: str) -> str:
+    text = str(base_url or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(urlparse(text).hostname or "").strip()
+    except Exception:
+        return ""
+
+
+def _bridge_url_points_to_local_machine(base_url: str) -> bool:
+    return _host_points_to_local_machine(_bridge_url_host(base_url))
+
+
+def _host_points_to_local_machine(host: str) -> bool:
+    text = str(host or "").strip()
+    if not text:
+        return False
+    try:
+        infos = socket.getaddrinfo(text, None, socket.AF_INET, socket.SOCK_STREAM)
+        addresses = [str(item[4][0]) for item in infos if item and item[4]]
+    except Exception:
+        addresses = [text]
+    for address in dict.fromkeys(addresses):
+        if _ipv4_address_belongs_to_local_machine(address):
+            return True
+    return False
+
+
+def _ipv4_address_belongs_to_local_machine(address: str) -> bool:
+    try:
+        parsed = ipaddress.ip_address(str(address or "").strip())
+    except Exception:
+        return False
+    if parsed.version != 4:
+        return False
+    if parsed.is_loopback or parsed.is_unspecified:
+        return True
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind((str(parsed), 0))
+        return True
+    except OSError:
+        return False
     finally:
         try:
             sock.close()

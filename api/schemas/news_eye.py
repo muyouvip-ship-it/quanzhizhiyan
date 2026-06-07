@@ -59,6 +59,7 @@ class NewsThemeRankingResponse(BaseModel):
     updated_at: str
     source: str
     message: str
+    data_governance: dict[str, Any] = Field(default_factory=dict)
 
 
 class NewsThemeSnapshotResponse(BaseModel):

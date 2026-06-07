@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tradingagents"
-version = "0.2.0"
+version = "0.3.0"
 description = "量化之神: Multi-agent quantitative research platform for A-share trading"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -51,5 +51,6 @@ include = ["tradingagents*", "cli*", "api*", "scheduler*"]
 
 [dependency-groups]
 dev = [
+    "alembic>=1.18.4",
     "pytest>=9.0.2",
 ]

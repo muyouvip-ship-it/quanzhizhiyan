@@ -4,7 +4,7 @@ import { useNavigate } from 'react-router-dom'
 import { api } from '@/services/api'
 import { usePolling } from '@/hooks/usePolling'
 import { useAuthStore } from '@/stores/authStore'
-import type { RuntimeConfig, RuntimeQmtAccountConfig, RuntimeWarmupResult, UserToken, VirtualWarehouseDiagnosticsResponse, VirtualWarehouseOverviewResponse, BacktestDataConfigItem, BacktestDataSubscriptionStatus, DailyReviewConfig, DailyKlineGovernanceSummaryResponse, SystemDataSourceRegistryResponse } from '@/types'
+import type { RuntimeConfig, RuntimeLlmCoreStockReadiness, RuntimeQmtAccountConfig, RuntimeWarmupResult, UserToken, VirtualWarehouseDiagnosticsResponse, VirtualWarehouseOverviewResponse, BacktestDataConfigItem, BacktestDataSubscriptionStatus, DailyReviewConfig, DailyKlineGovernanceSummaryResponse, SystemDataSourceRegistryResponse } from '@/types'
 
 type ProviderPreset = {
     id: string
@@ -22,11 +22,12 @@ const PROVIDER_PRESETS: ProviderPreset[] = [
     { id: 'google', label: 'Google Gemini', provider: 'google', baseUrl: '', protocol: 'Google' },
     { id: 'ollama', label: '本地 Ollama', provider: 'ollama', baseUrl: 'http://127.0.0.1:11434/v1', protocol: 'OpenAI 兼容', editableBaseUrl: true, local: true },
     { id: 'local-openai', label: '本地 OpenAI 兼容（LM Studio / vLLM）', provider: 'openai', baseUrl: 'http://127.0.0.1:1234/v1', protocol: 'OpenAI 兼容', editableBaseUrl: true, local: true },
-    { id: 'dashscope', label: '阿里云百炼（DashScope）', provider: 'openai', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', protocol: 'OpenAI 兼容' },
-    { id: 'deepseek', label: 'DeepSeek', provider: 'openai', baseUrl: 'https://api.deepseek.com/v1', protocol: 'OpenAI 兼容' },
-    { id: 'moonshot', label: 'Moonshot AI（Kimi）', provider: 'openai', baseUrl: 'https://api.moonshot.cn/v1', protocol: 'OpenAI 兼容' },
-    { id: 'zhipu', label: '智谱 AI', provider: 'openai', baseUrl: 'https://open.bigmodel.cn/api/paas/v4', protocol: 'OpenAI 兼容' },
-    { id: 'siliconflow', label: '硅基流动', provider: 'openai', baseUrl: 'https://api.siliconflow.cn/v1', protocol: 'OpenAI 兼容' },
+    { id: 'dashscope', label: '阿里云百炼（DashScope）', provider: 'dashscope', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', protocol: 'OpenAI 兼容' },
+    { id: 'volcengine-ark', label: '火山引擎 Ark', provider: 'volcengine-ark', baseUrl: 'https://ark.cn-beijing.volces.com/api/coding/v3', protocol: 'OpenAI 兼容' },
+    { id: 'deepseek', label: 'DeepSeek', provider: 'deepseek', baseUrl: 'https://api.deepseek.com/v1', protocol: 'OpenAI 兼容' },
+    { id: 'moonshot', label: 'Moonshot AI（Kimi）', provider: 'moonshot', baseUrl: 'https://api.moonshot.cn/v1', protocol: 'OpenAI 兼容' },
+    { id: 'zhipu', label: '智谱 AI', provider: 'zhipu', baseUrl: 'https://open.bigmodel.cn/api/paas/v4', protocol: 'OpenAI 兼容' },
+    { id: 'siliconflow', label: '硅基流动', provider: 'siliconflow', baseUrl: 'https://api.siliconflow.cn/v1', protocol: 'OpenAI 兼容' },
     { id: 'custom-openai', label: '自定义 OpenAI 兼容', provider: 'openai', baseUrl: '', protocol: 'OpenAI 兼容', editableBaseUrl: true },
 ]
 
@@ -45,8 +46,61 @@ function inferPreset(llmProvider: string, backendUrl: string): string {
         return preset.baseUrl.replace(/\/$/, '') === normalizedUrl
     })
     if (matched) return matched.id
+    if (normalizedProvider === 'openai' && normalizedUrl) {
+        const legacyOpenAiCompatible = PROVIDER_PRESETS.find((preset) => preset.baseUrl.replace(/\/$/, '') === normalizedUrl)
+        if (legacyOpenAiCompatible) return legacyOpenAiCompatible.id
+    }
     if (normalizedProvider === 'openai') return 'custom-openai'
     return normalizedProvider || 'openai'
+}
+
+function displayConfigValue(value: unknown, fallback = '-'): string {
+    if (value === null || value === undefined) return fallback
+    const text = String(value).trim()
+    return text || fallback
+}
+
+function llmReadinessStatusLabel(status?: string): string {
+    const normalized = (status || '').trim()
+    const labels: Record<string, string> = {
+        ready: '远程 LLM 可用',
+        missing_api_key: '缺少 API Key',
+        auth_failed: 'Key 与端点不匹配',
+        local_rejected: '本地模型已拒绝',
+        missing_model: '缺少模型配置',
+        mixed_runtime_rejected: '配置来源混用',
+        disabled: 'LLM 增强关闭',
+        unavailable: '不可用',
+        unknown: '未检测',
+    }
+    return labels[normalized] || normalized || '未检测'
+}
+
+function llmReadinessTone(readiness: RuntimeLlmCoreStockReadiness | null): {
+    panel: string
+    badge: string
+    icon: string
+} {
+    const status = String(readiness?.status || '')
+    if (readiness?.ready || status === 'ready') {
+        return {
+            panel: 'border-emerald-200 bg-emerald-50/70 dark:border-emerald-900/50 dark:bg-emerald-950/20',
+            badge: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-200',
+            icon: 'text-emerald-500',
+        }
+    }
+    if (status === 'missing_api_key' || status === 'missing_model') {
+        return {
+            panel: 'border-amber-200 bg-amber-50/70 dark:border-amber-900/50 dark:bg-amber-950/20',
+            badge: 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-200',
+            icon: 'text-amber-500',
+        }
+    }
+    return {
+        panel: 'border-rose-200 bg-rose-50/70 dark:border-rose-900/50 dark:bg-rose-950/20',
+        badge: 'bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-200',
+        icon: 'text-rose-500',
+    }
 }
 
 function createDefaultQmtForm(role: 'paper' | 'live'): RuntimeQmtAccountConfig {
@@ -118,6 +172,16 @@ const SETTINGS_SECTIONS = [
     { id: 'system' as const, label: '系统调试', description: '令牌管理与日志调试入口', icon: Key },
 ]
 
+const DEFAULT_NEWS_SOURCE_LINKS = [
+    { key: 'stock_info_global_cls', name: '财联社电报', url: 'https://www.cls.cn/telegraph' },
+    { key: 'stock_info_global_em', name: '东方财富全球快讯', url: 'https://kuaixun.eastmoney.com/7_24.html' },
+    { key: 'stock_info_cjzc_em', name: '东方财富财经早餐', url: 'https://stock.eastmoney.com/a/czpnc.html' },
+    { key: 'stock_info_global_sina', name: '新浪7x24', url: 'https://finance.sina.com.cn/7x24' },
+    { key: 'stock_info_global_futu', name: '富途快讯', url: 'https://news.futunn.com/main/live' },
+    { key: 'stock_info_global_ths', name: '同花顺全球直播', url: 'https://news.10jqka.com.cn/realtimenews.html' },
+    { key: 'stock_news_em', name: '东方财富个股新闻', url: 'https://so.eastmoney.com/news/s?keyword=000001' },
+]
+
 export default function Settings() {
     const navigate = useNavigate()
     const { user } = useAuthStore()
@@ -126,8 +190,6 @@ export default function Settings() {
     const [customPrompt, setCustomPrompt] = useState('')
     const [llmApiKey, setLlmApiKey] = useState('')
     const [hasStoredApiKey, setHasStoredApiKey] = useState(false)
-    const [newsLlmApiKey, setNewsLlmApiKey] = useState('')
-    const [hasStoredNewsApiKey, setHasStoredNewsApiKey] = useState(false)
     const [wecomWebhook, setWecomWebhook] = useState('')
     const [hasStoredWebhook, setHasStoredWebhook] = useState(false)
     const [storedWebhookDisplay, setStoredWebhookDisplay] = useState('')
@@ -136,9 +198,7 @@ export default function Settings() {
     const [customBaseUrl, setCustomBaseUrl] = useState('')
     const [deepThinkLlm, setDeepThinkLlm] = useState('')
     const [quickThinkLlm, setQuickThinkLlm] = useState('')
-    const [newsProviderPreset, setNewsProviderPreset] = useState('openai')
-    const [newsCustomBaseUrl, setNewsCustomBaseUrl] = useState('')
-    const [newsAnalysisLlm, setNewsAnalysisLlm] = useState('')
+    const [llmCoreStock, setLlmCoreStock] = useState<RuntimeLlmCoreStockReadiness | null>(null)
     const [maxDebateRounds, setMaxDebateRounds] = useState(1)
     const [maxRiskRounds, setMaxRiskRounds] = useState(1)
     const [serverFallbackEnabled, setServerFallbackEnabled] = useState(true)
@@ -220,15 +280,24 @@ export default function Settings() {
         () => PROVIDER_PRESETS.find((item) => item.id === providerPreset) || PROVIDER_PRESETS[0],
         [providerPreset],
     )
-    const selectedNewsPreset = useMemo(
-        () => PROVIDER_PRESETS.find((item) => item.id === newsProviderPreset) || PROVIDER_PRESETS[0],
-        [newsProviderPreset],
+    const llmReadinessToneClasses = useMemo(() => llmReadinessTone(llmCoreStock), [llmCoreStock])
+    const llmReadinessDetails = useMemo(
+        () => [
+            { label: 'Provider', value: llmCoreStock?.provider },
+            { label: 'Model', value: llmCoreStock?.model },
+            { label: 'Base URL', value: llmCoreStock?.base_url },
+            { label: 'Runtime Set', value: llmCoreStock?.runtime_package_source },
+            { label: 'Provider Source', value: llmCoreStock?.provider_source },
+            { label: 'Key Source', value: llmCoreStock?.api_key_source || (llmCoreStock?.has_api_key ? 'configured' : null) },
+            { label: 'Base Source', value: llmCoreStock?.base_url_source },
+            { label: 'Model Source', value: llmCoreStock?.model_source },
+        ],
+        [llmCoreStock],
     )
+    const LlmReadinessIcon = llmCoreStock?.ready ? CheckCircle : AlertCircle
 
     const effectiveProvider = selectedPreset.provider
     const effectiveBaseUrl = selectedPreset.editableBaseUrl ? customBaseUrl.trim() : selectedPreset.baseUrl
-    const effectiveNewsProvider = selectedNewsPreset.provider
-    const effectiveNewsBaseUrl = selectedNewsPreset.editableBaseUrl ? newsCustomBaseUrl.trim() : selectedNewsPreset.baseUrl
     useEffect(() => {
         setWarmupResults([])
         setWarmupError(null)
@@ -240,6 +309,7 @@ export default function Settings() {
     }, [wecomWebhook])
 
     const shouldLoadQmtStatus = activeSettingsSection === 'qmt'
+    const shouldLoadSystemDataSources = activeSettingsSection === 'system' || activeSettingsSection === 'analysis'
 
     useEffect(() => {
         try {
@@ -263,21 +333,15 @@ export default function Settings() {
         setCustomBaseUrl(cfg.backend_url || '')
         setDeepThinkLlm(cfg.deep_think_llm)
         setQuickThinkLlm(cfg.quick_think_llm)
-        const inheritedNewsProvider = cfg.news_llm_provider || cfg.llm_provider
-        const inheritedNewsBaseUrl = cfg.news_backend_url || cfg.backend_url
-        const inheritedNewsModel = cfg.news_analysis_llm || cfg.quick_think_llm || cfg.deep_think_llm
-        setNewsProviderPreset(inferPreset(inheritedNewsProvider, inheritedNewsBaseUrl))
-        setNewsCustomBaseUrl(inheritedNewsBaseUrl || '')
-        setNewsAnalysisLlm(inheritedNewsModel || '')
         setMaxDebateRounds(cfg.max_debate_rounds)
         setMaxRiskRounds(cfg.max_risk_discuss_rounds)
-        setHasStoredApiKey(!!cfg.has_api_key)
-        setHasStoredNewsApiKey(!!cfg.has_news_api_key)
+        setHasStoredApiKey(!!(cfg.has_api_key || cfg.has_news_api_key))
         setHasStoredWebhook(!!cfg.has_wecom_webhook)
         setStoredWebhookDisplay(cfg.wecom_webhook_display || '')
         setServerFallbackEnabled(!!cfg.server_fallback_enabled)
         setEmailReportEnabled(cfg.email_report_enabled !== false)
         setWecomReportEnabled(cfg.wecom_report_enabled !== false)
+        setLlmCoreStock(cfg.llm_core_stock || null)
         if (Array.isArray(cfg.default_analysts) && cfg.default_analysts.length > 0) {
             setDefaultAnalysts(cfg.default_analysts)
         }
@@ -382,11 +446,11 @@ export default function Settings() {
     }, [loadQmtStatus, qmtDiagnostics, qmtOverview, qmtStatusLoading, shouldLoadQmtStatus])
 
     useEffect(() => {
-        if (activeSettingsSection !== 'system') return
+        if (!shouldLoadSystemDataSources) return
         if (systemDataSourcesLoading) return
         if (systemDataSources) return
         void loadSystemDataSources()
-    }, [activeSettingsSection, loadSystemDataSources, systemDataSources, systemDataSourcesLoading])
+    }, [loadSystemDataSources, shouldLoadSystemDataSources, systemDataSources, systemDataSourcesLoading])
 
     const loadBacktestConfigSnapshot = useCallback(async (options?: { syncForm?: boolean }) => {
         const syncForm = options?.syncForm !== false
@@ -482,18 +546,33 @@ export default function Settings() {
     const loadBacktestDataInfo = useCallback(async () => {
         setLoadingStats(true)
         try {
-            const [, , tasks] = await Promise.all([
+            const [configResult, statsResult, tasksResult, governanceResult] = await Promise.allSettled([
                 loadBacktestConfigSnapshot({ syncForm: true }),
                 loadBacktestStats(),
                 loadBacktestTaskList(),
                 loadDailyKlineGovernanceSummary(),
             ])
+            if (configResult.status === 'rejected') {
+                console.error('加载回测数据配置失败:', configResult.reason)
+            }
+            if (statsResult.status === 'rejected') {
+                console.error('加载已下载数据统计失败:', statsResult.reason)
+                setDataStats([])
+            }
+            let tasks: any[] = []
+            if (tasksResult.status === 'fulfilled') {
+                tasks = Array.isArray(tasksResult.value) ? tasksResult.value : []
+            } else {
+                console.error('加载回测数据任务失败:', tasksResult.reason)
+                setDataTasks([])
+            }
+            if (governanceResult.status === 'rejected') {
+                console.error('加载日K多源治理摘要失败:', governanceResult.reason)
+                setDailyKlineGovernance(null)
+            }
             ensureTaskPollingForActiveTasks(tasks)
         } catch (err) {
             console.error('加载回测数据信息失败:', err)
-            setDataStats([])
-            setDataTasks([])
-            setDailyKlineGovernance(null)
         } finally {
             setLoadingStats(false)
         }
@@ -707,10 +786,15 @@ export default function Settings() {
             
         } catch (err) {
             console.error('下载数据失败:', err)
+            try {
+                const tasks = await loadBacktestTaskList()
+                ensureTaskPollingForActiveTasks(tasks)
+            } catch (refreshErr) {
+                console.error('下载失败后刷新任务列表失败:', refreshErr)
+            }
             alert(err instanceof Error ? err.message : '下载数据失败')
         } finally {
             setDownloading(false)
-            setDownloadProgress(100)
         }
     }
 
@@ -825,6 +909,8 @@ export default function Settings() {
             'daily_kline': '股票日K线',
             'minute_kline': '股票1分钟K线',
             'index_data': '指数数据',
+            'index_daily_kline': '指数日K线',
+            'index_minute_kline': '指数1分钟K线',
             'chip_data': '筹码数据',
             'financial_data': '财务数据',
             'research_reports': '研报数据'
@@ -858,6 +944,10 @@ export default function Settings() {
     )
     const dataSourceRegistryItems = useMemo(() => systemDataSources?.sources || [], [systemDataSources?.sources])
     const dataSourceSurfaceItems = useMemo(() => systemDataSources?.surfaces || [], [systemDataSources?.surfaces])
+    const newsDataSourceLinks = useMemo(
+        () => systemDataSources?.news_sources?.length ? systemDataSources.news_sources : DEFAULT_NEWS_SOURCE_LINKS,
+        [systemDataSources?.news_sources],
+    )
     const dataSourceCategoryCount = useMemo(
         () => new Set(dataSourceRegistryItems.map(item => item.category)).size,
         [dataSourceRegistryItems],
@@ -904,6 +994,8 @@ export default function Settings() {
             'daily_kline': BarChart3,
             'minute_kline': LineChart,
             'index_data': TrendingUp,
+            'index_daily_kline': TrendingUp,
+            'index_minute_kline': LineChart,
             'chip_data': Database,
             'financial_data': DollarSign,
             'research_reports': FileText
@@ -1174,13 +1266,13 @@ export default function Settings() {
         backend_url: effectiveBaseUrl || undefined,
         deep_think_llm: deepThinkLlm,
         quick_think_llm: quickThinkLlm,
-        news_llm_provider: effectiveNewsProvider,
-        news_backend_url: effectiveNewsBaseUrl || undefined,
-        news_analysis_llm: newsAnalysisLlm,
+        news_llm_provider: effectiveProvider,
+        news_backend_url: effectiveBaseUrl || undefined,
+        news_analysis_llm: quickThinkLlm || deepThinkLlm,
         max_debate_rounds: maxDebateRounds,
         max_risk_discuss_rounds: maxRiskRounds,
         api_key: llmApiKey || undefined,
-        news_api_key: newsLlmApiKey || undefined,
+        news_api_key: llmApiKey || undefined,
         ...(options?.includeWecom ? {
             wecom_webhook_url: wecomWebhook.trim() || undefined,
             wecom_report_enabled: wecomReportEnabled,
@@ -1211,17 +1303,13 @@ export default function Settings() {
             warmup: true,
             force_warmup: forceWarmup,
         })
-        setHasStoredApiKey(!!response.has_api_key)
-        setHasStoredNewsApiKey(!!response.current.has_news_api_key)
-        setHasStoredWebhook(!!response.current.has_wecom_webhook)
-        setStoredWebhookDisplay(response.current.wecom_webhook_display || '')
-        setWecomReportEnabled(response.current.wecom_report_enabled !== false)
-        setPaperQmtForm(response.current.qmt_paper_account || createDefaultQmtForm('paper'))
-        setLiveQmtForm(response.current.qmt_live_account || createDefaultQmtForm('live'))
+        applyRuntimeConfig(response.current)
         setLlmApiKey('')
-        setNewsLlmApiKey('')
         setWecomWebhook('')
-        showSavedMessage(response.warmup?.message || successMessage)
+        const eventRefreshMessage = response.event_driven_selection?.triggered
+            ? `${successMessage}，机会榜重算已排队`
+            : successMessage
+        showSavedMessage(response.warmup?.message || eventRefreshMessage)
         return response
     }
 
@@ -1279,29 +1367,13 @@ export default function Settings() {
         if (!hasStoredApiKey) return
         setSaving(true)
         try {
-            const response = await api.updateConfig({ clear_api_key: true })
-            setHasStoredApiKey(!!response.has_api_key)
+            const response = await api.updateConfig({ clear_api_key: true, clear_news_api_key: true })
+            applyRuntimeConfig(response.current)
             setLlmApiKey('')
             setSaved(true)
             setTimeout(() => setSaved(false), 2000)
         } catch (err) {
             alert(err instanceof Error ? err.message : '清除密钥失败')
-        } finally {
-            setSaving(false)
-        }
-    }
-
-    const handleClearNewsApiKey = async () => {
-        if (!hasStoredNewsApiKey) return
-        setSaving(true)
-        try {
-            const response = await api.updateConfig({ clear_news_api_key: true })
-            setHasStoredNewsApiKey(!!response.current.has_news_api_key)
-            setNewsLlmApiKey('')
-            setSaved(true)
-            setTimeout(() => setSaved(false), 2000)
-        } catch (err) {
-            alert(err instanceof Error ? err.message : '清除资讯模型密钥失败')
         } finally {
             setSaving(false)
         }
@@ -1391,13 +1463,17 @@ export default function Settings() {
             <div className="card space-y-4">
                 <div className="flex items-center gap-2">
                     <Database className="w-5 h-5 text-purple-500" />
-                    <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">模型接入</h2>
+                    <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">LLM配置</h2>
                     {configLoading && <Loader2 className="ml-auto w-4 h-4 animate-spin text-slate-400" />}
                 </div>
 
                 {configError && (
                     <p className="text-sm text-amber-500">⚠ {configError}（显示本地默认值）</p>
                 )}
+
+                <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:border-slate-800 dark:bg-slate-950/60 dark:text-slate-300">
+                    当前账号：<span className="font-semibold text-slate-900 dark:text-slate-100">{user?.email || '--'}</span>
+                </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div>
@@ -1519,6 +1595,35 @@ export default function Settings() {
                         </p>
                     </div>
 
+                    {llmCoreStock && (
+                        <div className={`md:col-span-2 rounded-2xl border px-4 py-3 ${llmReadinessToneClasses.panel}`}>
+                            <div className="flex flex-wrap items-center justify-between gap-3">
+                                <div className="flex items-center gap-2">
+                                    <LlmReadinessIcon className={`h-4 w-4 ${llmReadinessToneClasses.icon}`} />
+                                    <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">主线机会榜 LLM 状态</div>
+                                </div>
+                                <span className={`rounded-full px-2.5 py-1 text-xs font-medium ${llmReadinessToneClasses.badge}`}>
+                                    {llmReadinessStatusLabel(llmCoreStock.status)}
+                                </span>
+                            </div>
+                            {llmCoreStock.reason && (
+                                <div className="mt-2 text-sm text-slate-700 dark:text-slate-200">
+                                    {llmCoreStock.reason}
+                                </div>
+                            )}
+                            <div className="mt-3 grid grid-cols-1 gap-2 text-xs sm:grid-cols-2 lg:grid-cols-3">
+                                {llmReadinessDetails.map((item) => (
+                                    <div key={item.label} className="min-w-0">
+                                        <span className="text-slate-500 dark:text-slate-400">{item.label}：</span>
+                                        <span className="break-words text-slate-700 dark:text-slate-200">
+                                            {displayConfigValue(item.value)}
+                                        </span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+
                     <div className="md:col-span-2 rounded-2xl border border-slate-200/80 dark:border-slate-700/80 bg-slate-50/80 dark:bg-slate-900/40 p-4 space-y-3">
                         <div className="flex flex-wrap items-center justify-between gap-3">
                             <div>
@@ -1571,110 +1676,39 @@ export default function Settings() {
             <div className="card space-y-4">
                 <div className="flex items-center gap-2">
                     <FileText className="w-5 h-5 text-sky-500" />
-                    <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">资讯 LLM</h2>
+                    <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">资讯数据来源</h2>
+                    {systemDataSourcesLoading && <Loader2 className="ml-auto w-4 h-4 animate-spin text-slate-400" />}
                 </div>
                 <p className="text-sm text-slate-500 dark:text-slate-400">
-                    这套配置用于资讯之眼里的“LLM 解读”和主线核心个股推荐，默认跟随上面的智能分析模型。
+                    资讯之眼和催化选股读取本地资讯缓存，外部源由后台轮询入库；所有 LLM 解读统一使用上方 LLM 配置。
                 </p>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div>
-                        <label className="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">
-                            资讯模型厂商
-                        </label>
-                        <select
-                            value={newsProviderPreset}
-                            onChange={e => setNewsProviderPreset(e.target.value)}
-                            className="input w-full"
-                            disabled={configLoading}
-                        >
-                            {PROVIDER_PRESETS.map((preset) => (
-                                <option key={`news-${preset.id}`} value={preset.id}>{preset.label}</option>
-                            ))}
-                        </select>
+                {systemDataSourcesError ? (
+                    <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/20 dark:text-amber-300">
+                        {systemDataSourcesError}
                     </div>
+                ) : null}
 
-                    <div>
-                        <label className="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">
-                            接入协议
-                        </label>
-                        <div className="input w-full flex items-center gap-2 bg-slate-50 dark:bg-slate-900/70 text-slate-600 dark:text-slate-300">
-                            <Link2 className="w-4 h-4 text-slate-400" />
-                            <span>{selectedNewsPreset.protocol}</span>
-                        </div>
+                {!newsDataSourceLinks.length ? (
+                    <div className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-500 dark:border-slate-800 dark:bg-slate-950/30 dark:text-slate-400">
+                        暂无可展示的资讯来源。
                     </div>
+                ) : null}
 
-                    {(selectedNewsPreset.baseUrl || selectedNewsPreset.editableBaseUrl) && (
-                        <div className="md:col-span-2">
-                            <label className="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">
-                                Base URL
-                            </label>
-                            <input
-                                type="text"
-                                value={selectedNewsPreset.editableBaseUrl ? newsCustomBaseUrl : selectedNewsPreset.baseUrl}
-                                onChange={e => setNewsCustomBaseUrl(e.target.value)}
-                                className="input w-full"
-                                disabled={configLoading || !selectedNewsPreset.editableBaseUrl}
-                                placeholder="http://127.0.0.1:11434/v1"
-                            />
-                            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                                {selectedNewsPreset.id === 'ollama'
-                                    ? '仅在明确需要本地模型时使用；当前建议保持远端主模型一致。'
-                                    : selectedNewsPreset.id === 'local-openai'
-                                        ? '仅在明确需要本地 OpenAI 兼容服务时使用。'
-                                        : selectedNewsPreset.editableBaseUrl
-                                            ? '可填写自定义资讯模型服务地址。'
-                                            : '使用该厂商的默认接入地址。'}
-                            </p>
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                    {newsDataSourceLinks.map((source) => (
+                        <div key={source.key} className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-4 dark:border-slate-800 dark:bg-slate-950/40">
+                            <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">{source.name}</div>
+                            <a
+                                href={source.url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="mt-2 block break-all text-sm text-blue-600 underline-offset-4 hover:underline dark:text-blue-400"
+                            >
+                                {source.url}
+                            </a>
                         </div>
-                    )}
-
-                    <div>
-                        <label className="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">
-                            资讯解读模型
-                        </label>
-                        <input
-                            type="text"
-                            value={newsAnalysisLlm}
-                            onChange={e => setNewsAnalysisLlm(e.target.value)}
-                            className="input w-full"
-                            placeholder={selectedNewsPreset.local ? '例如：qwen2.5:7b / llama3.1:8b / deepseek-r1:8b' : '例如：gpt-4.1-mini / deepseek-chat'}
-                            disabled={configLoading}
-                        />
-                    </div>
-
-                    <div>
-                        <label className="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-2">
-                            资讯模型 Key
-                        </label>
-                        <div className="relative">
-                            <Key className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
-                            <input
-                                type="password"
-                                value={newsLlmApiKey}
-                                onChange={e => setNewsLlmApiKey(e.target.value)}
-                                className="input w-full pl-10"
-                                placeholder={hasStoredNewsApiKey ? '已保存，留空则保持不变' : selectedNewsPreset.local ? '本地服务一般可留空，如有鉴权再填写' : '输入资讯模型 API Key'}
-                                disabled={configLoading}
-                            />
-                        </div>
-                        <div className="mt-2 flex flex-wrap items-center justify-between gap-3">
-                            <div className="text-xs text-slate-500 dark:text-slate-400">
-                                资讯之眼默认使用上面的智能分析模型；这里用于显式指定同一套远端模型或单独的资讯模型。
-                            </div>
-                            {hasStoredNewsApiKey && (
-                                <button
-                                    type="button"
-                                    onClick={handleClearNewsApiKey}
-                                    disabled={saving || saveAllSaving}
-                                    className="inline-flex items-center gap-1 text-xs text-rose-500 hover:text-rose-600 disabled:opacity-50"
-                                >
-                                    <Trash2 className="w-3.5 h-3.5" />
-                                    清除资讯密钥
-                                </button>
-                            )}
-                        </div>
-                    </div>
+                    ))}
                 </div>
             </div>
             )}
@@ -2490,8 +2524,8 @@ export default function Settings() {
                             <div className="rounded-xl bg-slate-50 px-3 py-3 dark:bg-slate-950">
                                 <div className="text-xs font-medium text-slate-600 dark:text-slate-300">增量水位</div>
                                 <div className="mt-2 space-y-2">
-                                    {(subscriptionStatus?.watermarks || []).slice(0, 4).map((item) => (
-                                        <div key={`${item.data_type}-${item.scope_key}`} className="rounded-lg border border-slate-200 px-3 py-2 text-xs dark:border-slate-800">
+                                    {(subscriptionStatus?.watermarks || []).slice(0, 4).map((item, index) => (
+                                        <div key={`${item.data_type}-${item.data_source || 'source'}-${item.scope_key}-${index}`} className="rounded-lg border border-slate-200 px-3 py-2 text-xs dark:border-slate-800">
                                             <div className="flex items-center justify-between gap-3">
                                                 <span className="font-medium text-slate-700 dark:text-slate-200">{item.data_type}</span>
                                                 <span className="text-slate-500 dark:text-slate-400">{item.last_status || '--'}</span>
@@ -2585,7 +2619,7 @@ export default function Settings() {
                                     {dailyKlineGovernance?.legacy?.date_range_end || '--'}
                                 </div>
                                 <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                                    {formatCount(dailyKlineGovernance?.legacy?.total_records)} 行 · {dailyKlineGovernance?.legacy?.symbol_count || 0} 只标的
+                                    {formatCount(dailyKlineGovernance?.legacy?.total_records)} 行 · {dailyKlineGovernance?.legacy?.symbol_count ? `${formatCount(dailyKlineGovernance.legacy.symbol_count)} 只标的` : '标的数按需校验'}
                                 </div>
                             </div>
                             <div className="rounded-2xl border border-slate-200 bg-slate-50/80 px-4 py-3 dark:border-slate-800 dark:bg-slate-900/40">

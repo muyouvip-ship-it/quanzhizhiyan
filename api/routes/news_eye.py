@@ -48,6 +48,8 @@ def list_news_themes(
     window: str = Query("premarket"),
     limit: int = Query(20, ge=1, le=50),
     include_evidence: bool = Query(True),
+    allow_async_llm: bool = Query(True),
+    force_sync_llm: bool = Query(False),
     db: Session = Depends(get_db),
     current_user=Depends(require_api_user),
 ) -> dict[str, Any]:
@@ -57,6 +59,8 @@ def list_news_themes(
         limit=limit,
         include_evidence=include_evidence,
         user_id=current_user.id,
+        allow_async_llm=allow_async_llm,
+        force_sync_llm=force_sync_llm,
     )
 
 
@@ -104,6 +108,8 @@ def refresh_news_items(
         limit=limit,
         symbols=symbols,
         trigger="manual",
+        user_id=current_user.id,
+        async_event_driven_selection=True,
     )
 
 

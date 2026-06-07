@@ -1,4 +1,4 @@
-import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, IntradayResponse, KlineResponse, LatestAnnouncementResponse, MarketQuoteResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse, RuntimeLogSource, RuntimeLogsResponse, StrategyDefinition, StrategyDraftResponse, StrategyListResponseV2, StrategyCompileResponse, StrategyDsl, BacktestRun, BacktestMetrics, BacktestTradeRecord, BacktestEquityPoint, BacktestWatchlistItem, BacktestMinuteConfirmationItem, BacktestTradeSnapshot, BacktestSignalItem, BacktestPositionItem, BacktestOrderItem, EvolutionExperiment, EvolutionCandidate, BacktestCompareResponse, OfficialStrategyPackListResponse, OfficialStrategyPackCloneResponse, OfficialStrategyPackItem, StrategyPlatformBacktestRequest, VirtualWarehouseOverviewResponse, VirtualWarehouseDiagnosticsResponse, QmtSyncProfile, PaperAccount, QmtOrderSubmitRequest, QmtOrderSubmitResponse, QmtOrderCancelResponse, QmtBulkSellTask, VirtualWarehouseOrder, VirtualWarehouseTrade, RealtimeMonitor, RealtimeEvent, RealtimeApprovalTask, RealtimeMonitorCreateRequest, RealtimeMonitorPositionsResponse, BacktestDataConfigItem, BacktestDataSubscriptionStatus, DailyKlineGovernanceSummaryResponse, ChanlunOverlayResponse, MarketOverviewResponse, NewsEyeAnalyzeRequest, NewsEyeAnalyzeResponse, NewsEyeListResponse, NewsEyeRefreshResponse, NewsThemePerformanceResponse, NewsThemeRankingResponse, NewsThemeSnapshotResponse, NewsThemeWindow, DailyReview, DailyReviewConfig, DailyReviewHistoryItem, QmtBackgroundRefreshResponse, SystemDataSourceRegistryResponse } from '@/types'
+import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, IntradayResponse, KlineResponse, LatestAnnouncementResponse, MarketQuoteResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse, RuntimeLogSource, RuntimeLogsResponse, StrategyDefinition, StrategyDraftResponse, StrategyListResponseV2, StrategyCompileResponse, StrategyDsl, BacktestRun, BacktestMetrics, BacktestTradeRecord, BacktestEquityPoint, BacktestWatchlistItem, BacktestMinuteConfirmationItem, BacktestTradeSnapshot, BacktestSignalItem, BacktestPositionItem, BacktestOrderItem, EvolutionExperiment, EvolutionCandidate, BacktestCompareResponse, OfficialStrategyPackListResponse, OfficialStrategyPackCloneResponse, OfficialStrategyPackItem, StrategyPlatformBacktestRequest, VirtualWarehouseOverviewResponse, VirtualWarehouseDiagnosticsResponse, QmtSyncProfile, PaperAccount, QmtOrderSubmitRequest, QmtOrderSubmitResponse, QmtOrderCancelResponse, QmtBulkSellTask, VirtualWarehouseOrder, VirtualWarehouseTrade, RealtimeMonitor, RealtimeEvent, RealtimeApprovalTask, RealtimeMonitorCreateRequest, RealtimeMonitorPositionsResponse, BacktestDataConfigItem, BacktestDataSubscriptionStatus, DailyKlineGovernanceSummaryResponse, ChanlunOverlayResponse, MarketOverviewResponse, NewsEyeAnalyzeRequest, NewsEyeAnalyzeResponse, NewsEyeListResponse, NewsEyeRefreshResponse, NewsThemePerformanceResponse, NewsThemeRankingResponse, NewsThemeSnapshotResponse, NewsThemeWindow, CatalystSelectionRankResponse, CatalystSelectionHistoryResponse, CatalystOpportunityEventResponse, CatalystMonitorPoolResponse, CatalystClosedLoopAuditResponse, CatalystEventRefreshRunResponse, CatalystLearningReplayResponse, CatalystSelectionSettlementResponse, DailyReview, DailyReviewConfig, DailyReviewHistoryItem, QmtBackgroundRefreshResponse, SystemDataSourceRegistryResponse } from '@/types'
 
 type ApiRequestOptions = RequestInit & {
     timeoutMs?: number
@@ -21,9 +21,13 @@ type BacktestDetailResponse<T> = {
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15000
+const NEWS_THEME_LLM_REQUEST_TIMEOUT_MS = 140000
+const CATALYST_SELECTION_REQUEST_TIMEOUT_MS = 120000
 const DAILY_REVIEW_GENERATE_TIMEOUT_MS = 180000
 const BACKTEST_DETAIL_PAGE_SIZE = 5000
 const BACKTEST_DETAIL_MAX_ITEMS = 50000
+const DEV_USER_ID = (import.meta.env.VITE_TA_DEV_USER_ID as string) || 'test-user-001'
+const DEV_USER_EMAIL = (import.meta.env.VITE_TA_DEV_USER_EMAIL as string) || 'test@example.com'
 
 function isLoopbackHostname(hostname: string): boolean {
     const normalized = hostname.trim().toLowerCase()
@@ -160,9 +164,10 @@ class ApiService {
         return this.request<KlineResponse>(`/v1/market/kline?${params}`)
     }
 
-    async getIntraday(symbol: string, tradeDate: string, includeLatestQuote = true): Promise<IntradayResponse> {
-        const params = new URLSearchParams({ symbol, trade_date: tradeDate, period: '1m' })
+    async getIntraday(symbol: string, tradeDate: string, period: string = '1m', includeLatestQuote = true, lookbackSessions = 1): Promise<IntradayResponse> {
+        const params = new URLSearchParams({ symbol, trade_date: tradeDate, period })
         if (includeLatestQuote) params.append('include_latest_quote', 'true')
+        if (lookbackSessions > 1) params.append('lookback_sessions', String(lookbackSessions))
         return this.request<IntradayResponse>(`/v1/market/intraday?${params}`)
     }
 
@@ -171,10 +176,12 @@ class ApiService {
         return this.request<MarketQuoteResponse>(`/v1/market/quote?${params}`)
     }
 
-    async getChanlunOverlay(symbol: string, startDate?: string, endDate?: string): Promise<ChanlunOverlayResponse> {
+    async getChanlunOverlay(symbol: string, startDate?: string, endDate?: string, period = 'daily', lookbackSessions = 1): Promise<ChanlunOverlayResponse> {
         const params = new URLSearchParams({ symbol })
         if (startDate) params.append('start_date', startDate)
         if (endDate) params.append('end_date', endDate)
+        if (period) params.append('period', period)
+        if (lookbackSessions > 1) params.append('lookback_sessions', String(lookbackSessions))
         return this.request<ChanlunOverlayResponse>(`/v1/market/kline/chanlun?${params}`)
     }
 
@@ -218,13 +225,19 @@ class ApiService {
         window?: NewsThemeWindow | string
         limit?: number
         include_evidence?: boolean
+        allow_async_llm?: boolean
+        force_sync_llm?: boolean
     }): Promise<NewsThemeRankingResponse> {
         const query = new URLSearchParams()
         if (params?.window) query.append('window', params.window)
         if (params?.limit) query.append('limit', String(params.limit))
         if (typeof params?.include_evidence === 'boolean') query.append('include_evidence', String(params.include_evidence))
+        if (typeof params?.allow_async_llm === 'boolean') query.append('allow_async_llm', String(params.allow_async_llm))
+        if (typeof params?.force_sync_llm === 'boolean') query.append('force_sync_llm', String(params.force_sync_llm))
         const suffix = query.toString() ? `?${query}` : ''
-        return this.request<NewsThemeRankingResponse>(`/v1/news-eye/themes${suffix}`)
+        return this.request<NewsThemeRankingResponse>(`/v1/news-eye/themes${suffix}`, {
+            timeoutMs: params?.force_sync_llm ? NEWS_THEME_LLM_REQUEST_TIMEOUT_MS : DEFAULT_REQUEST_TIMEOUT_MS,
+        })
     }
 
     async getNewsEyeThemeSnapshots(params: {
@@ -245,6 +258,122 @@ class ApiService {
         const query = new URLSearchParams({ snapshot_date: params.snapshot_date })
         if (params.horizon) query.append('horizon', params.horizon)
         return this.request<NewsThemePerformanceResponse>(`/v1/news-eye/theme-performance?${query}`)
+    }
+
+    async getCatalystSelections(params?: {
+        trade_date?: string
+        window?: string
+        limit?: number
+        force?: boolean
+    }): Promise<CatalystSelectionRankResponse> {
+        const query = new URLSearchParams()
+        if (params?.trade_date) query.append('trade_date', params.trade_date)
+        if (params?.window) query.append('window', params.window)
+        if (params?.limit) query.append('limit', String(params.limit))
+        if (typeof params?.force === 'boolean') query.append('force', String(params.force))
+        const suffix = query.toString() ? `?${query}` : ''
+        return this.request<CatalystSelectionRankResponse>(`/v1/catalyst-selection${suffix}`, {
+            timeoutMs: CATALYST_SELECTION_REQUEST_TIMEOUT_MS,
+        })
+    }
+
+    async generateCatalystSelections(payload: {
+        trade_date: string
+        force?: boolean
+    }, params?: {
+        window?: string
+        limit?: number
+    }): Promise<CatalystSelectionRankResponse> {
+        const query = new URLSearchParams()
+        if (params?.window) query.append('window', params.window)
+        if (params?.limit) query.append('limit', String(params.limit))
+        const suffix = query.toString() ? `?${query}` : ''
+        return this.request<CatalystSelectionRankResponse>(`/v1/catalyst-selection/generate${suffix}`, {
+            method: 'POST',
+            body: JSON.stringify(payload),
+            timeoutMs: CATALYST_SELECTION_REQUEST_TIMEOUT_MS,
+        })
+    }
+
+    async settleCatalystSelections(payload: {
+        trade_date: string
+        force?: boolean
+    }): Promise<CatalystSelectionSettlementResponse> {
+        return this.request<CatalystSelectionSettlementResponse>('/v1/catalyst-selection/settle', {
+            method: 'POST',
+            body: JSON.stringify(payload),
+        })
+    }
+
+    async getCatalystSelectionHistory(limit = 30): Promise<CatalystSelectionHistoryResponse> {
+        return this.request<CatalystSelectionHistoryResponse>(`/v1/catalyst-selection/history?limit=${limit}`)
+    }
+
+    async getCatalystOpportunityEvents(params?: {
+        trade_date?: string
+        window?: string
+        symbol?: string
+        event_level?: string
+        limit?: number
+    }): Promise<CatalystOpportunityEventResponse> {
+        const query = new URLSearchParams()
+        if (params?.trade_date) query.append('trade_date', params.trade_date)
+        if (params?.window) query.append('window', params.window)
+        if (params?.symbol) query.append('symbol', params.symbol)
+        if (params?.event_level) query.append('event_level', params.event_level)
+        if (params?.limit) query.append('limit', String(params.limit))
+        const suffix = query.toString() ? `?${query}` : ''
+        return this.request<CatalystOpportunityEventResponse>(`/v1/catalyst-selection/opportunity-events${suffix}`)
+    }
+
+    async getCatalystMonitorPool(params?: {
+        trade_date?: string
+        window?: string
+        limit?: number
+        force?: boolean
+    }): Promise<CatalystMonitorPoolResponse> {
+        const query = new URLSearchParams()
+        if (params?.trade_date) query.append('trade_date', params.trade_date)
+        if (params?.window) query.append('window', params.window)
+        if (params?.limit) query.append('limit', String(params.limit))
+        if (typeof params?.force === 'boolean') query.append('force', String(params.force))
+        const suffix = query.toString() ? `?${query}` : ''
+        return this.request<CatalystMonitorPoolResponse>(`/v1/catalyst-selection/monitor-pool${suffix}`)
+    }
+
+    async getCatalystClosedLoopAudits(params?: {
+        trade_date?: string
+        limit?: number
+    }): Promise<CatalystClosedLoopAuditResponse> {
+        const query = new URLSearchParams()
+        if (params?.trade_date) query.append('trade_date', params.trade_date)
+        if (params?.limit) query.append('limit', String(params.limit))
+        const suffix = query.toString() ? `?${query}` : ''
+        return this.request<CatalystClosedLoopAuditResponse>(`/v1/catalyst-selection/closed-loop-audits${suffix}`)
+    }
+
+    async getCatalystEventRefreshRuns(params?: {
+        limit?: number
+        status?: string
+        trigger?: string
+    }): Promise<CatalystEventRefreshRunResponse> {
+        const query = new URLSearchParams()
+        if (params?.limit) query.append('limit', String(params.limit))
+        if (params?.status) query.append('status', params.status)
+        if (params?.trigger) query.append('trigger', params.trigger)
+        const suffix = query.toString() ? `?${query}` : ''
+        return this.request<CatalystEventRefreshRunResponse>(`/v1/catalyst-selection/event-refresh-runs${suffix}`)
+    }
+
+    async getCatalystLearningReplay(params?: {
+        trade_date?: string
+        limit?: number
+    }): Promise<CatalystLearningReplayResponse> {
+        const query = new URLSearchParams()
+        if (params?.trade_date) query.append('trade_date', params.trade_date)
+        if (params?.limit) query.append('limit', String(params.limit))
+        const suffix = query.toString() ? `?${query}` : ''
+        return this.request<CatalystLearningReplayResponse>(`/v1/catalyst-selection/learning-replay${suffix}`)
     }
 
     async chatCompletion(
@@ -1105,8 +1234,8 @@ class ApiService {
                 // 开发模式：返回模拟用户
                 console.log('开发模式：使用模拟用户')
                 return {
-                    id: 'test-user-001',
-                    email: 'test@example.com',
+                    id: DEV_USER_ID,
+                    email: DEV_USER_EMAIL,
                     created_at: new Date().toISOString(),
                     last_login_at: new Date().toISOString()
                 }

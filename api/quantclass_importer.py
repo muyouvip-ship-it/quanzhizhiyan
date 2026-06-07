@@ -3,6 +3,7 @@
 """
 import pandas as pd
 import logging
+import os
 
 from api.services.market_data_pipeline_service import ingest_raw_daily_rows, reconcile_daily_trade_dates
 
@@ -143,8 +144,8 @@ if __name__ == '__main__':
     from api.quantclass_downloader import QuantClassDownloader
     
     # 配置
-    API_KEY = '2HUTNZYOSRA8X5Z7TY2VZGKNTX5UN28B'
-    HID = '1ad9e296ad8d3816b9bce5cba86b1ff6'
+    API_KEY = os.getenv('QUANTCLASS_API_KEY', '')
+    HID = os.getenv('QUANTCLASS_HID', '')
     
     # 创建下载器
     downloader = QuantClassDownloader(API_KEY, HID)

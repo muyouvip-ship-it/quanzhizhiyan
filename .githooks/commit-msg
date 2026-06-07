@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# commit-msg hook: auto-bump version based on conventional commit message.
+#
+# Rules (checked in order):
+#   BREAKING CHANGE in body / !: in subject          → bump MAJOR
+#   feat: / feat(scope):                             → bump MINOR
+#   fix: / patch: / chore: / refactor: / docs: / etc → bump PATCH
+#
+# The version is read from pyproject.toml, incremented, and written back.
+# The updated pyproject.toml is staged so it goes into the same commit.
+
+set -euo pipefail
+
+COMMIT_MSG_FILE="$1"
+COMMIT_MSG=$(cat "$COMMIT_MSG_FILE")
+FIRST_LINE=$(head -1 "$COMMIT_MSG_FILE")
+REPO_ROOT=$(git rev-parse --show-toplevel)
+PYPROJECT="$REPO_ROOT/pyproject.toml"
+
+# ── Determine bump level ────────────────────────────────────────────────
+bump="patch"
+
+# MAJOR: BREAKING CHANGE in body or !: in subject
+if echo "$COMMIT_MSG" | grep -qi 'BREAKING[ -]CHANGE'; then
+    bump="major"
+elif echo "$FIRST_LINE" | grep -qE '!:'; then
+    bump="major"
+# MINOR: feat:
+elif echo "$FIRST_LINE" | grep -qiE '^feat(\(.+\))?:'; then
+    bump="minor"
+fi
+
+# ── Read current version ────────────────────────────────────────────────
+current=$(grep -E '^version\s*=' "$PYPROJECT" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+if [ -z "$current" ]; then
+    echo "[version-hook] could not parse version from pyproject.toml, skipping"
+    exit 0
+fi
+
+IFS='.' read -r major minor patch <<< "$current"
+patch="${patch:-0}"
+
+case "$bump" in
+    major)
+        major=$((major + 1))
+        minor=0
+        patch=0
+        ;;
+    minor)
+        minor=$((minor + 1))
+        patch=0
+        ;;
+    patch)
+        patch=$((patch + 1))
+        ;;
+esac
+
+new_version="${major}.${minor}.${patch}"
+
+# ── Write back ──────────────────────────────────────────────────────────
+if [ "$new_version" = "$current" ]; then
+    exit 0
+fi
+
+sed -i '' "s/^version = \"${current}\"/version = \"${new_version}\"/" "$PYPROJECT"
+
+# Re-install editable so importlib.metadata picks up the new version
+if [ -f "$REPO_ROOT/.venv/bin/python" ]; then
+    "$REPO_ROOT/.venv/bin/python" -m pip install -e "$REPO_ROOT" -q 2>/dev/null || true
+fi
+
+git add "$PYPROJECT"
+
+echo "[version-hook] ${current} → ${new_version} (${bump})"

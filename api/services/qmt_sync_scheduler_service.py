@@ -142,6 +142,8 @@ def _should_run(row: QmtSyncProfileDB, now: datetime) -> bool:
 
 
 def _run_single_profile(db: Session, row: QmtSyncProfileDB, now: datetime) -> None:
+    previous_status = str(getattr(row, "last_status", None) or "").strip().lower()
+    previous_failures = int(getattr(row, "consecutive_failures", 0) or 0)
     try:
         config = qmt_virtual_account_service._resolve_runtime_config(
             row.account_key,
@@ -165,6 +167,10 @@ def _run_single_profile(db: Session, row: QmtSyncProfileDB, now: datetime) -> No
         connected = bool((overview.get("connection") or {}).get("connected"))
         if not connected:
             raise RuntimeError((overview.get("connection") or {}).get("message") or "QMT 未连接")
+        data_source = str(overview.get("data_source") or "")
+        if data_source != "live":
+            message = str((overview.get("connection") or {}).get("message") or "").strip()
+            raise RuntimeError(message or f"QMT 未完成实时同步，当前数据源为 {data_source or 'unknown'}")
         row.last_synced_at = now
         row.last_status = "success"
         row.last_error = None
@@ -172,6 +178,8 @@ def _run_single_profile(db: Session, row: QmtSyncProfileDB, now: datetime) -> No
         db.add(row)
         db.commit()
         logger.info("[qmt-sync] synced user=%s account=%s", row.user_id, row.account_key)
+        if row.alert_on_disconnect and (previous_status == "failed" or previous_failures > 0):
+            _maybe_send_reconnect_alert(db, row, now)
     except Exception as exc:
         row.last_synced_at = now
         row.last_status = "failed"
@@ -180,13 +188,44 @@ def _run_single_profile(db: Session, row: QmtSyncProfileDB, now: datetime) -> No
         db.add(row)
         db.commit()
         logger.warning("[qmt-sync] sync failed user=%s account=%s error=%s", row.user_id, row.account_key, exc)
-        if row.alert_on_disconnect:
+        if row.alert_on_disconnect and _should_send_disconnect_alert(previous_status, previous_failures):
             _maybe_send_disconnect_alert(db, row, now, str(exc))
 
 
+def _should_send_disconnect_alert(previous_status: str, previous_failures: int) -> bool:
+    if previous_status == "failed":
+        return False
+    return int(previous_failures or 0) <= 0
+
+
 def _maybe_send_disconnect_alert(db: Session, row: QmtSyncProfileDB, now: datetime, error_text: str) -> None:
-    if row.last_alerted_at and (now - _ensure_utc(row.last_alerted_at)) < timedelta(minutes=30):
-        return
+    session_note = _qmt_session_note(now)
+    lines = [
+        "量化之神 QMT 自动同步失联",
+        f"账户 Key：{row.account_key}",
+        f"错误：{error_text[:300]}",
+    ]
+    if session_note:
+        lines.append(session_note)
+    _send_qmt_sync_alert(db, row, now, "\n".join(lines))
+
+
+def _maybe_send_reconnect_alert(db: Session, row: QmtSyncProfileDB, now: datetime) -> None:
+    _send_qmt_sync_alert(
+        db,
+        row,
+        now,
+        "\n".join(
+            [
+                "量化之神 QMT 自动同步已恢复",
+                f"账户 Key：{row.account_key}",
+                "状态：QMT 已重新连接，并完成实时同步。",
+            ]
+        ),
+    )
+
+
+def _send_qmt_sync_alert(db: Session, row: QmtSyncProfileDB, now: datetime, message: str) -> None:
     user = db.query(UserDB).filter(UserDB.id == row.user_id).first()
     if not user or not bool(user.wecom_report_enabled):
         return
@@ -194,19 +233,29 @@ def _maybe_send_disconnect_alert(db: Session, row: QmtSyncProfileDB, now: dateti
     webhook_url = auth_service.decrypt_secret(getattr(user_cfg, "wecom_webhook_encrypted", None)) if user_cfg else None
     if not webhook_url:
         return
-    message = (
-        "量化之神 QMT 自动同步告警\n"
-        f"账户 Key：{row.account_key}\n"
-        f"用户：{getattr(user, 'email', row.user_id)}\n"
-        f"错误：{error_text[:300]}"
-    )
+    payload = f"{message}\n用户：{getattr(user, 'email', row.user_id)}"
     try:
-        if send_message(message, webhook_url):
+        if send_message(payload, webhook_url):
             row.last_alerted_at = now
             db.add(row)
             db.commit()
     except Exception:
         logger.exception("[qmt-sync] send alert failed")
+
+
+def _qmt_session_note(now: datetime) -> str | None:
+    local_now = _ensure_utc(now).astimezone(CN_TZ)
+    weekday = local_now.weekday()
+    current_time = local_now.time()
+    in_trading_window = weekday < 5 and (
+        (current_time.hour == 9 and current_time.minute >= 30)
+        or (10 <= current_time.hour < 11)
+        or (current_time.hour == 11 and current_time.minute <= 30)
+        or (13 <= current_time.hour < 15)
+    )
+    if in_trading_window:
+        return None
+    return "提示：当前不在 A 股连续竞价时段，QMT/bridge 离线可能是正常状态；本次失联只按状态变化提醒一次。"
 
 
 def _to_dict(row: QmtSyncProfileDB) -> dict:

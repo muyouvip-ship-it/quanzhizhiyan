@@ -46,6 +46,19 @@ function formatPercentValue(value?: number | null) {
   return `${(Number(value) * 100).toFixed(0)}%`
 }
 
+function formatScore(value?: number | null) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return '--'
+  return Number(value).toFixed(1)
+}
+
+function hasLlmBackedThemes(items: NewsThemeRankingItem[]) {
+  return items.some(item => {
+    const symbolSource = String(item.symbol_suggestion_source || '')
+    const semanticSource = String(item.semantic_source || '')
+    return symbolSource.startsWith('llm:') || semanticSource.startsWith('llm:')
+  })
+}
+
 function sentimentLabel(sentiment: string) {
   if (sentiment === 'positive') return '利好'
   if (sentiment === 'negative') return '利空'
@@ -71,6 +84,67 @@ function statusTone(status?: string) {
     return 'border-rose-200 bg-rose-50/85 text-rose-700 dark:border-rose-500/20 dark:bg-rose-500/10 dark:text-rose-300'
   }
   return 'border-slate-200 bg-white/80 text-slate-600 dark:border-slate-700 dark:bg-slate-800/70 dark:text-slate-300'
+}
+
+function llmStatusLabel(status?: string) {
+  if (status === 'ready') return '远程LLM就绪'
+  if (status === 'missing_api_key') return '缺少API Key'
+  if (status === 'local_rejected') return '本地模型已拒绝'
+  if (status === 'missing_model') return '模型未配置'
+  if (status === 'disabled') return 'LLM已关闭'
+  return 'LLM待确认'
+}
+
+function llmStatusTone(status?: string, ready?: boolean) {
+  if (ready || status === 'ready') {
+    return 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-500/20 dark:bg-emerald-500/10 dark:text-emerald-300'
+  }
+  if (status === 'missing_api_key' || status === 'local_rejected' || status === 'missing_model') {
+    return 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-300'
+  }
+  return 'border-slate-200 bg-slate-50 text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300'
+}
+
+function numberFromUnknown(value: unknown): number {
+  const numeric = Number(value)
+  return Number.isFinite(numeric) ? numeric : 0
+}
+
+function objectFromUnknown(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+
+function eventSelectionLabel(payload?: Record<string, unknown> | null) {
+  if (!payload) return '等待事件'
+  const errors = Array.isArray(payload.errors) ? payload.errors : []
+  const generated = Array.isArray(payload.generated) ? payload.generated : []
+  if (String(payload.status || '') === 'running') return '重算中'
+  if (errors.length > 0) return '重算异常'
+  if (payload.triggered === false) return '无新事件'
+  if (generated.length > 0) return '已重算'
+  if (payload.triggered === true) return '已触发'
+  return '等待事件'
+}
+
+function eventSelectionTone(payload?: Record<string, unknown> | null) {
+  if (!payload) return 'text-slate-500 dark:text-slate-400'
+  const errors = Array.isArray(payload.errors) ? payload.errors : []
+  if (String(payload.status || '') === 'running') return 'text-blue-600 dark:text-blue-300'
+  if (errors.length > 0) return 'text-rose-600 dark:text-rose-300'
+  if (payload.triggered === false) return 'text-slate-500 dark:text-slate-400'
+  return 'text-emerald-600 dark:text-emerald-300'
+}
+
+function eventWindowLabel(window?: unknown) {
+  const value = String(window || '')
+  return THEME_WINDOWS.find(item => item.value === value)?.label || value || '--'
+}
+
+function recordsFromUnknown(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .map(item => objectFromUnknown(item))
+    .filter((item): item is Record<string, unknown> => Boolean(item))
 }
 
 function sourceTierTone(tier?: string) {
@@ -170,11 +244,14 @@ function ThemeRankingCard({
   onSelect: (item: NewsThemeRankingItem) => void
 }) {
   const topTier = item.top_source_tier || item.source_tier
+  const semantic = item.event_semantic && typeof item.event_semantic === 'object' ? item.event_semantic as Record<string, unknown> : null
+  const eventType = semantic?.event_type ? String(semantic.event_type) : null
+  const catalystStrength = Number(semantic?.catalyst_strength)
   return (
     <button
       type="button"
       onClick={() => onSelect(item)}
-      className={`w-full rounded-[18px] border p-3 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-slate-300 dark:hover:border-slate-600 ${
+      className={`flex h-full min-h-[176px] w-full flex-col rounded-[18px] border p-3 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-slate-300 dark:hover:border-slate-600 ${
         selected
           ? 'border-sky-300 bg-sky-50/80 dark:border-sky-500/30 dark:bg-sky-500/10'
           : 'border-slate-200 bg-white/92 dark:border-slate-800 dark:bg-slate-900/76'
@@ -200,13 +277,18 @@ function ThemeRankingCard({
                 含S级证据
               </span>
             ) : null}
+            {eventType ? (
+              <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 dark:border-emerald-500/20 dark:bg-emerald-500/10 dark:text-emerald-300">
+                {eventType}
+              </span>
+            ) : null}
           </div>
-          <div className="mt-2 truncate text-base font-semibold text-slate-950 dark:text-white">
+          <div className="mt-2 truncate text-base font-semibold text-slate-950 dark:text-white" title={[item.theme, item.parent_theme].filter(Boolean).join(' / ')}>
             {item.theme}
             {item.parent_theme ? <span className="ml-1 text-xs font-normal text-slate-400">/ {item.parent_theme}</span> : null}
           </div>
         </div>
-        <div className="shrink-0 text-right">
+        <div className="shrink-0 text-right tabular-nums">
           <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-400">Score</div>
           <div className="text-xl font-semibold text-slate-950 dark:text-white">{item.score.toFixed(1)}</div>
         </div>
@@ -225,9 +307,14 @@ function ThemeRankingCard({
           <div className="text-slate-500 dark:text-slate-400">分歧</div>
         </div>
       </div>
-      <p className="mt-3 line-clamp-2 text-xs leading-5 text-slate-600 dark:text-slate-300">
+      <p className="mt-3 line-clamp-2 flex-1 break-words text-xs leading-5 text-slate-600 dark:text-slate-300" title={item.summary || item.catalyst || undefined}>
         {item.summary || item.catalyst || '等待更多资讯确认。'}
       </p>
+      {Number.isFinite(catalystStrength) ? (
+        <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
+          <div className="h-full rounded-full bg-emerald-500" style={{ width: `${Math.max(0, Math.min(catalystStrength, 100))}%` }} />
+        </div>
+      ) : null}
     </button>
   )
 }
@@ -269,10 +356,16 @@ export default function NewsEye() {
     last_success_at?: string | null
     last_error?: string | null
     saved_count?: number
+    new_count?: number
+    updated_count?: number
+    unchanged_count?: number
+    fresh_event_count?: number
+    event_driven_selection?: Record<string, unknown>
   } | null>(null)
   const [themeWindow, setThemeWindow] = useState<NewsThemeWindow>('premarket')
   const [themeItems, setThemeItems] = useState<NewsThemeRankingItem[]>([])
   const [themeUpdatedAt, setThemeUpdatedAt] = useState<string | null>(null)
+  const [themeGovernance, setThemeGovernance] = useState<Record<string, unknown> | null>(null)
   const [themeLoading, setThemeLoading] = useState(true)
   const [themeError, setThemeError] = useState<string | null>(null)
   const [selectedTheme, setSelectedTheme] = useState<string>('')
@@ -283,21 +376,34 @@ export default function NewsEye() {
     sector: '',
   })
 
-  const loadThemes = useCallback(async () => {
-    setThemeLoading(true)
+  const loadThemes = useCallback(async (options?: { forceSyncLlm?: boolean; preserveExistingLlm?: boolean; silent?: boolean }) => {
+    if (!options?.silent) setThemeLoading(true)
     try {
+      const forceSyncLlm = options?.forceSyncLlm ?? false
       const response = await api.getNewsEyeThemes({
         window: themeWindow,
         limit: 20,
         include_evidence: true,
+        allow_async_llm: true,
+        force_sync_llm: forceSyncLlm,
       })
-      setThemeItems(response.items || [])
+      const nextItems = response.items || []
+      setThemeItems(prev => {
+        if (options?.preserveExistingLlm && hasLlmBackedThemes(prev) && !hasLlmBackedThemes(nextItems)) {
+          return prev
+        }
+        return nextItems
+      })
       setThemeUpdatedAt(response.updated_at)
+      setThemeGovernance(response.data_governance || null)
       setThemeError(null)
     } catch (err) {
-      setThemeError(err instanceof Error ? err.message : '加载主线机会榜失败')
+      if (!options?.silent) {
+        setThemeError(err instanceof Error ? err.message : '加载主线机会榜失败')
+        setThemeGovernance(null)
+      }
     } finally {
-      setThemeLoading(false)
+      if (!options?.silent) setThemeLoading(false)
     }
   }, [themeWindow])
 
@@ -344,7 +450,7 @@ export default function NewsEye() {
       await api.refreshNewsEye(120)
       await Promise.all([
         loadItems({ offset: 0, append: false }),
-        loadThemes(),
+        loadThemes({ forceSyncLlm: true }),
       ])
     } catch (err) {
       setError(err instanceof Error ? err.message : '刷新资讯失败')
@@ -363,13 +469,13 @@ export default function NewsEye() {
   }, [loadItems])
 
   useEffect(() => {
-    void loadThemes()
+    void loadThemes({ forceSyncLlm: false })
   }, [loadThemes])
 
   usePolling(
     () => Promise.all([
       loadItems({ offset: 0, append: false }),
-      loadThemes(),
+      loadThemes({ forceSyncLlm: false, preserveExistingLlm: true, silent: true }),
     ]),
     { intervalMs: 20000, runImmediately: false },
   )
@@ -446,8 +552,23 @@ export default function NewsEye() {
 
   const trackedSymbols = backgroundMeta?.tracked_symbols || []
   const activeSources = useMemo(() => backgroundMeta?.active_sources || [], [backgroundMeta?.active_sources])
+  const eventSelectionMeta = objectFromUnknown(backgroundMeta?.event_driven_selection)
+  const freshEventCount = backgroundMeta?.fresh_event_count ?? ((backgroundMeta?.new_count || 0) + (backgroundMeta?.updated_count || 0))
+  const eventSelectionErrors = recordsFromUnknown(eventSelectionMeta?.errors)
+  const eventSelectionGenerated = recordsFromUnknown(eventSelectionMeta?.generated)
+  const eventSelectionNewsIngest = objectFromUnknown(eventSelectionMeta?.news_ingest)
+  const eventSelectionTrigger = String(eventSelectionMeta?.trigger || '')
+  const eventSelectionUpdatedAt = String(eventSelectionMeta?.updated_at || '')
   const hasFilters = activeFilters.length > 0
   const latestNewsTime = historyMeta?.latest_published_at || null
+  const llmCoreStockGovernance = useMemo(() => {
+    const value = themeGovernance?.llm_core_stock
+    return value && typeof value === 'object' ? value as Record<string, unknown> : null
+  }, [themeGovernance])
+  const llmCoreStockStatus = String(llmCoreStockGovernance?.status || 'unknown')
+  const llmCoreStockReady = Boolean(llmCoreStockGovernance?.ready)
+  const llmUsedSymbolThemeCount = numberFromUnknown(llmCoreStockGovernance?.used_symbol_theme_count)
+  const llmUsedSemanticThemeCount = numberFromUnknown(llmCoreStockGovernance?.used_semantic_theme_count)
   const governanceItems = useMemo<DataSourceGovernanceItem[]>(() => (backendGovernance?.items?.length ? backendGovernance.items : [
     {
       label: '页面主数据源',
@@ -473,7 +594,39 @@ export default function NewsEye() {
       detail: '这里显示的是资讯入库或最近成功同步时间，不代表新闻原始发布时间',
       tone: 'info',
     },
-  ]), [activeSources, backendGovernance?.items, backgroundMeta?.interval_seconds, backgroundMeta?.last_success_at, backgroundMeta?.status, pageFallback, pageSource, updatedAt])
+    {
+      label: '新事件触发',
+      value: String(freshEventCount ?? 0),
+      detail: `新增 ${backgroundMeta?.new_count ?? 0} / 更新 ${backgroundMeta?.updated_count ?? 0} / 重复 ${backgroundMeta?.unchanged_count ?? 0}`,
+      tone: freshEventCount > 0 ? 'good' : 'neutral',
+    },
+    {
+      label: '机会榜重算',
+      value: eventSelectionLabel(eventSelectionMeta),
+      detail: eventSelectionErrors.length
+        ? String(objectFromUnknown(eventSelectionErrors[0])?.error || '重算失败')
+        : eventSelectionGenerated.length
+          ? `窗口 ${eventSelectionGenerated.length} 个`
+          : String(eventSelectionMeta?.reason || eventSelectionMeta?.trigger || '等待新事件'),
+      tone: eventSelectionErrors.length ? 'bad' : eventSelectionMeta?.triggered === true ? 'good' : 'neutral',
+    },
+  ]), [
+    activeSources,
+    backendGovernance?.items,
+    backgroundMeta?.interval_seconds,
+    backgroundMeta?.last_success_at,
+    backgroundMeta?.new_count,
+    backgroundMeta?.status,
+    backgroundMeta?.unchanged_count,
+    backgroundMeta?.updated_count,
+    eventSelectionErrors,
+    eventSelectionGenerated,
+    eventSelectionMeta,
+    freshEventCount,
+    pageFallback,
+    pageSource,
+    updatedAt,
+  ])
   const governanceWarnings = useMemo(() => {
     if (backendGovernance?.warnings?.length) {
       const merged = [...backendGovernance.warnings]
@@ -604,7 +757,7 @@ export default function NewsEye() {
               </div>
             </div>
 
-            <div className="mt-2 grid gap-2 sm:grid-cols-2">
+            <div className="mt-2 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
               <div className="rounded-xl border border-slate-200/80 bg-white/85 p-3 dark:border-slate-700 dark:bg-slate-950/40">
                 <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-400 dark:text-slate-500">
                   已激活的数据源
@@ -620,8 +773,97 @@ export default function NewsEye() {
                 <p className="mt-1 text-lg font-semibold text-slate-950 dark:text-white">
                   {backgroundMeta?.saved_count ?? items.length}
                 </p>
+                <p className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
+                  新增 {backgroundMeta?.new_count ?? 0} / 更新 {backgroundMeta?.updated_count ?? 0}
+                </p>
+              </div>
+              <div className="rounded-xl border border-slate-200/80 bg-white/85 p-3 dark:border-slate-700 dark:bg-slate-950/40">
+                <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-400 dark:text-slate-500">
+                  新事件数
+                </div>
+                <p className="mt-1 text-lg font-semibold text-slate-950 dark:text-white">
+                  {freshEventCount}
+                </p>
+                <p className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
+                  重复 {backgroundMeta?.unchanged_count ?? 0}
+                </p>
+              </div>
+              <div className="rounded-xl border border-slate-200/80 bg-white/85 p-3 dark:border-slate-700 dark:bg-slate-950/40">
+                <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-400 dark:text-slate-500">
+                  机会榜重算
+                </div>
+                <p className={`mt-1 text-lg font-semibold ${eventSelectionTone(eventSelectionMeta)}`}>
+                  {eventSelectionLabel(eventSelectionMeta)}
+                </p>
+                <p className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
+                  {eventSelectionGenerated.length ? `窗口 ${eventSelectionGenerated.length}` : String(eventSelectionMeta?.reason || eventSelectionMeta?.trigger || '等待')}
+                </p>
               </div>
             </div>
+
+            {eventSelectionMeta ? (
+              <div className="mt-3 rounded-xl border border-slate-200/80 bg-white/82 px-3 py-2.5 text-xs dark:border-slate-700 dark:bg-slate-950/35">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className={`font-semibold ${eventSelectionTone(eventSelectionMeta)}`}>
+                      {eventSelectionLabel(eventSelectionMeta)}
+                    </span>
+                    {eventSelectionTrigger ? (
+                      <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] text-slate-500 dark:bg-slate-800 dark:text-slate-300">
+                        {eventSelectionTrigger}
+                      </span>
+                    ) : null}
+                    {eventSelectionUpdatedAt ? (
+                      <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] text-slate-500 dark:bg-slate-800 dark:text-slate-300">
+                        {formatDateTime(eventSelectionUpdatedAt)}
+                      </span>
+                    ) : null}
+                  </div>
+                  <a
+                    href="/catalyst-selection"
+                    className="rounded-full border border-slate-200 px-2.5 py-1 text-[11px] font-medium text-slate-600 transition hover:border-sky-300 hover:text-sky-600 dark:border-slate-700 dark:text-slate-300 dark:hover:border-sky-500/30 dark:hover:text-sky-300"
+                  >
+                    主线机会榜
+                  </a>
+                </div>
+
+                <div className="mt-2 flex flex-wrap gap-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+                  <span>新 {Number(eventSelectionNewsIngest?.['new'] ?? backgroundMeta?.new_count ?? 0)}</span>
+                  <span>更新 {Number(eventSelectionNewsIngest?.updated ?? backgroundMeta?.updated_count ?? 0)}</span>
+                  <span>重复 {Number(eventSelectionNewsIngest?.unchanged ?? backgroundMeta?.unchanged_count ?? 0)}</span>
+                </div>
+
+                {eventSelectionGenerated.length ? (
+                  <div className="mt-2 space-y-1.5">
+                    {eventSelectionGenerated.slice(0, 3).map((item, index) => {
+                      const topLabel = [item.top_name, item.top_symbol].map(value => String(value || '').trim()).filter(Boolean).join(' ')
+                      const eventCount = Number(item.opportunity_event_count || 0)
+                      return (
+                        <div key={`${String(item.window || 'window')}-${index}`} className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-50 px-2.5 py-1.5 dark:bg-slate-900/80">
+                          <span className="font-medium text-slate-700 dark:text-slate-200">
+                            {eventWindowLabel(item.window)}
+                          </span>
+                          <span className="text-slate-600 dark:text-slate-300">
+                            {topLabel || '暂无Top标的'}
+                          </span>
+                          <span className="text-slate-500 dark:text-slate-400">
+                            分 {formatScore(Number(item.top_score))} / 候选 {Number(item.item_count || 0)} / 事件 {eventCount}
+                          </span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                ) : eventSelectionErrors.length ? (
+                  <div className="mt-2 rounded-lg bg-rose-50 px-2.5 py-1.5 text-[11px] text-rose-700 dark:bg-rose-500/10 dark:text-rose-300">
+                    {String(eventSelectionErrors[0]?.error || '机会榜重算失败')}
+                  </div>
+                ) : (
+                  <div className="mt-2 text-[11px] text-slate-500 dark:text-slate-400">
+                    {String(eventSelectionMeta.reason || eventSelectionMeta.skip_reason || '等待新增或更新资讯触发')}
+                  </div>
+                )}
+              </div>
+            ) : null}
 
             <div className="mt-3 space-y-2">
               <div>
@@ -667,6 +909,25 @@ export default function NewsEye() {
             <p className="mt-1 text-xs leading-5 text-slate-500 dark:text-slate-400">
               消息驱动的主线观察，不是直接买卖建议；高分方向仍需结合竞价、量能和龙头承接确认。
             </p>
+            {llmCoreStockGovernance ? (
+              <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
+                <span
+                  title={String(llmCoreStockGovernance.reason || '')}
+                  className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 font-semibold ${llmStatusTone(llmCoreStockStatus, llmCoreStockReady)}`}
+                >
+                  <Sparkles className="h-3.5 w-3.5" />
+                  {llmStatusLabel(llmCoreStockStatus)}
+                </span>
+                <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 font-medium text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300">
+                  标的 {llmUsedSymbolThemeCount} / 语义 {llmUsedSemanticThemeCount}
+                </span>
+                {llmCoreStockGovernance.model ? (
+                  <span className="rounded-full border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
+                    {String(llmCoreStockGovernance.model)}
+                  </span>
+                ) : null}
+              </div>
+            ) : null}
           </div>
           <div className="flex flex-wrap items-center gap-2">
             {THEME_WINDOWS.map(option => (
@@ -692,8 +953,8 @@ export default function NewsEye() {
           </div>
         ) : null}
 
-        <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
-          <div>
+        <div className="mt-4 grid min-w-0 gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
+          <div className="min-w-0">
             {themeLoading ? (
               <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
                 {Array.from({ length: 6 }).map((_, index) => (
@@ -707,7 +968,7 @@ export default function NewsEye() {
                 <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">等待后台采集更多带板块标签的资讯。</p>
               </div>
             ) : (
-              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+              <div className="grid max-h-[620px] gap-3 overflow-y-auto pr-1 md:grid-cols-2 xl:max-h-none xl:grid-cols-3 xl:overflow-visible xl:pr-0">
                 {themeItems.slice(0, 9).map(item => (
                   <ThemeRankingCard
                     key={item.theme}
@@ -720,7 +981,7 @@ export default function NewsEye() {
             )}
           </div>
 
-          <div className="space-y-3">
+          <div className="min-w-0 space-y-3">
             <div className="rounded-[18px] border border-slate-200 bg-slate-50/80 p-4 dark:border-slate-700 dark:bg-slate-950/35">
               <div className="flex items-start justify-between gap-3">
                 <div>
@@ -747,9 +1008,31 @@ export default function NewsEye() {
 
               {selectedThemeItem ? (
                 <>
-                  <p className="mt-3 text-xs leading-5 text-slate-600 dark:text-slate-300">
+                  <p className="mt-3 break-words text-xs leading-5 text-slate-600 dark:text-slate-300">
                     {selectedThemeItem.catalyst || selectedThemeItem.summary || '等待更多催化线索。'}
                   </p>
+                  {(() => {
+                    const semantic = selectedThemeItem.event_semantic && typeof selectedThemeItem.event_semantic === 'object'
+                      ? selectedThemeItem.event_semantic as Record<string, unknown>
+                      : null
+                    if (!semantic) return null
+                    const chain = Array.isArray(semantic.beneficiary_chain) ? semantic.beneficiary_chain.map(String) : []
+                    const invalidations = Array.isArray(semantic.invalidation_conditions) ? semantic.invalidation_conditions.map(String) : []
+                    const risks = Array.isArray(semantic.risk_signals) ? semantic.risk_signals.map(String) : []
+                    return (
+                      <div className="mt-3 rounded-xl border border-emerald-200/80 bg-emerald-50/70 px-3 py-2 text-xs leading-5 text-emerald-800 dark:border-emerald-500/20 dark:bg-emerald-500/10 dark:text-emerald-200">
+                        <div className="flex flex-wrap items-center gap-2 font-medium">
+                          <span>{String(semantic.event_type || '事件催化')}</span>
+                          <span>强度 {formatScore(Number(semantic.catalyst_strength))}</span>
+                          <span>置信 {formatPercentValue(Number(semantic.confidence))}</span>
+                        </div>
+                        {chain.length ? <div className="mt-1">受益链条：{chain.slice(0, 5).join(' / ')}</div> : null}
+                        {invalidations.length || risks.length ? (
+                          <div className="mt-1">失效条件：{[...invalidations, ...risks].slice(0, 4).join('；')}</div>
+                        ) : null}
+                      </div>
+                    )
+                  })()}
                   <div className="mt-3 grid grid-cols-3 gap-2 text-center text-[11px]">
                     <div className="rounded-xl bg-white px-2 py-2 dark:bg-slate-900">
                       <div className="font-semibold text-slate-900 dark:text-slate-100">{selectedThemeItem.score.toFixed(1)}</div>
@@ -780,22 +1063,20 @@ export default function NewsEye() {
                       ))}
                     </div>
                   ) : null}
-                  <div className="mt-3 space-y-2">
+                  <div className="mt-3 max-h-96 space-y-2 overflow-y-auto pr-1">
                     {(selectedThemeItem.evidence_items || []).slice(0, 4).map(evidence => (
                       <div
                         key={evidence.id}
                         tabIndex={0}
-                        className="group relative rounded-xl border border-slate-200 bg-white/86 px-3 py-2 text-xs outline-none transition focus-within:z-40 focus-visible:ring-2 focus-visible:ring-sky-300 dark:border-slate-700 dark:bg-slate-900/70 dark:focus-visible:ring-sky-500/40"
+                        title={evidence.content}
+                        className="rounded-xl border border-slate-200 bg-white/86 px-3 py-2 text-xs outline-none transition hover:border-slate-300 focus-visible:ring-2 focus-visible:ring-sky-300 dark:border-slate-700 dark:bg-slate-900/70 dark:hover:border-slate-600 dark:focus-visible:ring-sky-500/40"
                       >
                         <div className="flex flex-wrap items-center gap-1.5">
                           <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${sourceTierTone(evidence.source_tier)}`}>{evidence.source_tier}</span>
                           <span className="text-[11px] text-slate-400">{evidence.source}</span>
                           <span className="text-[11px] text-slate-400">{formatDateTime(evidence.published_at)}</span>
                         </div>
-                        <div className="mt-1.5 line-clamp-2 leading-5 text-slate-700 dark:text-slate-300">{evidence.content}</div>
-                        <div className="absolute left-2 right-2 top-full z-40 mt-2 hidden max-h-72 overflow-y-auto rounded-xl border border-slate-200 bg-white p-3 text-xs leading-5 text-slate-700 shadow-xl ring-1 ring-slate-900/5 group-hover:block group-focus:block dark:border-slate-700 dark:bg-slate-950 dark:text-slate-200 dark:ring-white/10">
-                          {evidence.content}
-                        </div>
+                        <div className="mt-1.5 line-clamp-2 break-words leading-5 text-slate-700 dark:text-slate-300">{evidence.content}</div>
                       </div>
                     ))}
                   </div>

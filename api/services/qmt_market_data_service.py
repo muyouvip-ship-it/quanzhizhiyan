@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from api.core.settings import settings
 from api.database import SessionLocal, engine
+from api.core.utils import safe_float as _safe_float
 from api.services.market_data_pipeline_service import (
     ingest_raw_minute_rows,
     preferred_daily_kline_table,
@@ -161,6 +162,8 @@ def capture_intraday_symbols(
     account_key: str | None = None,
     db: Session | None = None,
     user_id: str | None = None,
+    timeout_seconds: float | None = None,
+    retry_missing: bool = True,
 ) -> dict[str, Any]:
     normalized = _normalize_symbols(symbols)
     if not normalized:
@@ -172,6 +175,7 @@ def capture_intraday_symbols(
         account_key=account_key,
         db=db,
         user_id=user_id,
+        timeout_seconds=timeout_seconds,
     )
     rows = _normalize_intraday_payload(payload)
     symbol_errors = dict(payload.get("symbol_errors") or {})
@@ -182,40 +186,42 @@ def capture_intraday_symbols(
     }
     missing_symbols = [symbol for symbol in normalized if symbol not in captured_symbols]
 
-    # QMT batch minute queries occasionally miss individual symbols without failing the
-    # whole request. Retry those names one by one so live monitoring doesn't silently
-    # monitor only a subset of holdings.
-    retry_rows: list[dict[str, Any]] = []
-    for symbol in missing_symbols:
-        retry_payload = _fetch_intraday_payload_safe(
-            [symbol],
-            trade_date=trade_date,
-            period=period,
-            account_key=account_key,
-            db=db,
-            user_id=user_id,
-        )
-        retry_items = _normalize_intraday_payload(retry_payload)
-        if retry_items:
-            retry_rows.extend(retry_items)
-            captured_symbols.add(symbol)
-        retry_errors = retry_payload.get("symbol_errors") or {}
-        if isinstance(retry_errors, dict) and symbol in retry_errors:
-            symbol_errors[symbol] = retry_errors[symbol]
-
-    if retry_rows:
-        rows = (
-            sorted(
-                {
-                    (
-                        normalize_market_symbol(item.get("symbol")),
-                        str(item.get("trade_time")),
-                    ): item
-                    for item in [*rows, *retry_rows]
-                }.values(),
-                key=lambda item: (str(item.get("symbol") or ""), str(item.get("trade_time") or "")),
+    if retry_missing and missing_symbols:
+        # QMT batch minute queries occasionally miss individual symbols without failing the
+        # whole request. Retry those names one by one so live monitoring doesn't silently
+        # monitor only a subset of holdings.
+        retry_rows: list[dict[str, Any]] = []
+        for symbol in missing_symbols:
+            retry_payload = _fetch_intraday_payload_safe(
+                [symbol],
+                trade_date=trade_date,
+                period=period,
+                account_key=account_key,
+                db=db,
+                user_id=user_id,
+                timeout_seconds=timeout_seconds,
             )
-        )
+            retry_items = _normalize_intraday_payload(retry_payload)
+            if retry_items:
+                retry_rows.extend(retry_items)
+                captured_symbols.add(symbol)
+            retry_errors = retry_payload.get("symbol_errors") or {}
+            if isinstance(retry_errors, dict) and symbol in retry_errors:
+                symbol_errors[symbol] = retry_errors[symbol]
+
+        if retry_rows:
+            rows = (
+                sorted(
+                    {
+                        (
+                            normalize_market_symbol(item.get("symbol")),
+                            str(item.get("trade_time")),
+                        ): item
+                        for item in [*rows, *retry_rows]
+                    }.values(),
+                    key=lambda item: (str(item.get("symbol") or ""), str(item.get("trade_time") or "")),
+                )
+            )
 
     captured_symbols = {
         normalize_market_symbol(item.get("symbol"))
@@ -626,6 +632,7 @@ def _fetch_intraday_payload_safe(
     account_key: str | None,
     db: Session | None = None,
     user_id: str | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     config = _resolve_market_config(account_key, db=db, user_id=user_id)
     try:
@@ -634,6 +641,7 @@ def _fetch_intraday_payload_safe(
                 config,
                 "/market/minute-bars",
                 {"symbols": symbols, "trade_date": trade_date, "period": period},
+                timeout_seconds=timeout_seconds,
             )
             return payload if isinstance(payload, dict) else {"items": []}
         rows = _fetch_intraday_rows_via_local_xt(symbols, trade_date=trade_date, period=period)
@@ -902,13 +910,21 @@ def _bridge_post(
         f"{base_url}{path}",
         json=body,
         headers=headers,
-        timeout=timeout_seconds or 30,
+        timeout=_normalize_timeout_seconds(timeout_seconds),
     )
     response.raise_for_status()
     payload = response.json()
     if not isinstance(payload, dict):
         raise RuntimeError(f"unexpected bridge payload: {type(payload).__name__}")
     return payload
+
+
+def _normalize_timeout_seconds(timeout_seconds: float | None, *, default: float = 30.0) -> float:
+    try:
+        value = float(timeout_seconds) if timeout_seconds is not None else float(default)
+    except Exception:
+        value = float(default)
+    return max(value, 1.0)
 
 
 def _normalize_quote_payload(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -1523,10 +1539,3 @@ def _parse_datetime(value: Any) -> datetime | None:
         return None
 
 
-def _safe_float(value: Any) -> float | None:
-    if value in (None, ""):
-        return None
-    try:
-        return round(float(value), 4)
-    except Exception:
-        return None

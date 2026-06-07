@@ -7,20 +7,27 @@ import math
 import os
 import re
 import threading
+import time as time_module
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from typing import Any, Iterable
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
 from api.database import SessionLocal
-from api.core.runtime_config import build_runtime_config
+from api.core.runtime_config import (
+    account_llm_runtime_sources,
+    build_news_runtime_config,
+    build_runtime_config,
+    has_mixed_account_llm_runtime,
+    llm_runtime_package_source,
+)
 from api.core.stock_map import get_reverse_stock_map
-from api.services import auth_service
 from tradingagents.llm_clients.factory import create_llm_client
 
 
@@ -35,12 +42,33 @@ LLM_SYMBOL_PER_THEME_LIMIT = max(int(os.getenv("NEWS_THEME_LLM_SYMBOL_PER_THEME_
 LLM_SYMBOL_ERROR_CACHE_TTL_SECONDS = max(int(os.getenv("NEWS_THEME_LLM_SYMBOL_ERROR_TTL_SECONDS", "600")), 0)
 LLM_SYMBOL_GLOBAL_ERROR_COOLDOWN_SECONDS = max(int(os.getenv("NEWS_THEME_LLM_SYMBOL_GLOBAL_ERROR_COOLDOWN_SECONDS", "300")), 0)
 LLM_SYMBOL_TIMEOUT_SECONDS = max(float(os.getenv("NEWS_THEME_LLM_SYMBOL_TIMEOUT_SECONDS", "120")), 5.0)
+LLM_SYMBOL_ASYNC_WAIT_SECONDS = max(float(os.getenv("NEWS_THEME_LLM_SYMBOL_ASYNC_WAIT_SECONDS", "0")), 0.0)
+LLM_SYMBOL_RECENT_SUCCESS_TTL_SECONDS = max(int(os.getenv("NEWS_THEME_LLM_SYMBOL_RECENT_SUCCESS_TTL_SECONDS", "1800")), 0)
 LLM_SYMBOL_EVIDENCE_LIMIT = max(int(os.getenv("NEWS_THEME_LLM_SYMBOL_EVIDENCE_LIMIT", "3")), 1)
 LLM_SYMBOL_EVIDENCE_CHARS = max(int(os.getenv("NEWS_THEME_LLM_SYMBOL_EVIDENCE_CHARS", "160")), 80)
+LLM_PROVIDERS_REQUIRING_API_KEY = {
+    "openai",
+    "anthropic",
+    "google",
+    "xai",
+    "openrouter",
+    "volcengine",
+    "volcengine-ark",
+    "ark",
+    "dashscope",
+    "deepseek",
+    "moonshot",
+    "zhipu",
+    "siliconflow",
+}
+CORE_STOCK_FEEDBACK_MODEL_VERSION = "settlement-feedback-v1"
+THEME_REFRESH_ADVISORY_LOCK_CLASS = 72021
 
 _CORE_STOCK_SUGGESTION_TASKS: set[str] = set()
 _CORE_STOCK_SUGGESTION_TASKS_LOCK = threading.Lock()
 _CORE_STOCK_LAST_FAILURE_AT: dict[str, datetime] = {}
+_THEME_SCHEMA_LOCK = threading.RLock()
+_THEME_SCHEMA_ENSURED_BINDS: set[str] = set()
 
 POLICY_AUTHORITY_KEYWORDS = (
     "中共中央",
@@ -183,6 +211,31 @@ class ThemeEvent:
 
 
 def ensure_theme_tables(db: Session) -> None:
+    bind_key = _schema_bind_key(db)
+    if bind_key in _THEME_SCHEMA_ENSURED_BINDS:
+        return
+    with _THEME_SCHEMA_LOCK:
+        if bind_key in _THEME_SCHEMA_ENSURED_BINDS:
+            return
+        _ensure_theme_tables_uncached(db)
+        _THEME_SCHEMA_ENSURED_BINDS.add(bind_key)
+
+
+def _schema_bind_key(db: Session) -> str:
+    try:
+        bind = db.get_bind()
+    except Exception:
+        return f"session:{id(db)}"
+    bind_url = getattr(bind, "url", None)
+    if bind_url is not None:
+        try:
+            return bind_url.render_as_string(hide_password=False)
+        except Exception:
+            return str(bind_url)
+    return f"bind:{id(bind)}"
+
+
+def _ensure_theme_tables_uncached(db: Session) -> None:
     db.execute(
         text(
             """
@@ -207,6 +260,8 @@ def ensure_theme_tables(db: Session) -> None:
                 related_symbols_json TEXT DEFAULT '[]',
                 raw_tags_json TEXT DEFAULT '[]',
                 evidence_items_json TEXT DEFAULT '[]',
+                event_semantic_json TEXT DEFAULT '{}',
+                semantic_source VARCHAR(120),
                 summary TEXT,
                 catalyst TEXT,
                 risk_note TEXT,
@@ -216,6 +271,8 @@ def ensure_theme_tables(db: Session) -> None:
             """
         )
     )
+    db.execute(text("ALTER TABLE market_news_theme_snapshots ADD COLUMN IF NOT EXISTS event_semantic_json TEXT DEFAULT '{}'"))
+    db.execute(text("ALTER TABLE market_news_theme_snapshots ADD COLUMN IF NOT EXISTS semantic_source VARCHAR(120)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS ix_market_news_theme_snapshots_date ON market_news_theme_snapshots (snapshot_date, window_label, rank)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS ix_market_news_theme_snapshots_theme ON market_news_theme_snapshots (theme)"))
     db.execute(
@@ -263,9 +320,12 @@ def ensure_theme_tables(db: Session) -> None:
                 cache_key VARCHAR(64) PRIMARY KEY,
                 window_label VARCHAR(20) NOT NULL,
                 evidence_hash VARCHAR(64) NOT NULL,
+                config_hash VARCHAR(64),
                 provider VARCHAR(40),
                 model VARCHAR(120),
                 suggestions_json TEXT DEFAULT '{}',
+                event_semantics_json TEXT DEFAULT '{}',
+                trigger_context_json TEXT DEFAULT '{}',
                 error TEXT,
                 created_at TIMESTAMP NOT NULL,
                 updated_at TIMESTAMP NOT NULL
@@ -273,7 +333,11 @@ def ensure_theme_tables(db: Session) -> None:
             """
         )
     )
+    db.execute(text("ALTER TABLE market_news_theme_symbol_suggestions ADD COLUMN IF NOT EXISTS event_semantics_json TEXT DEFAULT '{}'"))
+    db.execute(text("ALTER TABLE market_news_theme_symbol_suggestions ADD COLUMN IF NOT EXISTS trigger_context_json TEXT DEFAULT '{}'"))
+    db.execute(text("ALTER TABLE market_news_theme_symbol_suggestions ADD COLUMN IF NOT EXISTS config_hash VARCHAR(64)"))
     db.execute(text("CREATE INDEX IF NOT EXISTS ix_market_news_theme_symbol_suggestions_window ON market_news_theme_symbol_suggestions (window_label, updated_at DESC)"))
+    db.execute(text("CREATE INDEX IF NOT EXISTS ix_market_news_theme_symbol_suggestions_recent ON market_news_theme_symbol_suggestions (window_label, provider, model, config_hash, updated_at DESC)"))
     db.commit()
 
 
@@ -284,16 +348,34 @@ def list_theme_rankings(
     limit: int = 20,
     include_evidence: bool = True,
     user_id: str | None = None,
+    now: datetime | None = None,
+    allow_async_llm: bool = False,
+    force_sync_llm: bool = False,
+    trigger_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    rows = refresh_theme_rankings(db, windows=(window,), limit=limit, persist=True, user_id=user_id).get(window, [])
+    rows = refresh_theme_rankings(
+        db,
+        windows=(window,),
+        limit=limit,
+        persist=True,
+        now=now,
+        user_id=user_id,
+        allow_async_llm=allow_async_llm,
+        force_sync_llm=force_sync_llm,
+        trigger_context=trigger_context,
+    ).get(window, [])
     if not include_evidence:
         rows = [{**row, "evidence_items": []} for row in rows]
+    llm_readiness = core_stock_llm_readiness(db, user_id=user_id)
     return {
         "window": _normalize_window(window),
         "items": rows[:limit],
         "updated_at": _iso(_now_cn_naive()),
         "source": "cache:market_news_items+theme_resonance",
         "message": "消息驱动主线观察，不构成直接买卖建议。",
+        "data_governance": {
+            "llm_core_stock": _llm_core_stock_usage_summary(rows[:limit], readiness=llm_readiness),
+        },
     }
 
 
@@ -305,6 +387,9 @@ def refresh_theme_rankings(
     persist: bool = True,
     now: datetime | None = None,
     user_id: str | None = None,
+    allow_async_llm: bool = False,
+    force_sync_llm: bool = False,
+    trigger_context: dict[str, Any] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     ensure_theme_tables(db)
     current = _normalize_dt(now) or _now_cn_naive()
@@ -312,7 +397,7 @@ def refresh_theme_rankings(
     rankings_by_window: dict[str, list[dict[str, Any]]] = {}
     for raw_window in windows:
         window = _normalize_window(raw_window)
-        window_start, window_end = _resolve_window_range(window, current)
+        window_start, window_end = resolve_news_window_range(window, current)
         news_rows = _load_news_rows(db, window_start=window_start, window_end=window_end)
         ranking = _build_theme_ranking(
             news_rows,
@@ -329,6 +414,9 @@ def refresh_theme_rankings(
             window_start=window_start,
             window_end=window_end,
             user_id=user_id,
+            allow_async_llm=allow_async_llm,
+            force_sync_llm=force_sync_llm,
+            trigger_context=trigger_context,
         )
         if persist:
             _persist_ranking_snapshot(
@@ -343,6 +431,11 @@ def refresh_theme_rankings(
     if persist:
         db.commit()
     return rankings_by_window
+
+
+def resolve_news_window_range(window: str, now: datetime | None = None) -> tuple[datetime, datetime]:
+    current = _normalize_dt(now) or _now_cn_naive()
+    return _resolve_window_range(_normalize_window(window), current)
 
 
 def list_theme_snapshots(db: Session, *, snapshot_date: str, window: str | None = None, limit: int = 50) -> dict[str, Any]:
@@ -536,6 +629,17 @@ def _score_theme(theme: str, events: list[ThemeEvent], *, market_confirmation: d
     summary = _build_summary(theme, message_count, negative_count, dominant_tier, policy_boost, consensus_rate)
     catalyst = _build_catalyst(evidence, raw_tags, confirmation)
     risk_note = _build_risk_note(crowding_risk, disagreement_level, negative_events)
+    event_semantic = _heuristic_event_semantic(
+        theme=theme,
+        evidence=evidence,
+        catalyst=catalyst,
+        summary=summary,
+        policy_boost=policy_boost,
+        consensus_rate=consensus_rate,
+        negative_count=negative_count,
+        crowding_risk=crowding_risk,
+        risk_note=risk_note,
+    )
     return {
         "theme": theme,
         "parent_theme": THEME_CATALOG.get(theme, {}).get("parent_theme"),
@@ -557,6 +661,8 @@ def _score_theme(theme: str, events: list[ThemeEvent], *, market_confirmation: d
         "summary": summary,
         "catalyst": catalyst,
         "risk_note": risk_note,
+        "event_semantic": event_semantic,
+        "semantic_source": "heuristic:event_rules",
         "market_confirmation": confirmation,
         "evidence_items": evidence,
     }
@@ -570,27 +676,72 @@ def _apply_llm_core_stock_suggestions(
     window_start: datetime,
     window_end: datetime,
     user_id: str | None,
+    allow_async_llm: bool = False,
+    force_sync_llm: bool = False,
+    trigger_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    if not ranking or not user_id or not _llm_symbol_suggestions_enabled():
+    if not ranking or not _llm_symbol_suggestions_enabled():
+        _mark_core_stock_llm_trace(ranking, status="disabled", reason="NEWS_THEME_LLM_SYMBOLS disabled")
         return ranking
 
-    prompt_items = _build_core_stock_prompt_items(ranking[:LLM_SYMBOL_THEME_LIMIT])
+    prompt_items = _build_core_stock_prompt_items(db, ranking[:LLM_SYMBOL_THEME_LIMIT])
     if not prompt_items:
+        _mark_core_stock_llm_trace(ranking, status="no_prompt_items", reason="no positive evidence for LLM prompt")
         return ranking
 
     config = _resolve_core_stock_llm_config(db, user_id=user_id)
     if not config:
+        _mark_core_stock_llm_trace(
+            ranking,
+            themes=[str(item.get("theme") or "") for item in prompt_items],
+            status="config_unavailable",
+            reason="core stock LLM config is not ready",
+        )
         return ranking
 
     config_hash = _make_core_stock_config_hash(config)
     evidence_hash = _make_core_stock_evidence_hash(prompt_items)
     cache_key = _make_core_stock_cache_key(window, evidence_hash, config_hash)
-    cached = _load_core_stock_suggestion_cache(db, cache_key)
-    if cached is not None:
-        return _merge_core_stock_suggestions(ranking, cached, source="llm:cache")
+    trace_base = {
+        "provider": str(config.get("provider") or ""),
+        "model": str(config.get("model") or ""),
+        "base_url": config.get("base_url"),
+        "runtime_package_source": config.get("runtime_package_source"),
+        "cache_key": cache_key,
+        "evidence_hash": evidence_hash,
+        "window": window,
+    }
+    public_trigger_context = _public_llm_trigger_context(trigger_context)
+    trace_themes = [str(item.get("theme") or "") for item in prompt_items]
+    if not force_sync_llm:
+        cached = _load_core_stock_suggestion_cache(db, cache_key)
+        if cached is not None:
+            _mark_core_stock_llm_trace(
+                ranking,
+                themes=trace_themes,
+                status="cache_hit",
+                cache_updated_at=_iso(_safe_datetime(cached.get("updated_at"))),
+                cache_has_error=bool(cached.get("error")),
+                trigger_context=cached.get("trigger_context") or public_trigger_context,
+                **trace_base,
+            )
+            ranking = _merge_event_semantics(ranking, cached.get("event_semantics") or {}, source="llm:cache")
+            return _merge_core_stock_suggestions(ranking, cached.get("suggestions") or {}, source="llm:cache")
 
-    if not _llm_symbol_suggestions_sync_enabled():
-        _queue_core_stock_suggestion_refresh(
+    sync_invoke = force_sync_llm or (_llm_symbol_suggestions_sync_enabled() and not allow_async_llm)
+
+    if not sync_invoke:
+        if not user_id and not allow_async_llm:
+            _mark_core_stock_llm_trace(
+                ranking,
+                themes=trace_themes,
+                status="async_skipped",
+                reason="anonymous request without async permission",
+                trigger_context=public_trigger_context,
+                **trace_base,
+            )
+            return ranking
+        queued = _queue_core_stock_suggestion_refresh(
             config=config,
             cache_key=cache_key,
             window=window,
@@ -598,10 +749,78 @@ def _apply_llm_core_stock_suggestions(
             window_start=window_start,
             window_end=window_end,
             prompt_items=prompt_items,
+            trigger_context=public_trigger_context,
+        )
+        if queued and LLM_SYMBOL_ASYNC_WAIT_SECONDS > 0:
+            cached = _wait_for_core_stock_suggestion_cache(db, cache_key, timeout_seconds=LLM_SYMBOL_ASYNC_WAIT_SECONDS)
+            if cached is not None:
+                _mark_core_stock_llm_trace(
+                    ranking,
+                    themes=trace_themes,
+                    status="cache_hit_after_async_wait",
+                    cache_updated_at=_iso(_safe_datetime(cached.get("updated_at"))),
+                    cache_has_error=bool(cached.get("error")),
+                    trigger_context=cached.get("trigger_context") or public_trigger_context,
+                    **trace_base,
+                )
+                ranking = _merge_event_semantics(ranking, cached.get("event_semantics") or {}, source="llm:cache")
+                return _merge_core_stock_suggestions(ranking, cached.get("suggestions") or {}, source="llm:cache")
+        recent_cached = _load_recent_core_stock_success_cache(
+            db,
+            window=window,
+            provider=str(config.get("provider") or ""),
+            model=str(config.get("model") or ""),
+            config_hash=config_hash,
+            exclude_cache_key=cache_key,
+        )
+        if recent_cached is not None:
+            _mark_core_stock_llm_trace(
+                ranking,
+                themes=trace_themes,
+                status="recent_cache_hit_refresh_queued" if queued else "recent_cache_hit_refresh_pending",
+                cache_updated_at=_iso(_safe_datetime(recent_cached.get("updated_at"))),
+                recent_cache_key=recent_cached.get("cache_key"),
+                recent_evidence_hash=recent_cached.get("evidence_hash"),
+                queued_refresh=bool(queued),
+                trigger_context=recent_cached.get("trigger_context") or public_trigger_context,
+                **trace_base,
+            )
+            ranking = _merge_event_semantics(ranking, recent_cached.get("event_semantics") or {}, source="llm:recent_cache")
+            return _merge_core_stock_suggestions(ranking, recent_cached.get("suggestions") or {}, source="llm:recent_cache")
+        _mark_core_stock_llm_trace(
+            ranking,
+            themes=trace_themes,
+            status="queued" if queued else "queue_skipped",
+            reason=None if queued else "single flight or cooldown active",
+            trigger_context=public_trigger_context,
+            **trace_base,
         )
         return ranking
 
+    _advisory_xact_lock(db, _llm_cache_lock_id(cache_key))
+    if not force_sync_llm:
+        cached = _load_core_stock_suggestion_cache(db, cache_key)
+        if cached is not None:
+            _mark_core_stock_llm_trace(
+                ranking,
+                themes=trace_themes,
+                status="cache_hit_after_lock",
+                cache_updated_at=_iso(_safe_datetime(cached.get("updated_at"))),
+                cache_has_error=bool(cached.get("error")),
+                trigger_context=cached.get("trigger_context") or public_trigger_context,
+                **trace_base,
+            )
+            ranking = _merge_event_semantics(ranking, cached.get("event_semantics") or {}, source="llm:cache")
+            return _merge_core_stock_suggestions(ranking, cached.get("suggestions") or {}, source="llm:cache")
+
     try:
+        _mark_core_stock_llm_trace(
+            ranking,
+            themes=trace_themes,
+            status="invoking",
+            trigger_context=public_trigger_context,
+            **trace_base,
+        )
         raw_suggestions = _invoke_core_stock_llm(
             config,
             {
@@ -612,15 +831,33 @@ def _apply_llm_core_stock_suggestions(
             },
         )
         suggestions = _normalize_core_stock_suggestions(raw_suggestions)
+        event_semantics = _normalize_event_semantics(raw_suggestions)
         _store_core_stock_suggestion_cache(
             db,
             cache_key=cache_key,
             window=window,
             evidence_hash=evidence_hash,
+            config_hash=config_hash,
             provider=str(config.get("provider") or ""),
             model=str(config.get("model") or ""),
             suggestions=suggestions,
+            event_semantics=event_semantics,
+            trigger_context=public_trigger_context,
             error=None,
+        )
+        ranking = _merge_event_semantics(
+            ranking,
+            event_semantics,
+            source=f"llm:{config.get('provider')}/{config.get('model')}",
+        )
+        _mark_core_stock_llm_trace(
+            ranking,
+            themes=trace_themes,
+            status="invoked",
+            suggested_theme_count=len(suggestions),
+            semantic_theme_count=len(event_semantics),
+            trigger_context=public_trigger_context,
+            **trace_base,
         )
         return _merge_core_stock_suggestions(
             ranking,
@@ -634,12 +871,74 @@ def _apply_llm_core_stock_suggestions(
             cache_key=cache_key,
             window=window,
             evidence_hash=evidence_hash,
+            config_hash=config_hash,
             provider=str(config.get("provider") or ""),
             model=str(config.get("model") or ""),
             suggestions={},
+            event_semantics={},
+            trigger_context=public_trigger_context,
             error=str(exc)[:500],
         )
+        _mark_core_stock_llm_trace(
+            ranking,
+            themes=trace_themes,
+            status="failed",
+            error=str(exc)[:240],
+            trigger_context=public_trigger_context,
+            **trace_base,
+        )
         return ranking
+
+
+def _mark_core_stock_llm_trace(
+    ranking: list[dict[str, Any]],
+    *,
+    themes: list[str] | None = None,
+    status: str,
+    **fields: Any,
+) -> None:
+    theme_set = {str(theme) for theme in (themes or []) if str(theme).strip()}
+    for item in ranking:
+        if theme_set and str(item.get("theme") or "") not in theme_set:
+            continue
+        trace = dict(item.get("llm_symbol_trace") or {})
+        trace.update({k: v for k, v in fields.items() if v not in (None, "", [])})
+        trace["status"] = status
+        trace["updated_at"] = _iso(_now_cn_naive())
+        item["llm_symbol_trace"] = trace
+
+
+def _public_llm_trigger_context(context: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(context, dict):
+        return {}
+    allowed = {
+        "source",
+        "trigger",
+        "refresh_key",
+        "reason",
+        "trade_date",
+        "window",
+        "limit",
+        "fresh_event_count",
+        "capture_rows",
+        "capture_success",
+        "triggered_at",
+    }
+    result: dict[str, Any] = {}
+    for key in allowed:
+        value = context.get(key)
+        if value in (None, "", []):
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            result[key] = value
+    news_ingest = context.get("news_ingest")
+    if isinstance(news_ingest, dict):
+        result["news_ingest"] = {
+            key: news_ingest.get(key)
+            for key in ("saved", "new", "updated", "unchanged")
+            if news_ingest.get(key) is not None
+        }
+    return result
 
 
 def _llm_symbol_suggestions_enabled() -> bool:
@@ -659,6 +958,7 @@ def _queue_core_stock_suggestion_refresh(
     window_start: datetime,
     window_end: datetime,
     prompt_items: list[dict[str, Any]],
+    trigger_context: dict[str, Any] | None = None,
 ) -> bool:
     config_hash = _make_core_stock_config_hash(config)
     with _CORE_STOCK_SUGGESTION_TASKS_LOCK:
@@ -680,6 +980,7 @@ def _queue_core_stock_suggestion_refresh(
             "window_start": window_start,
             "window_end": window_end,
             "prompt_items": prompt_items,
+            "trigger_context": trigger_context or {},
         },
         name=f"news-theme-llm-{cache_key[:8]}",
         daemon=True,
@@ -697,6 +998,7 @@ def _refresh_core_stock_suggestion_cache_background(
     window_start: datetime,
     window_end: datetime,
     prompt_items: list[dict[str, Any]],
+    trigger_context: dict[str, Any] | None = None,
 ) -> None:
     failed = False
     config_hash = _make_core_stock_config_hash(config)
@@ -711,13 +1013,17 @@ def _refresh_core_stock_suggestion_cache_background(
             },
         )
         suggestions = _normalize_core_stock_suggestions(raw_suggestions)
+        event_semantics = _normalize_event_semantics(raw_suggestions)
         _store_core_stock_suggestion_cache_in_new_session(
             cache_key=cache_key,
             window=window,
             evidence_hash=evidence_hash,
+            config_hash=config_hash,
             provider=str(config.get("provider") or ""),
             model=str(config.get("model") or ""),
             suggestions=suggestions,
+            event_semantics=event_semantics,
+            trigger_context=trigger_context or {},
             error=None,
         )
         logger.info(
@@ -732,9 +1038,12 @@ def _refresh_core_stock_suggestion_cache_background(
             cache_key=cache_key,
             window=window,
             evidence_hash=evidence_hash,
+            config_hash=config_hash,
             provider=str(config.get("provider") or ""),
             model=str(config.get("model") or ""),
             suggestions={},
+            event_semantics={},
+            trigger_context=trigger_context or {},
             error=str(exc)[:500],
         )
     finally:
@@ -755,15 +1064,36 @@ def _core_stock_global_failure_cooldown_active(now: datetime, *, config_hash: st
     return (now - failed_at).total_seconds() < LLM_SYMBOL_GLOBAL_ERROR_COOLDOWN_SECONDS
 
 
+def _wait_for_core_stock_suggestion_cache(
+    db: Session,
+    cache_key: str,
+    *,
+    timeout_seconds: float,
+) -> dict[str, Any] | None:
+    deadline = time_module.monotonic() + max(float(timeout_seconds), 0.0)
+    while time_module.monotonic() < deadline:
+        cached = _load_core_stock_suggestion_cache(db, cache_key)
+        if cached is not None:
+            return cached
+        remaining = deadline - time_module.monotonic()
+        if remaining <= 0:
+            break
+        time_module.sleep(min(0.5, remaining))
+    return _load_core_stock_suggestion_cache(db, cache_key)
+
+
 def _store_core_stock_suggestion_cache_in_new_session(
     *,
     cache_key: str,
     window: str,
     evidence_hash: str,
+    config_hash: str | None = None,
     provider: str,
     model: str,
     suggestions: dict[str, list[dict[str, str]]],
     error: str | None,
+    event_semantics: dict[str, dict[str, Any]] | None = None,
+    trigger_context: dict[str, Any] | None = None,
 ) -> None:
     try:
         with SessionLocal() as db:
@@ -773,9 +1103,12 @@ def _store_core_stock_suggestion_cache_in_new_session(
                 cache_key=cache_key,
                 window=window,
                 evidence_hash=evidence_hash,
+                config_hash=config_hash,
                 provider=provider,
                 model=model,
                 suggestions=suggestions,
+                event_semantics=event_semantics or {},
+                trigger_context=trigger_context or {},
                 error=error,
             )
             db.commit()
@@ -783,23 +1116,164 @@ def _store_core_stock_suggestion_cache_in_new_session(
         logger.exception("[news-theme] failed to store LLM core stock suggestions cache")
 
 
-def _build_core_stock_prompt_items(ranking: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _build_core_stock_prompt_items(db: Session, ranking: list[dict[str, Any]]) -> list[dict[str, Any]]:
     prompt_items: list[dict[str, Any]] = []
     for item in ranking:
         evidence = _positive_or_policy_evidence(item)
         if not evidence:
             continue
+        event_semantic = item.get("event_semantic") if isinstance(item.get("event_semantic"), dict) else {}
         prompt_items.append(
             {
                 "theme": item.get("theme"),
                 "parent_theme": item.get("parent_theme"),
                 "summary": str(item.get("summary") or "")[:120],
                 "catalyst": str(item.get("catalyst") or "")[:120],
+                "event_semantic": event_semantic,
                 "raw_tags": item.get("raw_tags") or [],
                 "evidence": evidence,
             }
         )
-    return prompt_items
+    return _attach_core_stock_feedback_context(db, prompt_items)
+
+
+def _attach_core_stock_feedback_context(db: Session, prompt_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not prompt_items:
+        return prompt_items
+    theme_keys = _dedupe_strings(str(item.get("theme") or "").strip() for item in prompt_items)
+    event_type_keys = _dedupe_strings(
+        _feedback_event_type_key(((item.get("event_semantic") or {}) if isinstance(item.get("event_semantic"), dict) else {}).get("event_type"))
+        for item in prompt_items
+    )
+    profiles = _load_core_stock_feedback_profiles(db, themes=theme_keys, event_types=event_type_keys)
+    if not profiles:
+        return prompt_items
+
+    enriched: list[dict[str, Any]] = []
+    for item in prompt_items:
+        feedback: dict[str, Any] = {}
+        theme = str(item.get("theme") or "").strip()
+        event_type = _feedback_event_type_key(
+            ((item.get("event_semantic") or {}) if isinstance(item.get("event_semantic"), dict) else {}).get("event_type")
+        )
+        theme_profile = (profiles.get("themes") or {}).get(theme)
+        event_profile = (profiles.get("event_types") or {}).get(event_type)
+        if theme_profile:
+            feedback["theme_profile"] = theme_profile
+        if event_profile:
+            feedback["event_type_profile"] = event_profile
+        if feedback:
+            enriched.append({**item, "historical_feedback": feedback})
+        else:
+            enriched.append(item)
+    return enriched
+
+
+def _load_core_stock_feedback_profiles(
+    db: Session,
+    *,
+    themes: list[str],
+    event_types: list[str],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    theme_keys = [theme for theme in themes if theme]
+    event_type_keys = [event_type for event_type in event_types if event_type]
+    if not theme_keys and not event_type_keys:
+        return {}
+
+    exists = db.execute(text("SELECT to_regclass('catalyst_selection_feedback_profiles')")).scalar()
+    if not exists:
+        return {}
+
+    rows = db.execute(
+        text(
+            """
+            SELECT
+                profile_scope,
+                profile_key,
+                sample_count,
+                hit_count,
+                miss_count,
+                average_change_pct,
+                average_hit_score,
+                hit_rate,
+                learned_score,
+                confidence,
+                last_trade_date,
+                last_settlement_date,
+                feature_snapshot_json,
+                updated_at
+            FROM catalyst_selection_feedback_profiles
+            WHERE model_version = :model_version
+              AND (
+                (profile_scope = 'theme' AND profile_key IN :theme_keys)
+                OR (profile_scope = 'event_type' AND profile_key IN :event_type_keys)
+              )
+            """
+        ).bindparams(
+            bindparam("theme_keys", expanding=True),
+            bindparam("event_type_keys", expanding=True),
+        ),
+        {
+            "model_version": CORE_STOCK_FEEDBACK_MODEL_VERSION,
+            "theme_keys": theme_keys or ["__none__"],
+            "event_type_keys": event_type_keys or ["__none__"],
+        },
+    ).mappings().all()
+
+    result: dict[str, dict[str, dict[str, Any]]] = {"themes": {}, "event_types": {}}
+    for row in rows:
+        scope = str(row.get("profile_scope") or "")
+        key = str(row.get("profile_key") or "").strip()
+        if not key:
+            continue
+        profile = _compact_core_stock_feedback_profile(row)
+        if scope == "theme":
+            result["themes"][key] = profile
+        elif scope == "event_type":
+            result["event_types"][key] = profile
+    return result
+
+
+def _compact_core_stock_feedback_profile(row: Any) -> dict[str, Any]:
+    learned_score = _bounded_float(row.get("learned_score"), default=50.0, low=0.0, high=100.0)
+    hit_rate = _bounded_float(row.get("hit_rate"), default=0.0, low=0.0, high=100.0)
+    confidence = _bounded_float(row.get("confidence"), default=0.0, low=0.0, high=1.0)
+    if learned_score >= 62 and hit_rate >= 50 and confidence >= 0.25:
+        instruction = "prioritize_if_current_evidence_confirms"
+    elif learned_score <= 45 or (hit_rate > 0 and hit_rate < 35):
+        instruction = "deprioritize_or_require_stronger_confirmation"
+    else:
+        instruction = "neutral_reference"
+    return {
+        "profile_key": str(row.get("profile_key") or ""),
+        "sample_count": int(row.get("sample_count") or 0),
+        "hit_count": int(row.get("hit_count") or 0),
+        "miss_count": int(row.get("miss_count") or 0),
+        "hit_rate": round(hit_rate, 2),
+        "learned_score": round(learned_score, 2),
+        "confidence": round(confidence, 4),
+        "average_change_pct": _safe_round(row.get("average_change_pct"), 2),
+        "average_hit_score": _safe_round(row.get("average_hit_score"), 2),
+        "last_trade_date": str(row.get("last_trade_date") or "") or None,
+        "last_settlement_date": str(row.get("last_settlement_date") or "") or None,
+        "updated_at": _iso(row.get("updated_at")),
+        "instruction": instruction,
+        "feature_snapshot": _loads(row.get("feature_snapshot_json"), default={}),
+    }
+
+
+def _feedback_event_type_key(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip())[:40]
+
+
+def _safe_round(value: Any, digits: int) -> float | None:
+    try:
+        number = float(value)
+    except Exception:
+        return None
+    if math.isnan(number) or math.isinf(number):
+        return None
+    return round(number, digits)
 
 
 def _positive_or_policy_evidence(item: dict[str, Any]) -> list[dict[str, Any]]:
@@ -833,6 +1307,11 @@ def _make_core_stock_config_hash(config: dict[str, Any]) -> str:
         "provider": str(config.get("provider") or "").strip().lower(),
         "model": str(config.get("model") or "").strip(),
         "base_url": str(config.get("base_url") or "").strip().rstrip("/"),
+        "runtime_package_source": str(config.get("runtime_package_source") or "").strip(),
+        "api_key_source": str(config.get("api_key_source") or "").strip(),
+        "provider_source": str(config.get("provider_source") or "").strip(),
+        "base_url_source": str(config.get("base_url_source") or "").strip(),
+        "model_source": str(config.get("model_source") or "").strip(),
         "api_key_hash": hashlib.sha256(api_key.encode("utf-8")).hexdigest() if api_key else "",
     }
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
@@ -843,11 +1322,11 @@ def _make_core_stock_cache_key(window: str, evidence_hash: str, config_hash: str
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _load_core_stock_suggestion_cache(db: Session, cache_key: str) -> dict[str, list[dict[str, str]]] | None:
+def _load_core_stock_suggestion_cache(db: Session, cache_key: str, *, ignore_error: bool = False) -> dict[str, Any] | None:
     row = db.execute(
         text(
             """
-            SELECT suggestions_json, error, updated_at
+            SELECT cache_key, evidence_hash, config_hash, suggestions_json, event_semantics_json, trigger_context_json, error, updated_at
             FROM market_news_theme_symbol_suggestions
             WHERE cache_key = :cache_key
             """
@@ -857,16 +1336,92 @@ def _load_core_stock_suggestion_cache(db: Session, cache_key: str) -> dict[str, 
     if not row:
         return None
     if row.get("error"):
+        if ignore_error:
+            return None
         updated_at = _safe_datetime(row.get("updated_at"))
         if (
             LLM_SYMBOL_ERROR_CACHE_TTL_SECONDS > 0
             and updated_at is not None
             and (_now_cn_naive() - updated_at).total_seconds() <= LLM_SYMBOL_ERROR_CACHE_TTL_SECONDS
         ):
-            return {}
+            return {
+                "suggestions": {},
+                "event_semantics": {},
+                "trigger_context": _loads(row.get("trigger_context_json"), default={}),
+                "error": str(row.get("error") or ""),
+                "cache_key": row.get("cache_key"),
+                "evidence_hash": row.get("evidence_hash"),
+                "config_hash": row.get("config_hash"),
+                "updated_at": updated_at,
+            }
         return None
-    payload = _loads(row.get("suggestions_json"), default={})
-    return payload if isinstance(payload, dict) else None
+    suggestions = _loads(row.get("suggestions_json"), default={})
+    event_semantics = _loads(row.get("event_semantics_json"), default={})
+    trigger_context = _loads(row.get("trigger_context_json"), default={})
+    return {
+        "suggestions": suggestions if isinstance(suggestions, dict) else {},
+        "event_semantics": event_semantics if isinstance(event_semantics, dict) else {},
+        "trigger_context": trigger_context if isinstance(trigger_context, dict) else {},
+        "error": None,
+        "cache_key": row.get("cache_key"),
+        "evidence_hash": row.get("evidence_hash"),
+        "config_hash": row.get("config_hash"),
+        "updated_at": _safe_datetime(row.get("updated_at")),
+    }
+
+
+def _load_recent_core_stock_success_cache(
+    db: Session,
+    *,
+    window: str,
+    provider: str,
+    model: str,
+    config_hash: str,
+    exclude_cache_key: str | None = None,
+) -> dict[str, Any] | None:
+    if LLM_SYMBOL_RECENT_SUCCESS_TTL_SECONDS <= 0 or not config_hash:
+        return None
+    cutoff = _now_cn_naive() - timedelta(seconds=LLM_SYMBOL_RECENT_SUCCESS_TTL_SECONDS)
+    row = db.execute(
+        text(
+            """
+            SELECT cache_key, evidence_hash, config_hash, suggestions_json, event_semantics_json, trigger_context_json, updated_at
+            FROM market_news_theme_symbol_suggestions
+            WHERE window_label = :window_label
+              AND provider = :provider
+              AND model = :model
+              AND config_hash = :config_hash
+              AND error IS NULL
+              AND updated_at >= :cutoff
+              AND (:exclude_cache_key IS NULL OR cache_key <> :exclude_cache_key)
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """
+        ),
+        {
+            "window_label": window,
+            "provider": provider or None,
+            "model": model or None,
+            "config_hash": config_hash,
+            "cutoff": cutoff,
+            "exclude_cache_key": exclude_cache_key,
+        },
+    ).mappings().first()
+    if not row:
+        return None
+    suggestions = _loads(row.get("suggestions_json"), default={})
+    event_semantics = _loads(row.get("event_semantics_json"), default={})
+    trigger_context = _loads(row.get("trigger_context_json"), default={})
+    return {
+        "suggestions": suggestions if isinstance(suggestions, dict) else {},
+        "event_semantics": event_semantics if isinstance(event_semantics, dict) else {},
+        "trigger_context": trigger_context if isinstance(trigger_context, dict) else {},
+        "error": None,
+        "cache_key": row.get("cache_key"),
+        "evidence_hash": row.get("evidence_hash"),
+        "config_hash": row.get("config_hash"),
+        "updated_at": _safe_datetime(row.get("updated_at")),
+    }
 
 
 def _store_core_stock_suggestion_cache(
@@ -875,25 +1430,31 @@ def _store_core_stock_suggestion_cache(
     cache_key: str,
     window: str,
     evidence_hash: str,
+    config_hash: str | None = None,
     provider: str,
     model: str,
     suggestions: dict[str, list[dict[str, str]]],
     error: str | None,
+    event_semantics: dict[str, dict[str, Any]] | None = None,
+    trigger_context: dict[str, Any] | None = None,
 ) -> None:
     now = _iso(_now_cn_naive())
     db.execute(
         text(
             """
             INSERT INTO market_news_theme_symbol_suggestions (
-                cache_key, window_label, evidence_hash, provider, model, suggestions_json, error, created_at, updated_at
+                cache_key, window_label, evidence_hash, config_hash, provider, model, suggestions_json, event_semantics_json, trigger_context_json, error, created_at, updated_at
             )
             VALUES (
-                :cache_key, :window_label, :evidence_hash, :provider, :model, :suggestions_json, :error, :created_at, :updated_at
+                :cache_key, :window_label, :evidence_hash, :config_hash, :provider, :model, :suggestions_json, :event_semantics_json, :trigger_context_json, :error, :created_at, :updated_at
             )
             ON CONFLICT (cache_key) DO UPDATE SET
+                config_hash = EXCLUDED.config_hash,
                 provider = EXCLUDED.provider,
                 model = EXCLUDED.model,
                 suggestions_json = EXCLUDED.suggestions_json,
+                event_semantics_json = EXCLUDED.event_semantics_json,
+                trigger_context_json = EXCLUDED.trigger_context_json,
                 error = EXCLUDED.error,
                 updated_at = EXCLUDED.updated_at
             """
@@ -902,9 +1463,12 @@ def _store_core_stock_suggestion_cache(
             "cache_key": cache_key,
             "window_label": window,
             "evidence_hash": evidence_hash,
+            "config_hash": config_hash or None,
             "provider": provider or None,
             "model": model or None,
             "suggestions_json": json.dumps(suggestions or {}, ensure_ascii=False),
+            "event_semantics_json": json.dumps(event_semantics or {}, ensure_ascii=False),
+            "trigger_context_json": json.dumps(trigger_context or {}, ensure_ascii=False, default=str),
             "error": error,
             "created_at": now,
             "updated_at": now,
@@ -912,29 +1476,229 @@ def _store_core_stock_suggestion_cache(
     )
 
 
-def _resolve_core_stock_llm_config(db: Session, *, user_id: str) -> dict[str, Any] | None:
-    config = build_runtime_config({}, user_id=user_id, db=db)
-    user_cfg = auth_service.get_user_llm_config(db, user_id)
+def core_stock_llm_readiness(db: Session, *, user_id: str | None = None) -> dict[str, Any]:
+    diagnostic, _ = _inspect_core_stock_llm_config(db, user_id=user_id, include_secret=False)
+    return diagnostic
+
+
+def clear_core_stock_llm_error_cache(db: Session, *, provider: str | None = None, model: str | None = None) -> int:
+    ensure_theme_tables(db)
+    clauses = ["error IS NOT NULL"]
+    params: dict[str, Any] = {}
+    if provider:
+        clauses.append("provider = :provider")
+        params["provider"] = str(provider).strip().lower()
+    if model:
+        clauses.append("model = :model")
+        params["model"] = str(model).strip()
+    result = db.execute(
+        text(
+            f"""
+            DELETE FROM market_news_theme_symbol_suggestions
+            WHERE {' AND '.join(clauses)}
+            """
+        ),
+        params,
+    )
+    return int(result.rowcount or 0)
+
+
+def _resolve_core_stock_llm_config(db: Session, *, user_id: str | None) -> dict[str, Any] | None:
+    diagnostic, config = _inspect_core_stock_llm_config(db, user_id=user_id, include_secret=True)
+    if diagnostic.get("ready"):
+        return config
+    status = str(diagnostic.get("status") or "unavailable")
+    if status == "local_rejected":
+        logger.warning(
+            "[news-theme] skipped local LLM config for core stock suggestions provider=%s base_url=%s",
+            diagnostic.get("provider"),
+            diagnostic.get("base_url"),
+        )
+    elif status == "missing_api_key":
+        logger.warning("[news-theme] skipped LLM core stock suggestions because provider=%s has no API key", diagnostic.get("provider"))
+    elif status == "auth_failed":
+        logger.warning("[news-theme] skipped LLM core stock suggestions because provider=%s model=%s auth failed: %s", diagnostic.get("provider"), diagnostic.get("model"), diagnostic.get("last_error"))
+    elif status != "disabled":
+        logger.warning("[news-theme] skipped LLM core stock suggestions status=%s reason=%s", status, diagnostic.get("reason"))
+    return None
+
+
+def _inspect_core_stock_llm_config(
+    db: Session,
+    *,
+    user_id: str | None,
+    include_secret: bool,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    enabled = _llm_symbol_suggestions_enabled()
+    config = build_news_runtime_config(user_id=user_id, db=db) if user_id else build_runtime_config({})
     provider = str(config.get("llm_provider") or "").strip().lower()
     base_url = str(config.get("backend_url") or "").strip()
     model = str(config.get("quick_think_llm") or config.get("deep_think_llm") or "").strip()
     api_key = str(config.get("api_key") or "").strip()
-    if user_cfg:
-        news_provider = str(getattr(user_cfg, "news_llm_provider", None) or "").strip().lower()
-        news_backend_url = str(getattr(user_cfg, "news_backend_url", None) or "").strip()
-        news_model = str(getattr(user_cfg, "news_analysis_llm", None) or "").strip()
-        news_api_key = auth_service.decrypt_secret(getattr(user_cfg, "news_api_key_encrypted", None))
-        provider = news_provider or provider
-        base_url = news_backend_url or base_url
-        model = news_model or model
-        api_key = news_api_key or api_key
+    api_key_source = str(config.get("_api_key_source") or "").strip() or None
+    provider_source = str(config.get("_llm_provider_source") or "").strip() or None
+    base_url_source = str(config.get("_backend_url_source") or "").strip() or None
+    model_source = str(config.get("_quick_think_llm_source") or config.get("_deep_think_llm_source") or "").strip() or None
+    runtime_package_source = llm_runtime_package_source(config)
+    account_runtime_sources = sorted(account_llm_runtime_sources(config))
+    mixed_account_runtime = has_mixed_account_llm_runtime(config)
+    source = "user_runtime" if user_id else "system_runtime"
     if not provider or not model:
-        return None
-    return {
+        config = build_runtime_config({})
+        provider = str(config.get("llm_provider") or "").strip().lower()
+        base_url = str(config.get("backend_url") or "").strip()
+        model = str(config.get("quick_think_llm") or config.get("deep_think_llm") or "").strip()
+        api_key = str(config.get("api_key") or "").strip()
+        api_key_source = str(config.get("_api_key_source") or "").strip() or None
+        provider_source = str(config.get("_llm_provider_source") or "").strip() or None
+        base_url_source = str(config.get("_backend_url_source") or "").strip() or None
+        model_source = str(config.get("_quick_think_llm_source") or config.get("_deep_think_llm_source") or "").strip() or None
+        runtime_package_source = llm_runtime_package_source(config)
+        account_runtime_sources = sorted(account_llm_runtime_sources(config))
+        mixed_account_runtime = has_mixed_account_llm_runtime(config)
+        source = "system_fallback"
+    requires_api_key = provider in LLM_PROVIDERS_REQUIRING_API_KEY
+    diagnostic = {
+        "enabled": bool(enabled),
+        "ready": False,
+        "status": "unknown",
+        "reason": "",
         "provider": provider,
         "model": model,
         "base_url": base_url or None,
-        "api_key": api_key or None,
+        "source": source,
+        "runtime_package_source": runtime_package_source,
+        "api_key_source": api_key_source,
+        "provider_source": provider_source,
+        "base_url_source": base_url_source,
+        "model_source": model_source,
+        "account_runtime_sources": account_runtime_sources,
+        "mixed_account_runtime": bool(mixed_account_runtime),
+        "requires_api_key": bool(requires_api_key),
+        "has_api_key": bool(api_key),
+        "sync_enabled": _llm_symbol_suggestions_sync_enabled(),
+        "async_allowed_without_user": False,
+    }
+    if not enabled:
+        diagnostic.update({"status": "disabled", "reason": "NEWS_THEME_LLM_SYMBOLS 已关闭，主线核心股和事件语义使用规则回退。"})
+        return diagnostic, None
+    if not provider or not model:
+        diagnostic.update({"status": "missing_model", "reason": "LLM provider 或模型未配置，主线核心股和事件语义使用规则回退。"})
+        return diagnostic, None
+    if _is_local_llm_config(provider=provider, base_url=base_url):
+        diagnostic.update({"status": "local_rejected", "reason": "当前配置指向本地模型，系统要求主线机会榜只使用远程 LLM，已回退到规则语义。"})
+        return diagnostic, None
+    if mixed_account_runtime:
+        diagnostic.update(
+            {
+                "status": "mixed_runtime_rejected",
+                "reason": "账号 LLM 字段未形成同源运行包；provider、Base URL、模型和 Key 必须来自同一套账号配置，已拒绝混用。",
+            }
+        )
+        return diagnostic, None
+    if requires_api_key and not api_key:
+        diagnostic.update({"status": "missing_api_key", "reason": "远程 LLM 已配置但缺少 API Key，主线核心股和事件语义使用规则回退。"})
+        return diagnostic, None
+    safe_config = {
+        "provider": provider,
+        "model": model,
+        "base_url": base_url or None,
+        "runtime_package_source": runtime_package_source,
+        "api_key_source": api_key_source,
+        "provider_source": provider_source,
+        "base_url_source": base_url_source,
+        "model_source": model_source,
+    }
+    llm_error = _latest_core_stock_llm_error(db, provider=provider, model=model)
+    if llm_error:
+        diagnostic.update(llm_error)
+        return diagnostic, None
+    diagnostic.update({"ready": True, "status": "ready", "reason": "远程 LLM 配置可用，可用于主线核心股和事件语义增强。"})
+    if include_secret:
+        safe_config["api_key"] = api_key or None
+    return diagnostic, safe_config
+
+
+def _latest_core_stock_llm_error(db: Session, *, provider: str, model: str) -> dict[str, Any] | None:
+    try:
+        row = db.execute(
+            text(
+                """
+                SELECT error, updated_at
+                FROM market_news_theme_symbol_suggestions
+                WHERE provider = :provider
+                  AND model = :model
+                  AND error IS NOT NULL
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """
+            ),
+            {"provider": provider, "model": model},
+        ).mappings().first()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
+    if not row:
+        return None
+    updated_at = _safe_datetime(row.get("updated_at"))
+    if updated_at is not None:
+        age_seconds = max((_now_cn_naive() - updated_at).total_seconds(), 0.0)
+        if age_seconds > max(LLM_SYMBOL_ERROR_CACHE_TTL_SECONDS, 600):
+            return None
+    error_text = str(row.get("error") or "").strip()
+    if not error_text:
+        return None
+    lowered = error_text.lower()
+    if any(token in lowered for token in ("apikey", "api key", "api_key", "signature cannot be verified", "not found", "401")):
+        return {
+            "ready": False,
+            "status": "auth_failed",
+            "reason": "远程 LLM 已配置，但当前 Key 无法通过端点认证，请检查 Key 与 Base URL 是否匹配。",
+            "last_error": error_text[:240],
+        }
+    return None
+
+
+def _is_local_llm_config(*, provider: str, base_url: str | None) -> bool:
+    if str(provider or "").strip().lower() == "ollama":
+        return True
+    value = str(base_url or "").strip()
+    if not value:
+        return False
+    hostname = urlparse(value).hostname or ""
+    return hostname in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+
+
+def _llm_core_stock_usage_summary(rows: list[dict[str, Any]], *, readiness: dict[str, Any]) -> dict[str, Any]:
+    symbol_source_counts = Counter(str(item.get("symbol_suggestion_source") or "unknown") for item in rows)
+    semantic_source_counts = Counter(str(item.get("semantic_source") or "unknown") for item in rows)
+    llm_symbol_count = sum(
+        1
+        for item in rows
+        if str(item.get("symbol_suggestion_source") or "").startswith("llm:")
+        and bool(item.get("related_symbols"))
+    )
+    llm_no_symbol_count = sum(
+        1
+        for item in rows
+        if str(item.get("symbol_suggestion_source") or "").startswith("llm:")
+        and not bool(item.get("related_symbols"))
+    )
+    llm_semantic_count = sum(
+        1
+        for item in rows
+        if str(item.get("semantic_source") or "").startswith("llm:")
+    )
+    return {
+        **readiness,
+        "used_symbol_theme_count": llm_symbol_count,
+        "no_symbol_theme_count": llm_no_symbol_count,
+        "used_semantic_theme_count": llm_semantic_count,
+        "symbol_source_counts": dict(symbol_source_counts),
+        "semantic_source_counts": dict(semantic_source_counts),
     }
 
 
@@ -942,11 +1706,15 @@ _CORE_STOCK_SYSTEM_PROMPT = """你是A股主题投研助手。你需要根据利
 
 要求：
 1. 只输出JSON，不要输出Markdown或解释。
-2. 输出格式：{"items":[{"theme":"人工智能","symbols":[{"symbol":"603019.SH","name":"中科曙光","reason":"算力基础设施核心受益"}]}]}
+2. 输出格式：{"items":[{"theme":"人工智能","event_type":"政策支持","catalyst_strength":85,"beneficiary_chain":["算力基础设施","AI服务器"],"invalidation_conditions":["政策落地低于预期"],"risk_signals":["高位拥挤"],"confidence":0.78,"reasoning":"政策明确支持AI基础设施","symbols":[{"symbol":"603019.SH","name":"中科曙光","reason":"算力基础设施核心受益"}]}]}
 3. 只能推荐A股股票，symbol必须使用 .SH/.SZ/.BJ 后缀。
 4. 不要把券商、基金、期货、媒体、交易所、海外公司或研报发布方当成受益标的。
 5. 每个主题最多8只，优先核心龙头、产业链直接受益、政策明确指向或证据中提及的标的。
-6. 如果证据不足以支撑具体标的，symbols返回空数组。"""
+6. 如果证据不足以支撑具体标的，symbols返回空数组；但仍需给出事件类型、强度、受益链条和失效条件。
+7. catalyst_strength 为0-100，confidence 为0-1。
+8. historical_feedback 是历史结算反馈；learned_score、hit_rate、confidence 高的方向可以提高置信，低分或低命中的方向要降低强度、减少标的或写入风险，但不能覆盖当前证据。
+9. 每只股票的 reason 必须说明它与 beneficiary_chain 或当前证据的直接受益关系；说不清直接受益链条就不要输出该股票。
+10. 避免泛科技、泛通信、媒体平台、研报发布方等弱相关标的；只有在证据或受益链明确支持时才给具体股票。"""
 
 
 def _invoke_core_stock_llm(config: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
@@ -1028,11 +1796,142 @@ def _normalize_core_stock_suggestions(payload: dict[str, Any]) -> dict[str, list
             if theme != "金融" and any(token in str(name) for token in ("证券", "期货", "基金")):
                 continue
             seen.add(symbol)
-            items.append({"symbol": symbol, "name": str(name)})
+            payload = {"symbol": symbol, "name": str(name)}
+            reason = str(stock.get("reason") or stock.get("rationale") or stock.get("logic") or "").strip()
+            if reason:
+                payload["reason"] = reason[:180]
+            items.append(payload)
             if len(items) >= LLM_SYMBOL_PER_THEME_LIMIT:
                 break
         normalized[theme] = items
     return normalized
+
+
+def _normalize_event_semantics(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    rows = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return {}
+    normalized: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        theme = str(row.get("theme") or "").strip()
+        if not theme:
+            continue
+        normalized[theme] = _normalize_event_semantic_payload(row)
+    return normalized
+
+
+def _normalize_event_semantic_payload(row: dict[str, Any]) -> dict[str, Any]:
+    strength = _bounded_float(row.get("catalyst_strength"), default=50.0, low=0.0, high=100.0)
+    confidence = _bounded_float(row.get("confidence"), default=0.5, low=0.0, high=1.0)
+    return {
+        "event_type": str(row.get("event_type") or row.get("type") or "事件催化").strip()[:40],
+        "catalyst_strength": round(strength, 2),
+        "beneficiary_chain": _dedupe_strings(row.get("beneficiary_chain") or row.get("benefit_chain") or [])[:8],
+        "invalidation_conditions": _dedupe_strings(row.get("invalidation_conditions") or row.get("invalidations") or [])[:8],
+        "risk_signals": _dedupe_strings(row.get("risk_signals") or row.get("risks") or [])[:8],
+        "confidence": round(confidence, 4),
+        "reasoning": str(row.get("reasoning") or row.get("reason") or "").strip()[:220],
+    }
+
+
+def _merge_event_semantics(
+    ranking: list[dict[str, Any]],
+    event_semantics: dict[str, dict[str, Any]],
+    *,
+    source: str,
+) -> list[dict[str, Any]]:
+    if not event_semantics:
+        return ranking
+    for item in ranking:
+        theme = str(item.get("theme") or "")
+        semantic = event_semantics.get(theme)
+        if not isinstance(semantic, dict):
+            continue
+        normalized = _normalize_event_semantic_payload(semantic)
+        item["event_semantic"] = normalized
+        item["semantic_source"] = source
+        strength = _bounded_float(normalized.get("catalyst_strength"), default=50.0, low=0.0, high=100.0)
+        confidence = _bounded_float(normalized.get("confidence"), default=0.5, low=0.0, high=1.0)
+        item["score"] = round(max(0.0, float(item.get("score") or 0.0) + (strength - 50.0) * confidence * 0.12), 2)
+        if normalized.get("reasoning"):
+            item["catalyst"] = str(normalized["reasoning"])[:140]
+        if normalized.get("risk_signals") or normalized.get("invalidation_conditions"):
+            item["risk_note"] = "；".join([*(normalized.get("risk_signals") or []), *(normalized.get("invalidation_conditions") or [])][:3])
+    return ranking
+
+
+def _heuristic_event_semantic(
+    *,
+    theme: str,
+    evidence: list[dict[str, Any]],
+    catalyst: str,
+    summary: str,
+    policy_boost: bool,
+    consensus_rate: float | None,
+    negative_count: int,
+    crowding_risk: str | None,
+    risk_note: str | None,
+) -> dict[str, Any]:
+    text_value = " ".join([theme, catalyst or "", summary or "", " ".join(str(item.get("content") or "") for item in evidence)])
+    if policy_boost:
+        event_type = "政策支持"
+    elif any(token in text_value for token in ("中标", "签约", "订单")):
+        event_type = "订单兑现"
+    elif any(token in text_value for token in ("获批", "认证", "牌照")):
+        event_type = "资质获批"
+    elif any(token in text_value for token in ("量产", "发布", "新品", "突破")):
+        event_type = "产业进展"
+    elif any(token in text_value for token in ("涨价", "供需", "库存")):
+        event_type = "供需改善"
+    else:
+        event_type = "消息催化"
+
+    strength = 42.0
+    if policy_boost:
+        strength += 18.0
+    strength += min(len(evidence) * 4.0, 16.0)
+    if consensus_rate is not None and consensus_rate >= 0.8:
+        strength += 8.0
+    if any(token in text_value for token in STRONG_POSITIVE_KEYWORDS):
+        strength += 10.0
+    strength -= min(max(negative_count, 0) * 4.0, 16.0)
+
+    risk_signals: list[str] = []
+    invalidations: list[str] = []
+    if crowding_risk:
+        risk_signals.append(str(crowding_risk))
+    if risk_note:
+        risk_signals.append(str(risk_note))
+    if negative_count:
+        invalidations.append("后续负面消息继续增加")
+    if policy_boost:
+        invalidations.append("政策落地节奏低于预期")
+    if any(token in text_value for token in ("小作文", "传闻", "据传", "网传")):
+        invalidations.append("消息被澄清或缺少权威来源")
+
+    aliases = THEME_CATALOG.get(theme, {}).get("aliases") or (theme,)
+    beneficiary_chain = _dedupe_strings([theme, *aliases])[:5]
+    return {
+        "event_type": event_type,
+        "catalyst_strength": round(max(0.0, min(strength, 100.0)), 2),
+        "beneficiary_chain": beneficiary_chain,
+        "invalidation_conditions": _dedupe_strings(invalidations)[:6],
+        "risk_signals": _dedupe_strings(risk_signals)[:6],
+        "confidence": round(min(0.95, 0.35 + len(evidence) * 0.08 + (0.16 if policy_boost else 0.0)), 4),
+        "reasoning": catalyst or summary or f"{theme}出现消息催化",
+    }
+
+
+def _bounded_float(value: Any, *, default: float, low: float, high: float) -> float:
+    try:
+        number = float(value)
+    except Exception:
+        number = default
+    if math.isnan(number) or math.isinf(number):
+        number = default
+    return max(low, min(number, high))
 
 
 def _resolve_llm_stock_symbol(
@@ -1065,9 +1964,67 @@ def _merge_core_stock_suggestions(
         theme = str(item.get("theme") or "")
         if theme not in suggestions:
             continue
-        item["related_symbols"] = suggestions.get(theme) or []
-        item["symbol_suggestion_source"] = source
+        accepted: list[dict[str, str]] = []
+        rejected: list[dict[str, str]] = []
+        for stock in suggestions.get(theme) or []:
+            if not isinstance(stock, dict):
+                continue
+            public_stock = {
+                "symbol": str(stock.get("symbol") or "").strip().upper(),
+                "name": str(stock.get("name") or "").strip(),
+            }
+            if not public_stock["symbol"] or not public_stock["name"]:
+                continue
+            if _llm_core_stock_suggestion_supported(item, stock):
+                accepted.append(public_stock)
+            else:
+                rejected.append(
+                    {
+                        **public_stock,
+                        "reason": str(stock.get("reason") or "").strip()[:120],
+                    }
+                )
+        if accepted:
+            item["related_symbols"] = accepted
+            item["symbol_suggestion_source"] = source
+        else:
+            item["related_symbols"] = []
+            item["symbol_suggestion_source"] = f"{source}:no_symbols"
+        if rejected:
+            item["llm_symbol_rejections"] = rejected[:8]
     return ranking
+
+
+def _llm_core_stock_suggestion_supported(theme_item: dict[str, Any], stock: dict[str, str]) -> bool:
+    theme = str(theme_item.get("theme") or "").strip()
+    name = str(stock.get("name") or "").strip()
+    symbol = str(stock.get("symbol") or "").strip().upper()
+    if not theme or not symbol:
+        return False
+    if theme != "金融" and any(token in name for token in ("证券", "期货", "基金")):
+        return False
+
+    reason = str(stock.get("reason") or "").strip()
+    if not reason:
+        # Older cached/model responses may not include a reason. Keep them
+        # usable, while the prompt now requires reasons for new generations.
+        return True
+
+    raw_tags = [str(tag) for tag in (theme_item.get("raw_tags") or []) if str(tag).strip()]
+    aliases = _theme_relevance_aliases(theme, raw_tags)
+    semantic = theme_item.get("event_semantic") if isinstance(theme_item.get("event_semantic"), dict) else {}
+    aliases.extend(str(item) for item in (semantic.get("beneficiary_chain") or []) if str(item).strip())
+    aliases = _dedupe_strings(alias for alias in aliases if len(str(alias or "").strip()) >= 2)
+
+    evidence_text = " ".join(
+        str(row.get("content") or "")
+        for row in (theme_item.get("evidence_items") or [])
+        if isinstance(row, dict)
+    )
+    symbol_code = symbol.split(".", 1)[0]
+    if _symbol_appears_in_text(symbol=symbol, symbol_code=symbol_code, name=name, text_value=evidence_text):
+        return True
+    return any(_theme_alias_has_valid_match(theme, alias, reason) for alias in aliases)
 
 
 def _row_to_theme_events(row: Any, *, now: datetime) -> list[ThemeEvent]:
@@ -1461,6 +2418,7 @@ def _persist_ranking_snapshot(
     window_end: datetime,
     snapshot_date: str,
 ) -> None:
+    _advisory_xact_lock(db, _snapshot_lock_id(snapshot_date=snapshot_date, window=window))
     now = _iso(_now_cn_naive())
     db.execute(
         text(
@@ -1492,14 +2450,16 @@ def _persist_ranking_snapshot(
                     snapshot_id, snapshot_date, window_label, window_start, window_end,
                     theme, parent_theme, rank, score, message_count, positive_count, negative_count,
                     consensus_rate, source_tier, policy_boost, disagreement_level, crowding_risk,
-                    related_symbols_json, raw_tags_json, evidence_items_json, summary, catalyst, risk_note,
+                    related_symbols_json, raw_tags_json, evidence_items_json, event_semantic_json, semantic_source,
+                    summary, catalyst, risk_note,
                     created_at, updated_at
                 )
                 VALUES (
                     :snapshot_id, :snapshot_date, :window_label, :window_start, :window_end,
                     :theme, :parent_theme, :rank, :score, :message_count, :positive_count, :negative_count,
                     :consensus_rate, :source_tier, :policy_boost, :disagreement_level, :crowding_risk,
-                    :related_symbols_json, :raw_tags_json, :evidence_items_json, :summary, :catalyst, :risk_note,
+                    :related_symbols_json, :raw_tags_json, :evidence_items_json, :event_semantic_json, :semantic_source,
+                    :summary, :catalyst, :risk_note,
                     :created_at, :updated_at
                 )
                 """
@@ -1525,6 +2485,8 @@ def _persist_ranking_snapshot(
                 "related_symbols_json": json.dumps(item.get("related_symbols") or [], ensure_ascii=False),
                 "raw_tags_json": json.dumps(item.get("raw_tags") or [], ensure_ascii=False),
                 "evidence_items_json": json.dumps(item.get("evidence_items") or [], ensure_ascii=False),
+                "event_semantic_json": json.dumps(item.get("event_semantic") or {}, ensure_ascii=False),
+                "semantic_source": item.get("semantic_source"),
                 "summary": item.get("summary"),
                 "catalyst": item.get("catalyst"),
                 "risk_note": item.get("risk_note"),
@@ -1562,6 +2524,31 @@ def _persist_ranking_snapshot(
             )
 
 
+def _snapshot_lock_id(*, snapshot_date: str, window: str) -> int:
+    raw = f"{snapshot_date}|{window}".encode("utf-8")
+    return int(hashlib.sha256(raw).hexdigest()[:8], 16) & 0x7FFFFFFF
+
+
+def _llm_cache_lock_id(cache_key: str) -> int:
+    return (int(hashlib.sha256(str(cache_key).encode("utf-8")).hexdigest()[:8], 16) % 2_147_482_000) + 1000
+
+
+def _advisory_xact_lock(db: Session, lock_id: int) -> None:
+    try:
+        bind = db.get_bind()
+    except Exception:
+        return
+    if getattr(getattr(bind, "dialect", None), "name", "") != "postgresql":
+        return
+    db.execute(
+        text("SELECT pg_advisory_xact_lock(:class_id, :lock_id)"),
+        {
+            "class_id": THEME_REFRESH_ADVISORY_LOCK_CLASS,
+            "lock_id": int(lock_id),
+        },
+    )
+
+
 def _snapshot_row_to_payload(row: Any, *, include_evidence: bool) -> dict[str, Any]:
     evidence_items = _loads(row["evidence_items_json"])
     evidence_top_tier = (
@@ -1588,6 +2575,8 @@ def _snapshot_row_to_payload(row: Any, *, include_evidence: bool) -> dict[str, A
         "summary": row["summary"],
         "catalyst": row["catalyst"],
         "risk_note": row["risk_note"],
+        "event_semantic": _loads(row.get("event_semantic_json"), default={}),
+        "semantic_source": row.get("semantic_source") or "heuristic:event_rules",
         "window": row["window_label"],
         "window_start": _iso(row["window_start"]),
         "window_end": _iso(row["window_end"]),

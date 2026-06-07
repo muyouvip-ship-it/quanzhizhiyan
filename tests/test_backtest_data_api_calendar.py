@@ -5,6 +5,20 @@ from datetime import date
 from api import backtest_data_api as target
 
 
+def test_daily_kline_subscription_config_normalizes_hidden_tencent_source() -> None:
+    payload = target._normalize_config_payload(
+        {
+            "data_types": ["daily_kline"],
+            "data_source": "tencent",
+            "date_range_start": "2026-06-05",
+            "date_range_end": "2026-06-05",
+            "auto_update": True,
+        }
+    )
+
+    assert payload["data_source_preference"] == "quantclass"
+
+
 def test_daily_kline_calendar_min_max_uses_physical_tables(monkeypatch) -> None:
     seen_tables: list[str] = []
     ranges = {

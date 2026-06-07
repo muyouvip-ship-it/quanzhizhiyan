@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from api.database import UserDB, get_db
+from api.database import SessionLocal, UserDB, get_db
 from api.deps import require_web_user
 from api.schemas.config import (
     UserRuntimeConfigResponse,
@@ -18,6 +19,87 @@ from api.schemas.config import (
 from api.services import auth_service
 
 router = APIRouter(prefix="/v1", tags=["Config"])
+logger = logging.getLogger(__name__)
+
+_LLM_EVENT_REFRESH_FIELDS = {
+    "llm_provider",
+    "backend_url",
+    "quick_think_llm",
+    "deep_think_llm",
+    "news_llm_provider",
+    "news_backend_url",
+    "news_analysis_llm",
+    "api_key",
+    "news_api_key",
+    "clear_api_key",
+    "clear_news_api_key",
+}
+
+
+def _llm_config_update_requested(updates: UserRuntimeConfigUpdateRequest) -> bool:
+    payload = updates.model_dump()
+    for key in _LLM_EVENT_REFRESH_FIELDS:
+        value = payload.get(key)
+        if key in {"clear_api_key", "clear_news_api_key"}:
+            if value:
+                return True
+            continue
+        if value is not None:
+            return True
+    return False
+
+
+def _build_event_selection_refresh_state(
+    db: Session,
+    *,
+    user_id: str,
+    updates: UserRuntimeConfigUpdateRequest,
+) -> dict:
+    requested = _llm_config_update_requested(updates)
+    base = {
+        "requested": requested,
+        "triggered": False,
+        "status": "skipped",
+        "reason": "non_llm_config_change",
+        "windows": ["premarket", "24h"],
+    }
+    if not requested:
+        return base
+
+    from api.services import news_theme_service
+
+    readiness = news_theme_service.core_stock_llm_readiness(db, user_id=user_id)
+    if not readiness.get("ready"):
+        return {
+            **base,
+            "reason": readiness.get("status") or "llm_not_ready",
+            "llm_core_stock": readiness,
+        }
+    return {
+        **base,
+        "triggered": True,
+        "status": "scheduled",
+        "reason": "llm_ready",
+        "llm_core_stock": readiness,
+    }
+
+
+def _run_event_driven_selection_refresh(user_id: str) -> None:
+    from api.services import catalyst_selection_service
+
+    db = SessionLocal()
+    try:
+        catalyst_selection_service.refresh_event_driven_selection(
+            db,
+            trigger="config:llm-updated",
+            windows=("premarket", "24h"),
+            limit=10,
+            user_id=user_id,
+        )
+    except Exception:
+        logger.exception("[config] event-driven catalyst refresh failed after LLM config update")
+    finally:
+        db.close()
 
 
 @router.get("/config", response_model=UserRuntimeConfigResponse)
@@ -82,11 +164,24 @@ def update_runtime_config(
         persistent_user.wecom_report_enabled = updates.wecom_report_enabled
     db.commit()
 
+    if _llm_config_update_requested(updates):
+        from api.services import news_theme_service
+
+        news_theme_service.clear_core_stock_llm_error_cache(db)
+        db.commit()
+
     current_cfg = compat._config_response_for_user(persistent_user, db)
     warmup_models = compat._warmup_model_names(current_cfg.model_dump())
     should_warmup = compat._should_trigger_config_warmup(before_cfg, current_cfg, updates)
     if should_warmup:
         background_tasks.add_task(compat._run_config_warmup, pending_cfg, persistent_user.id)
+    event_selection_refresh = _build_event_selection_refresh_state(
+        db,
+        user_id=persistent_user.id,
+        updates=updates,
+    )
+    if event_selection_refresh.get("triggered"):
+        background_tasks.add_task(_run_event_driven_selection_refresh, persistent_user.id)
 
     applied = {
         key: value
@@ -100,13 +195,13 @@ def update_runtime_config(
         "applied": applied,
         "current": current_cfg,
         "has_api_key": bool(row.api_key_encrypted),
-        "has_news_api_key": bool(getattr(row, "news_api_key_encrypted", None)),
         "warmup": {
             "requested": bool(updates.warmup or updates.force_warmup),
             "triggered": bool(should_warmup),
             "status": "scheduled" if should_warmup else "skipped",
             "models": warmup_models,
         },
+        "event_driven_selection": event_selection_refresh,
     }
 
 

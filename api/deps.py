@@ -12,22 +12,43 @@ from api.database import UserDB, get_db_ctx
 from api.services import auth_service, token_service
 
 _auth_scheme = HTTPBearer(auto_error=False)
-_DEV_ACCESS_TOKEN = "dev-test-token-001"
-_DEV_USER_ID = "test-user-001"
-_DEV_USER_EMAIL = "test@example.com"
+# Dev-only defaults – only active when APP_ENV != "production"
+_DEFAULT_DEV_ACCESS_TOKEN = os.getenv("TA_DEV_ACCESS_TOKEN", "dev-test-token-001")
+_DEFAULT_DEV_USER_ID = os.getenv("TA_DEV_USER_ID", "test-user-001")
+_DEFAULT_DEV_USER_EMAIL = os.getenv("TA_DEV_USER_EMAIL", "test@example.com")
 
 
 def _is_dev_mode() -> bool:
     return os.getenv("APP_ENV", "development").lower() != "production"
 
 
+def _dev_access_token() -> str:
+    return os.getenv("TA_DEV_ACCESS_TOKEN", _DEFAULT_DEV_ACCESS_TOKEN).strip() or _DEFAULT_DEV_ACCESS_TOKEN
+
+
+def _dev_user_email() -> str:
+    return os.getenv("TA_DEV_USER_EMAIL", _DEFAULT_DEV_USER_EMAIL).strip().lower() or _DEFAULT_DEV_USER_EMAIL
+
+
+def _explicit_dev_user_id() -> Optional[str]:
+    value = os.getenv("TA_DEV_USER_ID")
+    return value.strip() if value and value.strip() else None
+
+
 def _resolve_dev_user(db) -> UserDB:
     now = datetime.now(timezone.utc)
-    user = auth_service.get_user_by_id(db, _DEV_USER_ID) or auth_service.get_user_by_email(db, _DEV_USER_EMAIL)
+    dev_email = _dev_user_email()
+    dev_user_id = _explicit_dev_user_id()
+    if dev_user_id:
+        user = auth_service.get_user_by_id(db, dev_user_id) or auth_service.get_user_by_email(db, dev_email)
+        create_user_id = dev_user_id
+    else:
+        user = auth_service.get_user_by_email(db, dev_email)
+        create_user_id = _DEFAULT_DEV_USER_ID if dev_email == _DEFAULT_DEV_USER_EMAIL else str(uuid4())
     if user is None:
         user = UserDB(
-            id=_DEV_USER_ID or str(uuid4()),
-            email=_DEV_USER_EMAIL,
+            id=create_user_id,
+            email=dev_email,
             is_active=True,
             created_at=now,
             updated_at=now,
@@ -36,8 +57,8 @@ def _resolve_dev_user(db) -> UserDB:
         )
         db.add(user)
     else:
-        user.id = user.id or _DEV_USER_ID
-        user.email = user.email or _DEV_USER_EMAIL
+        user.id = user.id or create_user_id
+        user.email = user.email or dev_email
         user.is_active = True
         user.updated_at = now
         user.last_login_at = now
@@ -56,7 +77,7 @@ class RequireUser:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="请先登录")
         token = credentials.credentials
         with get_db_ctx() as db:
-            if _is_dev_mode() and token == _DEV_ACCESS_TOKEN:
+            if _is_dev_mode() and token == _dev_access_token():
                 return _resolve_dev_user(db)
             try:
                 payload = auth_service.decode_access_token(token)

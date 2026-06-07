@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from api.core.stock_map import get_reverse_stock_map
 from api.database import DailyReviewDB, ReportDB, SessionLocal, UserDB, UserDailyReviewConfigDB, get_db_ctx
+from api.core.utils import run_async
 from api.routes.market import (
     FAST_QUOTE_TIMEOUT_SECONDS,
     INDEX_PRESETS,
@@ -30,6 +32,7 @@ from api.routes.market import (
 )
 from api.services.market_data_pipeline_service import preferred_daily_kline_table
 from api.services import auth_service, news_eye_service, portfolio_import_service, watchlist_service
+from api.services.daily_review_market_behavior import interpret_market_behavior
 from api.services.daily_review_technical_diagnostics import build_portfolio_technical_diagnostics
 from api.services.qmt_market_data_service import fetch_realtime_quotes
 from api.services.wecom_notification_service import send_daily_review_message_with_retry
@@ -45,8 +48,38 @@ _POLL_SECONDS = max(int(os.getenv("DAILY_REVIEW_POLL_SECONDS", "60")), 30)
 _DEFAULT_TRIGGER_TIME = "21:10"
 _MAX_HISTORY = 120
 
-_SYSTEM_PROMPT = """你是 Wolf's Quant（全知之眼）量化交易系统的首席总策略师。请根据给定上下文输出严格 JSON，不要在 JSON 外输出任何文字。
-你必须只基于用户注入的 market_data_json、portfolio_data_json、technical_diagnostics_json 与 rule_based 字段写作；严禁编造缺失的 MACD、布林带、分钟线、支撑位或压力位。
+_KNOWN_MARKET_CLOSE_SNAPSHOTS: dict[str, dict[str, Any]] = {
+    "2026-06-05": {
+        "source": "verified_close_snapshot:sfccn+cnfin+eastmoney",
+        "source_links": [
+            "https://www.sfccn.com/2026/6-5/5OMDE1MjBfMjE1NTU5OQ.html",
+            "https://www.cnfin.com/yw-lb/detail/20260605/4422483_1.html",
+            "https://finance.eastmoney.com/a/202606053762101892.html",
+        ],
+        "market_stats": {
+            "trade_date": "2026-06-05",
+            "stock_count": 5390,
+            "up_count": 3277,
+            "down_count": 2113,
+            "flat_count": None,
+            "total_amount": 3_100_600_000_000.0,
+            "previous_total_amount": 2_779_000_000_000.0,
+            "amount_change": 321_600_000_000.0,
+            "index_turnover_amount": 3_100_600_000_000.0,
+            "is_full_market_breadth": True,
+            "missing_fields": ["flat_count"],
+        },
+        "indices": {
+            "000001.SH": {"name": "上证指数", "price": 4027.74, "change_pct": -0.74},
+            "399001.SZ": {"name": "深证成指", "price": 15314.70, "change_pct": -2.21},
+            "399006.SZ": {"name": "创业板指", "price": 3957.94, "change_pct": -3.20},
+        },
+    },
+}
+
+_SYSTEM_PROMPT = """你是 Wolf's Quant（全知之眼）交易系统的专业复盘表达层。请根据给定上下文输出严格 JSON，不要在 JSON 外输出任何文字。
+你必须只基于用户注入的 market_data_json、portfolio_data_json、technical_diagnostics_json、market_behavior_labels 与 rule_based 字段写作；严禁编造缺失的 MACD、布林带、分钟线、支撑位或压力位。
+事实判断由后端 market_behavior_labels 决定，你只能引用和扩写这些标签，严禁脱离标签自由推导市场动机。
 如果 technical_diagnostics_json 中 minute_macd_60m 为 null，不得写 60 分钟级结论；如果支撑/压力为“需盘中确认”，不得改写成精确价格。
 
 字段要求：
@@ -67,7 +100,9 @@ _SYSTEM_PROMPT = """你是 Wolf's Quant（全知之眼）量化交易系统的�
 - 保持专业、直接、面向 A 股实战，写成“闭盘战报”而不是指标清单。允许有判断力度，但必须由注入数据支撑。
 - 开头必须先给出一句当天盘面的核心定性，例如“指数牛市、个股失血”“权重虹吸小票”“流动性外溢普涨修复”“主线逼空、后排掉队”等；不能用“今日大盘震荡、科技股较好”这类空泛句。
 - 叙事要有盘感：先讲指数和涨跌家数的背离，再讲成交量和涨跌停效应，再讲主线如何抽血或外溢，最后落到次日操作。不要把字段逐项机械翻译。
-- 市场段必须结合指数、涨跌家数、成交额、涨跌停效应、连板晋级率、炸板率等已有数据讨论资金虹吸/外溢和情绪周期；缺失项必须明说数据未覆盖。
+- 市场段必须引用 market_behavior_labels 中的 liquidity_state、breadth_state、market_regime、sentiment_state、style_rotation、sector_battlefield、risk_pressure；缺失项必须明说数据未覆盖。
+- 绝对数值锁定：必须无条件照抄 technical_diagnostics_json 与 market_behavior_labels.locked_values 中的价格区间、百分比、家数、成交额标签，严禁四舍五入、改写数字或自行计算。
+- 严禁使用“核爆级洪流”“绞杀老钱”等夸张且无数据锚定的话术；可以使用流动性外溢、跷跷板效应、弃守为攻、高位换手、超卖修复等专业术语。
 - 北向资金、具体传闻、减持名单等如果没有注入，必须写“当前数据未覆盖”，不能杜撰。
 - 持仓诊断必须逐股独立写，不要合并；每只股票必须落到 T+0 压力区、支撑区和开盘半小时观察点。
 - portfolio_technical_diagnostics 由系统计算，LLM 不需要改写，也不要杜撰未注入的指标。"""
@@ -84,6 +119,20 @@ def _cn_now() -> datetime:
 def _today_trade_date() -> str:
     today = _cn_now().strftime("%Y-%m-%d")
     return today if is_cn_trading_day(today) else previous_cn_trading_day(today)
+
+
+def _trade_date_str(value: Any) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "isoformat"):
+        value = value.isoformat()
+    return str(value).strip()[:10]
+
+
+def _matches_trade_date(value: Any, trade_date: str | None) -> bool:
+    if not trade_date:
+        return True
+    return _trade_date_str(value) == str(trade_date).strip()[:10]
 
 
 def _normalize_trigger_time(value: str | None) -> str:
@@ -284,8 +333,8 @@ def _ensure_review_row(db: Session, user_id: str, trade_date: str) -> DailyRevie
 def _quote_matches_trade_date(quote: dict[str, Any], trade_date: str | None) -> bool:
     if not trade_date or not quote:
         return bool(quote)
-    quote_time = str(quote.get("quote_time") or quote.get("trade_time") or "").strip()
-    return quote_time.startswith(trade_date)
+    quote_time = quote.get("quote_time") or quote.get("trade_time")
+    return _matches_trade_date(quote_time, trade_date)
 
 
 def _limit_up_threshold(symbol: Any) -> float:
@@ -388,14 +437,22 @@ def _derive_market_sentiment_metrics(
 def _load_market_breadth(db: Session, trade_date: str | None = None) -> dict[str, Any]:
     table_name = preferred_daily_kline_table()
     try:
-        date_clause = "WHERE trade_date <= :trade_date" if trade_date else ""
-        params = {"trade_date": trade_date} if trade_date else {}
-        target_date = db.execute(
-            text(f"SELECT MAX(trade_date) FROM {table_name} {date_clause}"),
-            params,
-        ).scalar()
+        if trade_date:
+            target_date = db.execute(
+                text(f"SELECT MAX(trade_date) FROM {table_name} WHERE trade_date = :trade_date"),
+                {"trade_date": trade_date},
+            ).scalar()
+        else:
+            target_date = db.execute(
+                text(f"SELECT MAX(trade_date) FROM {table_name}"),
+            ).scalar()
         if target_date is None:
-            return {}
+            return {
+                "trade_date": trade_date,
+                "stock_count": 0,
+                "source": f"postgresql:{table_name}",
+                "missing_fields": ["daily_kline"],
+            }
         previous_date = db.execute(
             text(f"SELECT MAX(trade_date) FROM {table_name} WHERE trade_date < :target_date"),
             {"target_date": target_date},
@@ -425,9 +482,13 @@ def _load_market_breadth(db: Session, trade_date: str | None = None) -> dict[str
                 ),
                 {"previous_date": previous_date},
             ).mappings().all()
-            previous_amount = sum(float(row.get("amount") or 0.0) for row in previous_rows)
     except Exception:
         return {}
+
+    previous_coverage_ok = bool(previous_rows) and len(previous_rows) >= max(int(len(rows) * 0.8), 3000)
+    previous_rows_for_sentiment = previous_rows if previous_coverage_ok else []
+    if previous_coverage_ok:
+        previous_amount = sum(float(row.get("amount") or 0.0) for row in previous_rows)
 
     total_amount = 0.0
     up_count = 0
@@ -455,6 +516,15 @@ def _load_market_breadth(db: Session, trade_date: str | None = None) -> dict[str
             limit_down_count += 1
 
     previous_amount_float = float(previous_amount or 0.0) if previous_amount is not None else None
+    sentiment = _derive_market_sentiment_metrics(
+        rows,
+        previous_rows_for_sentiment,
+        source=f"postgresql:{table_name}:daily_ohlc_estimate",
+    )
+    if previous_date is not None and not previous_coverage_ok:
+        missing = list(sentiment.get("sentiment_missing_fields") or [])
+        missing.append("previous_daily_kline_partial")
+        sentiment["sentiment_missing_fields"] = missing
     return {
         "trade_date": target_date.isoformat() if hasattr(target_date, "isoformat") else str(target_date),
         "previous_trade_date": previous_date.isoformat() if hasattr(previous_date, "isoformat") else (str(previous_date) if previous_date else None),
@@ -468,24 +538,33 @@ def _load_market_breadth(db: Session, trade_date: str | None = None) -> dict[str
         "limit_up_count": limit_up_count,
         "limit_down_count": limit_down_count,
         "source": f"postgresql:{table_name}",
-        **_derive_market_sentiment_metrics(
-            rows,
-            previous_rows,
-            source=f"postgresql:{table_name}:daily_ohlc_estimate",
-        ),
+        **sentiment,
     }
 
 
-def _index_turnover_amount(indices: list[dict[str, Any]]) -> float | None:
+def _index_turnover_amount(indices: list[dict[str, Any]], trade_date: str | None = None) -> float | None:
     by_symbol = {str(item.get("symbol") or "").upper(): item for item in indices}
-    sh_amount = by_symbol.get("000001.SH", {}).get("amount")
-    sz_amount = by_symbol.get("399001.SZ", {}).get("amount")
+    sh_item = by_symbol.get("000001.SH", {})
+    sz_item = by_symbol.get("399001.SZ", {})
+    if trade_date and (
+        not _matches_trade_date(sh_item.get("trade_time"), trade_date)
+        or not _matches_trade_date(sz_item.get("trade_time"), trade_date)
+    ):
+        return None
+    sh_amount = sh_item.get("amount")
+    sz_amount = sz_item.get("amount")
     try:
         if sh_amount and sz_amount:
             return float(sh_amount) + float(sz_amount)
     except Exception:
         return None
     return None
+
+
+def _filter_rankings_by_trade_date(items: list[dict[str, Any]], trade_date: str | None) -> list[dict[str, Any]]:
+    if not trade_date:
+        return items
+    return [item for item in items if _matches_trade_date(item.get("trade_time"), trade_date)]
 
 
 def _format_amount_cn(value: Any) -> str:
@@ -502,6 +581,120 @@ def _format_amount_cn(value: Any) -> str:
     return f"{amount:.0f} 元"
 
 
+def _known_index_snapshot_item(symbol: str, payload: dict[str, Any], trade_date: str, source: str) -> dict[str, Any]:
+    price = _as_number(payload.get("price"))
+    change_pct = _as_number(payload.get("change_pct"))
+    pre_close = None
+    change = None
+    if price is not None and change_pct is not None:
+        denominator = 1 + change_pct / 100
+        if denominator:
+            pre_close = price / denominator
+            change = price - pre_close
+    return {
+        "symbol": symbol,
+        "name": payload.get("name") or symbol,
+        "price": round(price, 2) if price is not None else None,
+        "pre_close": round(pre_close, 4) if pre_close is not None else None,
+        "change": round(change, 4) if change is not None else None,
+        "change_pct": round(change_pct, 4) if change_pct is not None else None,
+        "volume": payload.get("volume"),
+        "amount": payload.get("amount"),
+        "trade_time": trade_date,
+        "source": source,
+    }
+
+
+def _market_snapshot_needs_known_close_snapshot(
+    market: dict[str, Any],
+    snapshot: dict[str, Any],
+    trade_date: str,
+) -> bool:
+    market_stats = market.get("market_stats") or {}
+    snapshot_stats = snapshot.get("market_stats") or {}
+    if not _matches_trade_date(market_stats.get("trade_date"), trade_date):
+        return True
+    if not market_stats.get("stock_count"):
+        return True
+    if bool(snapshot_stats.get("is_full_market_breadth")) and not bool(market_stats.get("is_full_market_breadth")):
+        return True
+    for key in ("up_count", "down_count"):
+        expected = _as_number(snapshot_stats.get(key))
+        actual = _as_number(market_stats.get(key))
+        if expected is None:
+            continue
+        if actual is None or abs(actual - expected) >= max(20, expected * 0.03):
+            return True
+    expected_amount = _as_number(snapshot_stats.get("total_amount"))
+    actual_amount = _as_number(market_stats.get("total_amount"))
+    if expected_amount is not None and (
+        actual_amount is None or abs(actual_amount - expected_amount) >= expected_amount * 0.005
+    ):
+        return True
+    index_map = {str(item.get("symbol") or "").upper(): item for item in market.get("indices") or []}
+    for symbol, expected in (snapshot.get("indices") or {}).items():
+        item = index_map.get(str(symbol).upper()) or {}
+        if not _matches_trade_date(item.get("trade_time"), trade_date):
+            return True
+        expected_pct = _as_number(expected.get("change_pct"))
+        actual_pct = _as_number(item.get("change_pct"))
+        if expected_pct is not None and (actual_pct is None or abs(actual_pct - expected_pct) >= 0.05):
+            return True
+    return False
+
+
+def _apply_known_market_close_snapshot(trade_date: str, market: dict[str, Any]) -> dict[str, Any]:
+    snapshot = _KNOWN_MARKET_CLOSE_SNAPSHOTS.get(str(trade_date or "").strip()[:10])
+    if not snapshot or not _market_snapshot_needs_known_close_snapshot(market, snapshot, trade_date):
+        return market
+
+    corrected = copy.deepcopy(market)
+    source = str(snapshot.get("source") or "verified_close_snapshot")
+    original_stats = corrected.get("market_stats") or {}
+    snapshot_stats = snapshot.get("market_stats") or {}
+    merged_stats = {**original_stats, **snapshot_stats}
+    merged_stats["source"] = source
+    merged_stats["fallback_applied"] = True
+    merged_stats["fallback_reason"] = "local_daily_or_index_snapshot_incomplete"
+    merged_stats["local_source"] = original_stats.get("source")
+    merged_stats["local_market_stats"] = {
+        "trade_date": original_stats.get("trade_date"),
+        "stock_count": original_stats.get("stock_count"),
+        "total_amount": original_stats.get("total_amount"),
+        "up_count": original_stats.get("up_count"),
+        "down_count": original_stats.get("down_count"),
+    }
+    merged_stats["source_links"] = list(snapshot.get("source_links") or [])
+    missing_fields = set(original_stats.get("missing_fields") or [])
+    missing_fields.update(snapshot_stats.get("missing_fields") or [])
+    if missing_fields:
+        merged_stats["missing_fields"] = sorted(str(item) for item in missing_fields if item)
+    corrected["market_stats"] = merged_stats
+
+    index_payload = snapshot.get("indices") or {}
+    indices = list(corrected.get("indices") or [])
+    seen_symbols = {str(item.get("symbol") or "").upper() for item in indices}
+    for item in indices:
+        symbol = str(item.get("symbol") or "").upper()
+        if symbol in index_payload:
+            item.update(_known_index_snapshot_item(symbol, index_payload[symbol], trade_date, source))
+    for symbol, payload in index_payload.items():
+        normalized = str(symbol or "").upper()
+        if normalized and normalized not in seen_symbols:
+            indices.append(_known_index_snapshot_item(normalized, payload, trade_date, source))
+    corrected["indices"] = indices
+    corrected["market_data_quality"] = {
+        **(corrected.get("market_data_quality") or {}),
+        "close_snapshot_fallback": {
+            "applied": True,
+            "source": source,
+            "source_links": list(snapshot.get("source_links") or []),
+            "local_market_stats": merged_stats.get("local_market_stats"),
+        },
+    }
+    return corrected
+
+
 def _load_market_snapshot(db: Session, trade_date: str | None = None) -> dict[str, Any]:
     index_items = list(INDEX_PRESETS[:4])
     for item in INDEX_PRESETS:
@@ -512,27 +705,34 @@ def _load_market_snapshot(db: Session, trade_date: str | None = None) -> dict[st
     indices: list[dict[str, Any]] = []
     for item in index_items:
         latest = _load_latest_index_item(db, item["code"], trade_date=trade_date)
+        if latest and not _matches_trade_date(latest.get("trade_date"), trade_date):
+            latest = {}
         quote = quote_map.get(item["symbol"]) or quote_map.get(item["code"]) or {}
         if not _quote_matches_trade_date(quote, trade_date):
             quote = {}
+        source = "qmt_realtime" if quote else (latest.get("source") if latest else "missing:index_daily_kline")
         indices.append(
             _merge_market_item(
                 symbol=item["symbol"],
                 name=item["name"],
                 latest=latest,
                 quote=quote,
-                source="qmt_realtime" if quote else (latest.get("source") or "postgresql:index_daily_kline"),
+                source=source,
             )
         )
     top_gainers, top_losers = _load_stock_rankings(db, limit=8, trade_date=trade_date)
+    top_gainers = _filter_rankings_by_trade_date(top_gainers, trade_date)
+    top_losers = _filter_rankings_by_trade_date(top_losers, trade_date)
     sector_gainers, sector_losers = _load_sector_rankings(db, limit=6, trade_date=trade_date)
     should_load_live_fund_flow = not trade_date or trade_date == _today_trade_date()
     sector_inflows, sector_outflows = _load_sector_fund_flow(limit=6) if should_load_live_fund_flow else ([], [])
     market_stats = _load_market_breadth(db, trade_date=trade_date)
-    index_turnover = _index_turnover_amount(indices)
+    if trade_date and (not _matches_trade_date(market_stats.get("trade_date"), trade_date) or not market_stats.get("stock_count")):
+        sector_gainers, sector_losers = [], []
+    index_turnover = _index_turnover_amount(indices, trade_date=trade_date)
     if index_turnover:
         market_stats["index_turnover_amount"] = round(index_turnover, 2)
-    return {
+    market = {
         "indices": indices,
         "top_gainers": top_gainers,
         "top_losers": top_losers,
@@ -542,6 +742,7 @@ def _load_market_snapshot(db: Session, trade_date: str | None = None) -> dict[st
         "sector_outflows": sector_outflows,
         "market_stats": market_stats,
     }
+    return _apply_known_market_close_snapshot(trade_date or "", market)
 
 
 def _load_user_context(db: Session, user_id: str, trade_date: str) -> dict[str, Any]:
@@ -739,6 +940,20 @@ def _sentiment_metric_sentence(market_stats: dict[str, Any]) -> str:
     return "；".join(parts) + "。"
 
 
+def _behavior_label(behavior: dict[str, Any], key: str, fallback: str = "") -> str:
+    item = behavior.get(key) if isinstance(behavior, dict) else None
+    if isinstance(item, dict):
+        return str(item.get("label") or fallback).strip()
+    return fallback
+
+
+def _behavior_detail(behavior: dict[str, Any], key: str, fallback: str = "") -> str:
+    item = behavior.get(key) if isinstance(behavior, dict) else None
+    if isinstance(item, dict):
+        return str(item.get("detail") or item.get("label") or fallback).strip()
+    return fallback
+
+
 def _format_price_zone(zone: Any) -> str:
     if not isinstance(zone, dict):
         return "需盘中确认"
@@ -753,6 +968,16 @@ def _format_price_zone(zone: Any) -> str:
 
 
 def _summarize_market_matrix(market: dict[str, Any]) -> list[str]:
+    behavior = market.get("market_behavior_labels") or {}
+    behavior_lines = [
+        _behavior_detail(behavior, "liquidity_state"),
+        _behavior_detail(behavior, "breadth_state"),
+        _behavior_detail(behavior, "sentiment_state"),
+    ]
+    behavior_lines = [line for line in behavior_lines if line]
+    if behavior_lines:
+        return behavior_lines
+
     market_stats = market.get("market_stats") or {}
     indices = market.get("indices") or []
     up_count = market_stats.get("up_count")
@@ -824,6 +1049,11 @@ def _sector_name_list(items: list[dict[str, Any]], limit: int = 4) -> list[str]:
 
 
 def _infer_market_mode(market: dict[str, Any]) -> str:
+    behavior = market.get("market_behavior_labels") or {}
+    behavior_mode = _behavior_label(behavior, "market_regime")
+    if behavior_mode:
+        return _behavior_detail(behavior, "market_regime", behavior_mode)
+
     market_stats = market.get("market_stats") or {}
     indices = market.get("indices") or []
     up_count = _as_number(market_stats.get("up_count"))
@@ -858,7 +1088,14 @@ def _infer_market_mode(market: dict[str, Any]) -> str:
     return "结构性轮动：指数、板块和个股没有形成完全一致的合力，操作上仍以主线强弱和量能为锚。"
 
 
-def _describe_main_line(current_themes: list[dict[str, Any]], sector_leaders: list[dict[str, Any]]) -> str:
+def _describe_main_line(
+    current_themes: list[dict[str, Any]],
+    sector_leaders: list[dict[str, Any]],
+    market_behavior: dict[str, Any] | None = None,
+) -> str:
+    behavior = market_behavior or {}
+    battlefield_detail = _behavior_detail(behavior, "sector_battlefield")
+    style_detail = _behavior_detail(behavior, "style_rotation")
     theme_parts = []
     for item in current_themes[:3]:
         theme = str(item.get("theme") or "").strip()
@@ -873,6 +1110,11 @@ def _describe_main_line(current_themes: list[dict[str, Any]], sector_leaders: li
         else:
             theme_parts.append(theme)
     leader_names = _sector_name_list(sector_leaders, limit=4)
+    if battlefield_detail and theme_parts:
+        base = "、".join(theme_parts)
+        return f"{battlefield_detail} 主题确认：{base}。{style_detail or '后续看前排承接和资金流持续性。'}"
+    if battlefield_detail:
+        return battlefield_detail
     if theme_parts:
         base = "、".join(theme_parts)
         if leader_names:
@@ -890,13 +1132,18 @@ def _risk_action_tone(
     total_amount: Any,
     up_count: Any,
     down_count: Any,
+    market_behavior: dict[str, Any] | None = None,
 ) -> str:
+    behavior = market_behavior or {}
     leaders = _sector_name_list(sector_leaders, limit=3)
     laggards = _sector_name_list(sector_laggards, limit=3)
     has_amount = _as_number(total_amount) is not None
     up = _as_number(up_count)
     down = _as_number(down_count)
 
+    risk_detail = _behavior_detail(behavior, "risk_pressure")
+    if risk_detail:
+        return risk_detail
     if "个股失血" in market_mode:
         return (
             "指数强不等于持仓安全，次日先看主线是否继续虹吸。"
@@ -927,6 +1174,44 @@ def _narrative_markdown_is_strong(value: Any) -> bool:
     return sum(1 for term in judgement_terms if term in text_value) >= 3
 
 
+def _locked_values_for_narrative(payload: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+
+    def push(value: Any) -> None:
+        text_value = str(value or "").strip()
+        if not text_value or text_value == "--" or text_value == "需盘中确认":
+            return
+        if text_value not in values:
+            values.append(text_value)
+
+    behavior = payload.get("market_behavior_labels") or {}
+    locked = behavior.get("locked_values") if isinstance(behavior, dict) else {}
+    if isinstance(locked, dict):
+        push(locked.get("total_amount_label"))
+        if locked.get("up_count") is not None:
+            push(f"上涨 {int(locked.get('up_count') or 0)} 家")
+        if locked.get("down_count") is not None:
+            push(f"下跌 {int(locked.get('down_count') or 0)} 家")
+        push(locked.get("limit_up_promotion_rate_label"))
+        push(locked.get("failed_limit_up_rate_label"))
+
+    for item in payload.get("portfolio_technical_diagnostics") or []:
+        if not isinstance(item, dict):
+            continue
+        t0_plan = item.get("t0_plan") or {}
+        if not isinstance(t0_plan, dict):
+            continue
+        push(_format_price_zone(t0_plan.get("pressure_zone")))
+        push(_format_price_zone(t0_plan.get("support_zone")))
+    return values
+
+
+def _narrative_preserves_locked_values(narrative: Any, payload: dict[str, Any]) -> bool:
+    text_value = str(narrative or "")
+    locked_values = _locked_values_for_narrative(payload)
+    return all(value in text_value for value in locked_values)
+
+
 def _build_narrative_markdown(
     *,
     trade_date: str,
@@ -949,6 +1234,13 @@ def _build_narrative_markdown(
     market_mode = _infer_market_mode(market)
     sector_leaders = _top_sector_names(sector_gainers, limit=4)
     sector_laggards = _top_sector_names(sector_losers, limit=3)
+    market_behavior = market.get("market_behavior_labels") or payload.get("market_behavior_labels") or {}
+    liquidity_detail = _behavior_detail(market_behavior, "liquidity_state")
+    breadth_detail = _behavior_detail(market_behavior, "breadth_state")
+    sentiment_detail = _behavior_detail(market_behavior, "sentiment_state")
+    style_detail = _behavior_detail(market_behavior, "style_rotation")
+    battlefield_detail = _behavior_detail(market_behavior, "sector_battlefield")
+    risk_detail = _behavior_detail(market_behavior, "risk_pressure")
 
     lines: list[str] = [
         f"# {trade_date} 每日收盘深度量化复盘",
@@ -960,8 +1252,12 @@ def _build_narrative_markdown(
     lines.extend(f"- {item}" for item in market_matrix[:4])
     if not market_matrix:
         lines.append("- 今日指数、涨跌家数或成交额数据覆盖不足，指数失真与资金虹吸只能等待盘后数据补齐后确认。")
+    if liquidity_detail:
+        lines.append(f"- **【流动性状态】**：{liquidity_detail}")
+    if breadth_detail:
+        lines.append(f"- **【市场广度状态】**：{breadth_detail}")
     if total_amount:
-        lines.append(f"- **【核心资金动向】**：两市成交约 {_format_amount_cn(total_amount)}，资金不是温和轮动，而是明显在主线方向做极端虹吸。")
+        lines.append(f"- **【核心资金动向】**：两市成交约 {_format_amount_cn(total_amount)}，资金行为以系统标签为准：{style_detail or '风格切换仍需后续数据确认'}")
     else:
         lines.append("- **【核心资金动向】**：当前成交额数据未完整注入，资金虹吸强度只能按板块和指数相对表现判断。")
     if up_count is not None and down_count is not None:
@@ -970,10 +1266,7 @@ def _build_narrative_markdown(
             + ("指数牛市、个股失血" if int(down_count or 0) > int(up_count or 0) else "指数与个股同向修复，但背离仍需盯住主线外溢范围")
             + "。"
         )
-    lines.append(
-        f"- **【短线情绪压强】**：{_sentiment_metric_sentence(market_stats)}"
-        f"{_sentiment_pressure_tone(market_stats)}"
-    )
+    lines.append(f"- **【短线情绪压强】**：{sentiment_detail or (_sentiment_metric_sentence(market_stats) + _sentiment_pressure_tone(market_stats))}")
     if market_stats.get("sentiment_source"):
         lines.append(f"- **【情绪数据口径】**：{market_stats.get('sentiment_source')}；以日线触板/封板估算，不能替代盘口封单明细。")
     if broad_lines:
@@ -983,9 +1276,11 @@ def _build_narrative_markdown(
         [
             "",
             "## 2. 核心 Battlefield：绝对主线与板块逻辑 (Sectors)",
-            f"- **【绝对主线驱动力解析】**：{_describe_main_line(current_themes, sector_leaders)}",
+            f"- **【绝对主线驱动力解析】**：{_describe_main_line(current_themes, sector_leaders, market_behavior)}",
         ]
     )
+    if battlefield_detail:
+        lines.append(f"- **【资金围猎意图】**：{battlefield_detail}")
     if sector_gainers:
         lines.append(
             "- 强势板块："
@@ -1001,7 +1296,7 @@ def _build_narrative_markdown(
                 f"{item.get('sector_name')} {_format_pct(item.get('change_pct'))}"
                 for item in sector_laggards[:4]
             )
-            + "，说明主线不是简单普涨，而是典型的资金虹吸式上攻。"
+            + f"，对应系统风格标签：{style_detail or '板块跷跷板效应待确认'}。"
         )
     elif not sector_gainers:
         lines.append("- 板块涨跌与资金流数据不足，主线持续性暂不做过度外推。")
@@ -1052,6 +1347,16 @@ def _build_narrative_markdown(
             "- **【次日总策略】**：" + _risk_action_tone(market_mode, sector_leaders, sector_laggards, total_amount, up_count, down_count),
         ]
     )
+    if risk_detail:
+        lines[-1] = "- **【次日总策略】**：" + _risk_action_tone(
+            market_mode,
+            sector_leaders,
+            sector_laggards,
+            total_amount,
+            up_count,
+            down_count,
+            market_behavior,
+        )
     return "\n".join(lines).strip()
 
 
@@ -1073,6 +1378,7 @@ def _build_rule_based_review(
     latest_report_map: dict[str, ReportDB] = user_context.get("latest_report_map") or {}
     quotes = user_context.get("holdings_quotes") or {}
     diagnostics = user_context.get("portfolio_technical_diagnostics") or []
+    market_behavior = market.get("market_behavior_labels") or {}
 
     positive_themes, negative_themes = _build_theme_candidates(news_items, market)
 
@@ -1083,7 +1389,7 @@ def _build_rule_based_review(
     amount_change_label = _format_amount_cn(abs(market_stats.get("amount_change") or 0.0)) if market_stats.get("amount_change") else ""
     lead_themes = "、".join([item["theme"] for item in positive_themes[:2]]) or "强势方向待确认"
     market_mode_headline = _infer_market_mode(market)
-    sentiment_tone = _sentiment_pressure_tone(market_stats)
+    sentiment_tone = _behavior_detail(market_behavior, "sentiment_state") or _sentiment_pressure_tone(market_stats)
     market_headline = f"{trade_date} 市场复盘：{market_mode_headline}；{sentiment_tone}主线集中在{lead_themes}。"
     if amount_label and market_stats.get("up_count"):
         market_headline = (
@@ -1096,6 +1402,10 @@ def _build_rule_based_review(
     star50 = next((item for item in indices if item.get("symbol") == "000688.SH" and item.get("change_pct") is not None), None)
     if star50:
         market_bullets.append(f"{star50.get('name')} {float(star50.get('change_pct') or 0):+.2f}%")
+    for key in ("liquidity_state", "breadth_state", "market_regime", "style_rotation", "risk_pressure"):
+        detail = _behavior_detail(market_behavior, key)
+        if detail:
+            market_bullets.append(detail)
     if amount_label and market_stats:
         stats_parts = [f"两市成交 {amount_label}"]
         if amount_change_label:
@@ -1278,7 +1588,7 @@ def _build_rule_based_review(
     payload = {
         "market_summary": {
             "headline": market_headline,
-            "bullets": _string_list(market_bullets, limit=6),
+            "bullets": _string_list(market_bullets, limit=8),
         },
         "portfolio_summary": {
             "headline": portfolio_headline,
@@ -1291,6 +1601,7 @@ def _build_rule_based_review(
         "next_candidate_stocks": next_candidate_stocks[:8],
         "risk_watchpoints": risk_watchpoints[:6],
         "portfolio_technical_diagnostics": diagnostics,
+        "market_behavior_labels": market_behavior,
     }
     payload["narrative_markdown"] = _build_narrative_markdown(
         trade_date=trade_date,
@@ -1311,24 +1622,34 @@ def _llm_enhance_review(
     user_context: dict[str, Any],
     news_items: list[dict[str, Any]],
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    from api.core.runtime_config import build_runtime_config
+    from api.core.runtime_config import build_runtime_config, has_mixed_account_llm_runtime, llm_runtime_source_payload
 
     config = build_runtime_config({}, user_id=user_id, db=db)
-    user_cfg = auth_service.get_user_llm_config(db, user_id)
+    runtime_sources = llm_runtime_source_payload(config)
     provider = str(config.get("llm_provider") or "").strip().lower()
     model = str(config.get("deep_think_llm") or config.get("quick_think_llm") or "").strip()
     api_key = str(config.get("api_key") or "").strip()
     base_url = str(config.get("backend_url") or "").strip()
+    runtime_meta = {
+        "enabled": True,
+        "provider": provider,
+        "model": model,
+        "base_url": base_url or None,
+        **runtime_sources,
+    }
+    if has_mixed_account_llm_runtime(config):
+        return None, {
+            **runtime_meta,
+            "enabled": False,
+            "error": "mixed_runtime_rejected",
+            "reason": "账号 LLM 字段未形成同源运行包；provider、Base URL、模型和 Key 必须来自同一套账号配置。",
+        }
     if not provider or not model:
-        return None, {"enabled": False, "error": "missing_model"}
+        return None, {**runtime_meta, "enabled": False, "error": "missing_model"}
 
     client_kwargs: dict[str, Any] = {}
     if api_key:
         client_kwargs["api_key"] = api_key
-    if user_cfg and getattr(user_cfg, "api_key_encrypted", None) and not api_key:
-        decrypted = auth_service.decrypt_secret(getattr(user_cfg, "api_key_encrypted", None))
-        if decrypted:
-            client_kwargs["api_key"] = decrypted
 
     context = {
         "trade_date": trade_date,
@@ -1348,6 +1669,7 @@ def _llm_enhance_review(
             "watchlist": (user_context.get("watchlist") or [])[:8],
         },
         "technical_diagnostics_json": (user_context.get("portfolio_technical_diagnostics") or [])[:8],
+        "market_behavior_labels": market.get("market_behavior_labels") or {},
         "today_reports": [
             {
                 "symbol": row.symbol,
@@ -1392,10 +1714,10 @@ def _llm_enhance_review(
         raw = str(getattr(result, "content", "") or "").strip()
         parsed = _find_json_object(raw)
         if not parsed:
-            return None, {"enabled": True, "provider": provider, "model": model, "error": "parse_failed", "raw": raw[:600]}
-        return parsed, {"enabled": True, "provider": provider, "model": model, "error": None, "raw": raw[:600]}
+            return None, {**runtime_meta, "error": "parse_failed", "raw": raw[:600]}
+        return parsed, {**runtime_meta, "error": None, "raw": raw[:600]}
     except Exception as exc:
-        return None, {"enabled": True, "provider": provider, "model": model, "error": str(exc)}
+        return None, {**runtime_meta, "error": str(exc)}
 
 
 def _merge_review_payload(rule_based: dict[str, Any], llm_payload: dict[str, Any] | None) -> dict[str, Any]:
@@ -1423,6 +1745,8 @@ def _merge_review_payload(rule_based: dict[str, Any], llm_payload: dict[str, Any
     if rule_based.get("portfolio_technical_diagnostics"):
         merged["portfolio_technical_diagnostics"] = rule_based.get("portfolio_technical_diagnostics") or []
     if not _narrative_markdown_is_strong(merged.get("narrative_markdown")):
+        merged["narrative_markdown"] = rule_based.get("narrative_markdown")
+    elif not _narrative_preserves_locked_values(merged.get("narrative_markdown"), rule_based):
         merged["narrative_markdown"] = rule_based.get("narrative_markdown")
     return merged
 
@@ -1621,6 +1945,7 @@ def generate_daily_review(
 
     try:
         market = _load_market_snapshot(db, resolved_trade_date)
+        market["market_behavior_labels"] = interpret_market_behavior(market)
         user_context = _load_user_context(db, user_id, resolved_trade_date)
         diagnostics = build_portfolio_technical_diagnostics(
             db,
@@ -1660,21 +1985,22 @@ def generate_daily_review(
             "trigger": trigger,
             "generated_at": _utcnow().isoformat(),
             "llm": llm_meta,
-        "market_snapshot": market,
-        "rule_based": rule_based,
-        "technical_diagnostics": diagnostics,
-        "market_sentiment": {
-            "limit_up_promotion_rate": market.get("market_stats", {}).get("limit_up_promotion_rate"),
-            "limit_up_promotion_count": market.get("market_stats", {}).get("limit_up_promotion_count"),
-            "limit_up_promotion_base": market.get("market_stats", {}).get("limit_up_promotion_base"),
-            "failed_limit_up_rate": market.get("market_stats", {}).get("failed_limit_up_rate"),
-            "failed_limit_up_count": market.get("market_stats", {}).get("failed_limit_up_count"),
-            "limit_up_touch_count": market.get("market_stats", {}).get("limit_up_touch_count"),
-            "sentiment_source": market.get("market_stats", {}).get("sentiment_source"),
-        },
-        "correction": final_payload.get("raw_correction_context"),
-        "news_items": news_items[:12],
-        "today_report_symbols": [report.symbol for report in (user_context.get("today_reports") or [])],
+            "market_snapshot": market,
+            "market_behavior_labels": market.get("market_behavior_labels"),
+            "rule_based": rule_based,
+            "technical_diagnostics": diagnostics,
+            "market_sentiment": {
+                "limit_up_promotion_rate": market.get("market_stats", {}).get("limit_up_promotion_rate"),
+                "limit_up_promotion_count": market.get("market_stats", {}).get("limit_up_promotion_count"),
+                "limit_up_promotion_base": market.get("market_stats", {}).get("limit_up_promotion_base"),
+                "failed_limit_up_rate": market.get("market_stats", {}).get("failed_limit_up_rate"),
+                "failed_limit_up_count": market.get("market_stats", {}).get("failed_limit_up_count"),
+                "limit_up_touch_count": market.get("market_stats", {}).get("limit_up_touch_count"),
+                "sentiment_source": market.get("market_stats", {}).get("sentiment_source"),
+            },
+            "correction": final_payload.get("raw_correction_context"),
+            "news_items": news_items[:12],
+            "today_report_symbols": [report.symbol for report in (user_context.get("today_reports") or [])],
             "holdings_count": len(user_context.get("holdings") or []),
             "watchlist_count": len(user_context.get("watchlist") or []),
         }
@@ -1689,7 +2015,7 @@ def generate_daily_review(
             should_push = trigger == "scheduled" and bool(config.get("push_enabled"))
         user = db.query(UserDB).filter(UserDB.id == user_id).first()
         if user is not None:
-            push_status, push_error = asyncio.run(_push_review_async(db, row, user, push_enabled=should_push))
+            push_status, push_error = run_async(_push_review_async(db, row, user, push_enabled=should_push))
             row.push_status = push_status
             row.push_error = push_error
             row.last_pushed_at = _utcnow() if push_status in {"sent", "partial"} else row.last_pushed_at

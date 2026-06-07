@@ -369,7 +369,12 @@ export interface IntradayBar {
 export interface IntradayResponse {
     symbol: string
     trade_date: string
+    requested_trade_date?: string | null
+    start_trade_date?: string
+    end_trade_date?: string
     period: string
+    lookback_sessions?: number
+    loaded_sessions?: number
     items: IntradayBar[]
     latest_quote?: MarketQuote | null
     source?: string
@@ -389,6 +394,7 @@ export interface ChanlunStroke {
     start_price: number
     end_price: number
     direction: 'up' | 'down'
+    confirmed?: boolean
 }
 
 export interface ChanlunCenter {
@@ -403,6 +409,8 @@ export interface ChanlunOverlayResponse {
     symbol: string
     start_date: string
     end_date: string
+    requested_trade_date?: string | null
+    period?: string
     source?: string
     message?: string | null
     fractals: ChanlunPoint[]
@@ -410,6 +418,8 @@ export interface ChanlunOverlayResponse {
     segments: ChanlunStroke[]
     zhongshu: ChanlunCenter[]
     buy_sell_points: ChanlunPoint[]
+    pending_bi: ChanlunStroke[]
+    pending_fractals: ChanlunPoint[]
 }
 
 export type ApiDataSourceTone = 'neutral' | 'good' | 'warn' | 'bad' | 'info'
@@ -432,6 +442,12 @@ export interface ApiDataSourceDescriptor {
     caveat?: string
 }
 
+export interface NewsDataSourceLink {
+    key: string
+    name: string
+    url: string
+}
+
 export interface ApiDataSourceGovernancePayload {
     domain: string
     title?: string
@@ -445,6 +461,7 @@ export interface ApiDataSourceGovernancePayload {
 export interface SystemDataSourceRegistryResponse {
     updated_at: string
     sources: ApiDataSourceDescriptor[]
+    news_sources?: NewsDataSourceLink[]
     surfaces: Array<{
         id: string
         name: string
@@ -486,6 +503,8 @@ export interface MarketOverviewResponse {
     sector_losers: MarketSectorItem[]
     sector_fund_inflows: MarketSectorItem[]
     sector_fund_outflows: MarketSectorItem[]
+    market_stats?: Record<string, number | string | null | undefined>
+    market_behavior_labels?: Record<string, unknown>
     updated_at: string
     source?: string
     fallback?: boolean
@@ -529,6 +548,11 @@ export interface NewsEyeListResponse {
         active_sources?: string[]
         tracked_symbols?: string[]
         saved_count?: number
+        new_count?: number
+        updated_count?: number
+        unchanged_count?: number
+        fresh_event_count?: number
+        event_driven_selection?: Record<string, unknown>
     }
     history: {
         offset: number
@@ -543,10 +567,15 @@ export interface NewsEyeListResponse {
 
 export interface NewsEyeRefreshResponse {
     saved: number
+    new?: number
+    updated?: number
+    unchanged?: number
+    fresh_event_count?: number
     source: string
     fallback: boolean
     message?: string
     updated_at: string
+    event_driven_selection?: Record<string, unknown>
 }
 
 export interface NewsEyeAnalyzeRequest {
@@ -607,10 +636,14 @@ export interface NewsThemeRankingItem {
     disagreement_level: 'none' | 'healthy' | 'high' | string
     crowding_risk?: string | null
     related_symbols: NewsEyeSymbolTag[]
+    symbol_suggestion_source?: string | null
     raw_tags: string[]
     summary?: string | null
     catalyst?: string | null
     risk_note?: string | null
+    event_semantic?: Record<string, unknown>
+    semantic_source?: string | null
+    llm_symbol_trace?: Record<string, unknown>
     market_confirmation?: Record<string, number>
     evidence_items: NewsThemeEvidenceItem[]
     window?: string
@@ -625,6 +658,7 @@ export interface NewsThemeRankingResponse {
     updated_at: string
     source: string
     message: string
+    data_governance?: Record<string, unknown>
 }
 
 export interface NewsThemeSnapshotResponse {
@@ -652,6 +686,244 @@ export interface NewsThemePerformanceResponse {
     horizon: string
     items: NewsThemePerformanceItem[]
     updated_at: string
+}
+
+export interface CatalystSelectionThemeMatch {
+    theme: string
+    score: number
+    catalyst?: string | null
+    summary?: string | null
+    source_tier?: string | null
+    evidence_count: number
+    relation_score?: number
+    mainline_alignment_score?: number
+    mainline_alignment_reasons?: string[]
+    event_semantic?: Record<string, unknown>
+    semantic_source?: string | null
+    symbol_suggestion_source?: string | null
+    relation_reasons?: string[]
+}
+
+export interface CatalystSelectionSettlement {
+    trade_date: string
+    settlement_date: string
+    symbol: string
+    name: string
+    rank: number
+    entry_price?: number | null
+    close_price?: number | null
+    next_open_price?: number | null
+    high_price?: number | null
+    low_price?: number | null
+    change_pct?: number | null
+    max_up_pct?: number | null
+    max_down_pct?: number | null
+    hit_score?: number | null
+    outcome: string
+    protected: boolean
+    settlement_notes: string[]
+}
+
+export interface CatalystSelectionItem {
+    rank: number
+    symbol: string
+    name: string
+    industry?: string | null
+    sector?: string | null
+    concepts: string[]
+    score: number
+    pre_execution_score?: number | null
+    execution_gate_adjustment?: Record<string, unknown>
+    catalyst_score: number
+    theme_score: number
+    relation_score: number
+    market_confirm_score: number
+    event_intelligence_score: number
+    momentum_score: number
+    fundamental_score: number
+    continuity_score: number
+    adaptive_feedback_score: number
+    risk_penalty: number
+    risk_flags: string[]
+    reason_parts: string[]
+    theme_matches: CatalystSelectionThemeMatch[]
+    signal_flags: string[]
+    risk_control: Record<string, unknown>
+    closed_loop_trace: Record<string, unknown>
+    market_background: string
+    market_behavior_labels: Record<string, unknown>
+    metric_snapshot: Record<string, number | string | null | undefined>
+    settlement?: CatalystSelectionSettlement | null
+}
+
+export interface CatalystSelectionRankResponse {
+    trade_date: string
+    window: string
+    updated_at: string
+    source: string
+    message: string
+    items: CatalystSelectionItem[]
+    market_background: string
+    market_behavior_labels: Record<string, unknown>
+    data_governance: Record<string, unknown>
+}
+
+export interface CatalystSelectionHistoryItem {
+    trade_date: string
+    item_count: number
+    top_symbol?: string | null
+    top_name?: string | null
+    average_change_pct?: number | null
+    hit_rate?: number | null
+    protected_count: number
+    data_source?: string | null
+    updated_at: string
+}
+
+export interface CatalystSelectionHistoryResponse {
+    items: CatalystSelectionHistoryItem[]
+    updated_at: string
+}
+
+export interface CatalystOpportunityEvent {
+    event_id: string
+    run_id: string
+    trade_date: string
+    window: string
+    symbol: string
+    name: string
+    rank: number
+    score: number
+    previous_rank?: number | null
+    previous_score?: number | null
+    rank_delta?: number | null
+    score_delta?: number | null
+    event_level: string
+    event_types: string[]
+    reasons: string[]
+    risk_action?: string | null
+    risk_level?: string | null
+    trace: Record<string, unknown>
+    created_at: string
+}
+
+export interface CatalystOpportunityEventResponse {
+    items: CatalystOpportunityEvent[]
+    filters: Record<string, unknown>
+    updated_at: string
+}
+
+export interface CatalystMonitorPoolResponse {
+    trade_date: string
+    window: string
+    updated_at: string
+    source: string
+    suggested_execution_mode: string
+    monitor_pool: Record<string, unknown>
+    risk_config: Record<string, unknown>
+    summary: Record<string, unknown>
+}
+
+export interface CatalystClosedLoopAudit {
+    audit_id: string
+    trade_date?: string | null
+    trigger: string
+    status: string
+    requirement_summary?: Record<string, unknown>
+    requirement_checks?: Record<string, unknown>[]
+    end_to_end_evidence?: Record<string, unknown>
+    requested_window_count: number
+    generated_window_count: number
+    failed_window_count: number
+    total_selected_count: number
+    opportunity_event_count: number
+    risk_action_counts: Record<string, number>
+    risk_level_counts: Record<string, number>
+    feedback: Record<string, unknown>
+    monitor_activation: Record<string, unknown>
+    llm_ready_window_count: number
+    settlement: Record<string, unknown>
+    generated: Record<string, unknown>[]
+    errors: Record<string, unknown>[]
+    skip_reason?: string | null
+    created_at: string
+    updated_at: string
+}
+
+export interface CatalystClosedLoopAuditResponse {
+    items: CatalystClosedLoopAudit[]
+    updated_at: string
+}
+
+export interface CatalystEventRefreshRun {
+    refresh_key: string
+    trigger: string
+    user_id?: string | null
+    trade_date?: string | null
+    windows: string[]
+    limit: number
+    reason?: string | null
+    context: Record<string, unknown>
+    status: string
+    deduped: boolean
+    generated: Record<string, unknown>[]
+    errors: Record<string, unknown>[]
+    skipped: boolean
+    skip_reason?: string | null
+    audit_id?: string | null
+    duration_ms?: number | null
+    scheduled_at: string
+    started_at: string
+    finished_at: string
+    updated_at: string
+}
+
+export interface CatalystEventRefreshRunResponse {
+    items: CatalystEventRefreshRun[]
+    filters: Record<string, unknown>
+    updated_at: string
+}
+
+export interface CatalystLearningReplayResponse {
+    trade_date?: string | null
+    status: string
+    source: string
+    score_version: string
+    feedback_model_version: string
+    realtime_feedback_model_version: string
+    audit_id?: string | null
+    audit_created_at?: string | null
+    candidate_impact_count: number
+    active_impact_count: number
+    unique_symbol_count: number
+    status_counts: Record<string, number>
+    profile_scope_counts: Record<string, number>
+    score_changed_count: number
+    rank_changed_count: number
+    risk_changed_count: number
+    gate_applied_count: number
+    action_changed_count: number
+    improved_rank_count: number
+    reduced_rank_count: number
+    average_score_delta?: number | null
+    max_abs_score_delta?: number | null
+    average_rank_delta?: number | null
+    average_max_position_delta_pct?: number | null
+    windows: Record<string, unknown>[]
+    items: Record<string, unknown>[]
+    settlement_feedback_replay: Record<string, unknown>
+    realtime_feedback_replay: Record<string, unknown>
+    evidence: string[]
+    gaps: string[]
+    updated_at: string
+}
+
+export interface CatalystSelectionSettlementResponse {
+    trade_date: string
+    settlement_date?: string | null
+    items: CatalystSelectionSettlement[]
+    updated_at: string
+    message?: string
 }
 
 // Structured extraction types
@@ -1015,9 +1287,9 @@ export interface RuntimeConfig {
     deep_think_llm: string
     quick_think_llm: string
     backend_url: string
-    news_llm_provider: string
-    news_backend_url: string
-    news_analysis_llm: string
+    news_llm_provider?: string | null
+    news_backend_url?: string | null
+    news_analysis_llm?: string | null
     max_debate_rounds: number
     max_risk_discuss_rounds: number
     has_api_key?: boolean
@@ -1028,17 +1300,48 @@ export interface RuntimeConfig {
     email_report_enabled?: boolean
     wecom_report_enabled?: boolean
     default_analysts?: string[]
+    llm_core_stock?: RuntimeLlmCoreStockReadiness
     qmt_paper_account: RuntimeQmtAccountConfig
     qmt_live_account: RuntimeQmtAccountConfig
+}
+
+export interface RuntimeLlmCoreStockReadiness {
+    enabled?: boolean
+    ready?: boolean
+    status?: string
+    reason?: string
+    provider?: string
+    model?: string
+    base_url?: string | null
+    source?: string
+    runtime_package_source?: string | null
+    api_key_source?: string | null
+    provider_source?: string | null
+    base_url_source?: string | null
+    model_source?: string | null
+    requires_api_key?: boolean
+    has_api_key?: boolean
+    sync_enabled?: boolean
+    async_allowed_without_user?: boolean
+    [key: string]: unknown
 }
 
 export interface RuntimeConfigUpdateResponse {
     message: string
     applied: RuntimeConfigUpdate
     has_api_key: boolean
-    has_news_api_key?: boolean
     current: RuntimeConfig
     warmup?: RuntimeConfigWarmup
+    event_driven_selection?: RuntimeConfigEventDrivenSelection
+}
+
+export interface RuntimeConfigEventDrivenSelection {
+    requested: boolean
+    triggered: boolean
+    status: 'scheduled' | 'skipped' | string
+    reason?: string
+    windows?: string[]
+    llm_core_stock?: RuntimeLlmCoreStockReadiness
 }
 
 export interface RuntimeConfigUpdate {

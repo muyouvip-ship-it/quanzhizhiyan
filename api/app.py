@@ -4,6 +4,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.core.http_utils import cors_allow_origins, cors_allow_origin_regex
+from api.core.rate_limit import RateLimitMiddleware
+from api.core.version_middleware import VersionHeaderMiddleware
 from api.core.settings import settings
 from api.core.versioning import get_version
 from api.lifespan import lifespan
@@ -11,6 +13,7 @@ from api.routes.analysis import router as analysis_router
 from api.routes.auth import router as auth_router
 from api.routes.chat import router as chat_router
 from api.routes.config import router as config_router
+from api.routes.catalyst_selection import router as catalyst_selection_router
 from api.routes.data_download import router as data_download_router
 from api.routes.feedback import router as feedback_router
 from api.routes.daily_reviews import router as daily_reviews_router
@@ -51,10 +54,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RateLimitMiddleware)
+app.add_middleware(VersionHeaderMiddleware)
 app.include_router(health_router)
 app.include_router(auth_router)
 app.include_router(tokens_router)
 app.include_router(config_router)
+app.include_router(catalyst_selection_router)
 app.include_router(daily_reviews_router)
 app.include_router(market_router)
 app.include_router(news_eye_router)

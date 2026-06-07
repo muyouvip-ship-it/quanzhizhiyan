@@ -16,7 +16,7 @@ import {
     createSeriesMarkers,
     createChart,
 } from 'lightweight-charts'
-import { Activity, CandlestickChart, Layers3 } from 'lucide-react'
+import { Activity, CandlestickChart, Layers3, Minus, Plus } from 'lucide-react'
 import { usePolling } from '@/hooks/usePolling'
 import { api } from '@/services/api'
 import type { ChanlunOverlayResponse, KlineCandle, MarketQuote } from '@/types'
@@ -40,16 +40,10 @@ interface KlinePanelProps {
 }
 
 type ViewMode = 'daily' | 'intraday'
+type IntradayPeriod = '1m' | '5m' | '15m' | '30m' | '60m'
 
 function normalizeDateKey(value?: string | null): string {
     return value ? value.slice(0, 10) : ''
-}
-
-function shiftDateText(dateText: string, offsetDays: number): string {
-    const date = new Date(`${dateText}T00:00:00`)
-    if (Number.isNaN(date.getTime())) return dateText
-    date.setDate(date.getDate() + offsetDays)
-    return toDateText(date)
 }
 
 function toDateText(date: Date): string {
@@ -71,7 +65,7 @@ function toBusinessDay(value: string): BusinessDay | null {
 
 function toChartTime(value: string): Time | null {
     if (!value) return null
-    if (value.includes(' ')) {
+    if (value.includes(' ') || value.includes('T')) {
         const ts = Date.parse(value.replace(' ', 'T'))
         if (!Number.isFinite(ts)) return null
         return Math.floor(ts / 1000) as UTCTimestamp
@@ -105,10 +99,10 @@ function mapIntradayItemToCandle(item: {
 }): KlineCandle {
     return {
         date: item.trade_time,
-        open: Number(item.open || 0),
-        high: Number(item.high || 0),
-        low: Number(item.low || 0),
-        close: Number(item.close || 0),
+        open: toChartNumber(item.open),
+        high: toChartNumber(item.high),
+        low: toChartNumber(item.low),
+        close: toChartNumber(item.close),
         volume: item.volume ?? null,
         amount: item.amount ?? null,
         change: null,
@@ -151,6 +145,63 @@ function formatVolume(value?: number | null): string {
     return formatNumber(value, 0)
 }
 
+function toChartNumber(value: unknown): number {
+    if (value == null || value === '') return Number.NaN
+    const numberValue = Number(value)
+    return Number.isFinite(numberValue) ? numberValue : Number.NaN
+}
+
+function timeIdentity(time: Time): string {
+    if (typeof time === 'number') return `ts:${time}`
+    if (typeof time === 'string') return `str:${time}`
+    return `bd:${time.year}-${String(time.month).padStart(2, '0')}-${String(time.day).padStart(2, '0')}`
+}
+
+function timeSortValue(time: Time): number {
+    if (typeof time === 'number') return time
+    if (typeof time === 'string') {
+        const parsed = Date.parse(time)
+        return Number.isFinite(parsed) ? parsed / 1000 : Number.MAX_SAFE_INTEGER
+    }
+    return Date.UTC(time.year, time.month - 1, time.day) / 1000
+}
+
+function normalizeChartCandles(rows: KlineCandle[]) {
+    const deduped = new Map<string, { candle: KlineCandle; data: CandlestickData; sortKey: number }>()
+    rows.forEach((candle) => {
+        const time = toChartTime(candle.date || '')
+        const open = toChartNumber(candle.open)
+        const high = toChartNumber(candle.high)
+        const low = toChartNumber(candle.low)
+        const close = toChartNumber(candle.close)
+        if (!time || ![open, high, low, close].every(Number.isFinite)) return
+        const key = timeIdentity(time)
+        deduped.set(key, {
+            candle: { ...candle, open, high, low, close },
+            data: { time, open, high, low, close },
+            sortKey: timeSortValue(time),
+        })
+    })
+    const normalized = Array.from(deduped.values()).sort((left, right) => left.sortKey - right.sortKey)
+    return {
+        candles: normalized.map((item) => item.candle),
+        data: normalized.map((item) => item.data),
+    }
+}
+
+function sortSeriesMarkers(items: SeriesMarker<Time>[]) {
+    return [...items].sort((left, right) => timeSortValue(left.time) - timeSortValue(right.time))
+}
+
+function intradayEmptyMessage(tradeDate: string, period: IntradayPeriod, source?: string) {
+    const sourceHint = source && source !== 'empty' ? `来源：${source}` : '本地分钟K库暂无该标的数据'
+    return `暂无 ${tradeDate} 附近 ${period} 分钟K，${sourceHint}；可先切回日K查看。`
+}
+
+function asArray<T>(value: T[] | null | undefined): T[] {
+    return Array.isArray(value) ? value : []
+}
+
 const INDEX_PRESETS = [
     { symbol: '000001.SH', label: '上证指数' },
     { symbol: '399001.SZ', label: '深证成指' },
@@ -162,6 +213,17 @@ const INDEX_PRESETS = [
     { symbol: '899050.BJ', label: '北证50' },
 ] as const
 
+const INTRADAY_PERIOD_OPTIONS: Array<{ value: IntradayPeriod; label: string }> = [
+    { value: '1m', label: '1分' },
+    { value: '5m', label: '5分' },
+    { value: '15m', label: '15分' },
+    { value: '30m', label: '30分' },
+    { value: '60m', label: '60分' },
+]
+
+const INTRADAY_LOOKBACK_SESSIONS = 20
+const INTRADAY_DEFAULT_VISIBLE_BARS = 240
+
 export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay = true, focusDate, markers = [] }: KlinePanelProps) {
     const currentAnalysisSymbol = useAnalysisStore((state) => state.currentSymbol)
     const containerRef = useRef<HTMLDivElement | null>(null)
@@ -172,9 +234,17 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
     const [error, setError] = useState<string | null>(null)
     const [isDark, setIsDark] = useState(document.documentElement.classList.contains('dark'))
     const [viewMode, setViewMode] = useState<ViewMode>('daily')
+    const [intradayPeriod, setIntradayPeriod] = useState<IntradayPeriod>('5m')
     const [candles, setCandles] = useState<KlineCandle[]>([])
     const [activeCandle, setActiveCandle] = useState<KlineCandle | null>(null)
     const [quote, setQuote] = useState<MarketQuote | null>(null)
+    const [intradayMeta, setIntradayMeta] = useState<{
+        start?: string
+        end?: string
+        loadedSessions?: number
+        requested?: string | null
+        source?: string
+    } | null>(null)
     const [overlayLoading, setOverlayLoading] = useState(false)
     const [overlayMessage, setOverlayMessage] = useState<string | null>(null)
     const [overlayData, setOverlayData] = useState<ChanlunOverlayResponse | null>(null)
@@ -189,27 +259,39 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
     const overlaySeriesRef = useRef<Array<ISeriesApi<'Line'>>>([])
 
     const range = useMemo(() => {
-        const markerDates = markers
-            .map(item => normalizeDateKey(item.timestamp || item.date))
-            .filter(Boolean)
-            .sort()
-        const focusDateKey = normalizeDateKey(focusDate)
-        if (focusDateKey) markerDates.push(focusDateKey)
-        markerDates.sort()
-
-        if (markerDates.length > 0) {
-            const start = shiftDateText(markerDates[0], -30)
-            const end = shiftDateText(markerDates[markerDates.length - 1], 30)
-            return { start, end }
-        }
-
         const end = new Date()
-        const start = new Date(end.getTime() - 180 * 24 * 60 * 60 * 1000)
-        return {
-            start: toDateText(start),
-            end: toDateText(end),
+        const endText = toDateText(end)
+        if (viewMode === 'intraday') {
+            return { start: toDateText(new Date(end.getTime() - 5 * 24 * 60 * 60 * 1000)), end: endText }
         }
-    }, [focusDate, markers])
+        // Load all data for daily; visible density is controlled by floating zoom.
+        return { start: '2010-01-01', end: endText }
+    }, [viewMode])
+
+    const applyDefaultVisibleRange = (dataLength: number) => {
+        if (!chartRef.current || dataLength <= 0) return
+        if (viewMode === 'daily') {
+            const visibleBars = 120
+            chartRef.current.timeScale().setVisibleLogicalRange({
+                from: Math.max(0, dataLength - visibleBars),
+                to: dataLength + 5,
+            })
+            return
+        }
+        chartRef.current.timeScale().setVisibleLogicalRange({
+            from: Math.max(0, dataLength - INTRADAY_DEFAULT_VISIBLE_BARS),
+            to: dataLength + 5,
+        })
+    }
+
+    const adjustChartZoom = (factor: number) => {
+        const timeScale = chartRef.current?.timeScale()
+        const range = timeScale?.getVisibleLogicalRange()
+        if (!timeScale || !range) return
+        const center = (range.from + range.to) / 2
+        const half = ((range.to - range.from) * factor) / 2
+        timeScale.setVisibleLogicalRange({ from: center - half, to: center + half })
+    }
 
     // Listen for theme changes
     useEffect(() => {
@@ -292,18 +374,13 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
         seriesRef.current = series
         markersRef.current = seriesMarkers
         if (candlesRef.current.length) {
-            const existingData: CandlestickData[] = candlesRef.current.flatMap((c) => {
-                const time = toChartTime(c.date || '')
-                const open = Number(c.open)
-                const high = Number(c.high)
-                const low = Number(c.low)
-                const close = Number(c.close)
-                if (!time) return []
-                if (![open, high, low, close].every(Number.isFinite)) return []
-                return [{ time, open, high, low, close }]
-            })
-            series.setData(existingData)
-            chart.timeScale().fitContent()
+            const { data: existingData } = normalizeChartCandles(candlesRef.current)
+            try {
+                series.setData(existingData)
+                applyDefaultVisibleRange(existingData.length)
+            } catch (chartDataError) {
+                setError(chartDataError instanceof Error ? `K线数据渲染失败：${chartDataError.message}` : 'K线数据渲染失败')
+            }
         }
 
         const handleCrosshairMove = (param: MouseEventParams) => {
@@ -320,7 +397,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
         chart.subscribeCrosshairMove(handleCrosshairMove)
 
         const handleDblClick = () => {
-            chartRef.current?.timeScale().fitContent()
+            applyDefaultVisibleRange(candlesRef.current.length)
         }
         const container = containerRef.current
         container.addEventListener('dblclick', handleDblClick)
@@ -356,30 +433,30 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
             try {
                 const tradeDate = normalizeDateKey(focusDate) || range.end
                 const dailyResponse = viewMode === 'daily' ? await api.getKline(symbol, range.start, range.end) : null
-                const intradayResponse = viewMode === 'intraday' ? await api.getIntraday(symbol, tradeDate, true) : null
+                const intradayResponse = viewMode === 'intraday'
+                    ? await api.getIntraday(symbol, tradeDate, intradayPeriod, true, INTRADAY_LOOKBACK_SESSIONS)
+                    : null
                 const sourceRows = viewMode === 'intraday'
-                    ? intradayResponse?.items.map(mapIntradayItemToCandle) || []
-                    : dailyResponse?.candles || []
-                const data: CandlestickData[] = sourceRows.flatMap((c) => {
-                    const time = toChartTime(c.date || '')
-                    const open = Number(c.open)
-                    const high = Number(c.high)
-                    const low = Number(c.low)
-                    const close = Number(c.close)
-                    if (!time) return []
-                    if (![open, high, low, close].every(Number.isFinite)) return []
-                    return [{ time, open, high, low, close }]
-                })
+                    ? (Array.isArray(intradayResponse?.items) ? intradayResponse.items.map(mapIntradayItemToCandle) : [])
+                    : (Array.isArray(dailyResponse?.candles) ? dailyResponse.candles : [])
+                const { candles: validCandles, data } = normalizeChartCandles(sourceRows)
 
                 if (cancelled) return
-                setCandles(sourceRows)
-                candlesRef.current = sourceRows
-                setActiveCandle(sourceRows.length ? sourceRows[sourceRows.length - 1] : null)
+                setCandles(validCandles)
+                candlesRef.current = validCandles
+                setActiveCandle(validCandles.length ? validCandles[validCandles.length - 1] : null)
                 if (intradayResponse?.latest_quote) setQuote(intradayResponse.latest_quote)
+                setIntradayMeta(intradayResponse ? {
+                    start: intradayResponse.start_trade_date || intradayResponse.trade_date,
+                    end: intradayResponse.end_trade_date || intradayResponse.trade_date,
+                    loadedSessions: intradayResponse.loaded_sessions,
+                    requested: intradayResponse.requested_trade_date,
+                    source: intradayResponse.source,
+                } : null)
                 seriesRef.current?.setData(data)
-                chartRef.current?.timeScale().fitContent()
+                applyDefaultVisibleRange(data.length)
                 if (!data.length) {
-                    setError(viewMode === 'daily' ? '暂无可用K线数据' : '暂无可用分时数据')
+                    setError(viewMode === 'daily' ? '暂无可用K线数据' : intradayEmptyMessage(tradeDate, intradayPeriod, intradayResponse?.source))
                 }
             } catch (e) {
                 if (cancelled) return
@@ -387,6 +464,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                 setCandles([])
                 candlesRef.current = []
                 setActiveCandle(null)
+                setIntradayMeta(null)
                 seriesRef.current?.setData([])
             } finally {
                 if (!cancelled) setLoading(false)
@@ -397,7 +475,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
         return () => {
             cancelled = true
         }
-    }, [focusDate, range.end, range.start, symbol, viewMode])
+    }, [focusDate, intradayPeriod, range.end, range.start, symbol, viewMode])
 
     useEffect(() => {
         let cancelled = false
@@ -444,7 +522,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
     }, [candles, focusDate])
 
     useEffect(() => {
-        if (!showChanlunOverlay || viewMode !== 'daily') {
+        if (!showChanlunOverlay) {
             setOverlayData(null)
             setOverlayMessage(null)
             setOverlayLoading(false)
@@ -454,7 +532,16 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
         const loadOverlay = async () => {
             setOverlayLoading(true)
             try {
-                const response = await api.getChanlunOverlay(symbol, range.start, range.end)
+                const chanlunTradeDate = normalizeDateKey(focusDate) || range.end
+                const chanlunStart = viewMode === 'daily' ? range.start : chanlunTradeDate
+                const chanlunEnd = viewMode === 'daily' ? range.end : chanlunTradeDate
+                const response = await api.getChanlunOverlay(
+                    symbol,
+                    chanlunStart,
+                    chanlunEnd,
+                    viewMode === 'daily' ? 'daily' : intradayPeriod,
+                    viewMode === 'daily' ? 1 : INTRADAY_LOOKBACK_SESSIONS,
+                )
                 if (cancelled) return
                 setOverlayData(response)
                 setOverlayMessage(response.message || null)
@@ -470,11 +557,11 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
         return () => {
             cancelled = true
         }
-    }, [range.end, range.start, showChanlunOverlay, symbol, viewMode])
+    }, [focusDate, range.end, range.start, showChanlunOverlay, symbol, viewMode, intradayPeriod])
 
     useEffect(() => {
         if (!markersRef.current) return
-        if (viewMode !== 'daily') {
+        if (viewMode !== 'daily' && viewMode !== 'intraday') {
             markersRef.current.setMarkers([])
             return
         }
@@ -491,7 +578,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
         })
         const overlayMarkers: SeriesMarker<Time>[] = []
         if (showChanlunOverlay && overlayToggles.fractals && overlayData) {
-            overlayMarkers.push(...overlayData.fractals.flatMap((point) => {
+            overlayMarkers.push(...asArray(overlayData.fractals).flatMap((point) => {
                 const time = toChartTime(point.date || '')
                 if (!time) return []
                 return [{
@@ -503,9 +590,24 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                     price: Number(point.price),
                 }]
             }))
+            // Render pending/unconfirmed fractals with hollow style
+            if (asArray(overlayData.pending_fractals).length) {
+                overlayMarkers.push(...asArray(overlayData.pending_fractals).flatMap((point) => {
+                    const time = toChartTime(point.date || '')
+                    if (!time) return []
+                    return [{
+                        time,
+                        position: point.type === 'top' ? ('aboveBar' as const) : ('belowBar' as const),
+                        shape: 'circle' as const,
+                        color: point.type === 'top' ? 'rgba(168,85,247,0.5)' : 'rgba(6,182,212,0.5)',
+                        text: point.type === 'top' ? '顶?' : '底?',
+                        price: Number(point.price),
+                    }]
+                }))
+            }
         }
         if (showChanlunOverlay && overlayToggles.buySell && overlayData) {
-            overlayMarkers.push(...overlayData.buy_sell_points.flatMap((point) => {
+            overlayMarkers.push(...asArray(overlayData.buy_sell_points).flatMap((point) => {
                 const time = toChartTime(point.date || '')
                 if (!time) return []
                 return [{
@@ -513,35 +615,50 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                     position: point.side === 'buy' ? ('belowBar' as const) : ('aboveBar' as const),
                     shape: point.side === 'buy' ? ('arrowUp' as const) : ('arrowDown' as const),
                     color: point.side === 'buy' ? '#ef4444' : '#22c55e',
-                    text: point.type.replace('_', ''),
+                    text: String(point.type || '').replace('_', ''),
                     price: Number(point.price),
                 }]
             }))
         }
-        markersRef.current.setMarkers([...tradeMarkers, ...overlayMarkers])
+        try {
+            markersRef.current.setMarkers(sortSeriesMarkers([...tradeMarkers, ...overlayMarkers]))
+        } catch (markerError) {
+            setOverlayMessage(markerError instanceof Error ? `K线标注渲染失败：${markerError.message}` : 'K线标注渲染失败')
+        }
     }, [markers, overlayData, overlayToggles.buySell, overlayToggles.fractals, showChanlunOverlay, viewMode])
 
     useEffect(() => {
         if (!chartRef.current) return
-        overlaySeriesRef.current.forEach((series) => chartRef.current?.removeSeries(series))
+        try {
+            overlaySeriesRef.current.forEach((series) => chartRef.current?.removeSeries(series))
+        } catch {
+            setOverlayMessage('缠论线条刷新失败，请切换周期重试')
+        }
         overlaySeriesRef.current = []
-        if (!showChanlunOverlay || !overlayData || viewMode !== 'daily') return
+        if (!showChanlunOverlay || !overlayData) return
 
         const pushLineSeries = (data: LineData<Time>[], options: Record<string, unknown>) => {
-            if (!chartRef.current || data.length < 2) return
-            const lineSeries = chartRef.current.addSeries(LineSeries, {
-                lastValueVisible: false,
-                priceLineVisible: false,
-                crosshairMarkerVisible: false,
-                ...options,
-            })
-            lineSeries.setData(data)
-            overlaySeriesRef.current.push(lineSeries)
+            const normalizedData = data
+                .filter((item) => Number.isFinite(Number(item.value)))
+                .sort((left, right) => timeSortValue(left.time) - timeSortValue(right.time))
+            if (!chartRef.current || normalizedData.length < 2) return
+            try {
+                const lineSeries = chartRef.current.addSeries(LineSeries, {
+                    lastValueVisible: false,
+                    priceLineVisible: false,
+                    crosshairMarkerVisible: false,
+                    ...options,
+                })
+                lineSeries.setData(normalizedData)
+                overlaySeriesRef.current.push(lineSeries)
+            } catch (lineError) {
+                setOverlayMessage(lineError instanceof Error ? `缠论线条渲染失败：${lineError.message}` : '缠论线条渲染失败')
+            }
         }
 
         const createLine = (startDate: string, endDate: string, startPrice: number, endPrice: number): LineData<Time>[] => {
-            const startTime = toBusinessDay((startDate || '').slice(0, 10))
-            const endTime = toBusinessDay((endDate || '').slice(0, 10))
+            const startTime = toChartTime(startDate || '')
+            const endTime = toChartTime(endDate || '')
             if (!startTime || !endTime) return []
             return [
                 { time: startTime, value: Number(startPrice) },
@@ -550,7 +667,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
         }
 
         if (overlayToggles.bi) {
-            overlayData.bi.forEach((stroke) => {
+            asArray(overlayData.bi).forEach((stroke) => {
                 pushLineSeries(
                     createLine(stroke.start_date, stroke.end_date, stroke.start_price, stroke.end_price),
                     {
@@ -559,10 +676,23 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                     },
                 )
             })
+            // Render pending/unconfirmed strokes with dashed style
+            if (asArray(overlayData.pending_bi).length) {
+                asArray(overlayData.pending_bi).forEach((stroke) => {
+                    pushLineSeries(
+                        createLine(stroke.start_date, stroke.end_date, stroke.start_price, stroke.end_price),
+                        {
+                            color: stroke.direction === 'up' ? '#f97316' : '#10b981',
+                            lineWidth: 2,
+                            lineStyle: 2, // dashed
+                        },
+                    )
+                })
+            }
         }
 
         if (overlayToggles.segments) {
-            overlayData.segments.forEach((segment) => {
+            asArray(overlayData.segments).forEach((segment) => {
                 pushLineSeries(
                     createLine(segment.start_date, segment.end_date, segment.start_price, segment.end_price),
                     {
@@ -574,7 +704,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
         }
 
         if (overlayToggles.zhongshu) {
-            overlayData.zhongshu.forEach((center) => {
+            asArray(overlayData.zhongshu).forEach((center) => {
                 pushLineSeries(
                     createLine(center.start_date, center.end_date, center.high, center.high),
                     {
@@ -611,8 +741,20 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
     const panelTimestamp = quote?.quote_time || panelCandle?.date || '--'
     const showCurrentSymbolButton = !!currentAnalysisSymbol && currentAnalysisSymbol !== symbol
     const currentSymbolLabel = currentAnalysisSymbol ? getDisplayName(currentAnalysisSymbol).replace(/（.*?）/, '') : '当前标的'
+    const intradayPeriodLabel = INTRADAY_PERIOD_OPTIONS.find(item => item.value === intradayPeriod)?.label || intradayPeriod
+    const intradayLoadedSessions = intradayMeta?.loadedSessions || (
+        intradayMeta?.start && intradayMeta?.end
+            ? new Set(candles.map(item => normalizeDateKey(item.date)).filter(Boolean)).size
+            : null
+    )
+    const handleIntradayPeriodChange = (period: IntradayPeriod) => {
+        if (period === intradayPeriod) return
+        setError(null)
+        setOverlayMessage(null)
+        setIntradayPeriod(period)
+    }
     const activeMarkerDetails = useMemo(() => {
-        if (viewMode !== 'daily') return []
+        if (viewMode !== 'daily' && viewMode !== 'intraday') return []
         const activeDate = normalizeDateKey(panelCandle?.date)
         if (!activeDate) return []
         return markers.filter(marker => normalizeDateKey(marker.date) === activeDate)
@@ -637,7 +779,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                         </div>
                     </div>
                 </div>
-                <div className="flex items-center gap-1.5">
+                <div className="flex items-center gap-1.5 flex-wrap">
                     <div className="flex items-center gap-1 rounded-xl border border-slate-200 px-1.5 py-1 dark:border-slate-700">
                         <button
                             type="button"
@@ -654,7 +796,24 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                             分时
                         </button>
                     </div>
-                    {showChanlunOverlay && viewMode === 'daily' && (
+                    {viewMode === 'intraday' && (
+                        <div className="flex items-center gap-1 rounded-xl border border-slate-200 px-1.5 py-1 dark:border-slate-700">
+                            <span className="px-1 text-[11px] font-medium text-slate-400 dark:text-slate-500">周期</span>
+                            {INTRADAY_PERIOD_OPTIONS.map(({ value, label }) => (
+                                <button
+                                    key={value}
+                                    type="button"
+                                    aria-pressed={intradayPeriod === value}
+                                    title={`切换到${label}钟K线`}
+                                    onClick={() => handleIntradayPeriodChange(value)}
+                                    className={`rounded-lg px-2 py-1 text-[11px] font-medium transition ${intradayPeriod === value ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300' : 'text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800'}`}
+                                >
+                                    {label}
+                                </button>
+                            ))}
+                        </div>
+                    )}
+                    {showChanlunOverlay && (
                     <div className="hidden flex-wrap items-center gap-1 rounded-xl border border-slate-200 px-2 py-1 dark:border-slate-700 xl:flex">
                         <Layers3 className="h-3.5 w-3.5 text-violet-500" />
                         {[
@@ -684,6 +843,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                     )}
                     {showCurrentSymbolButton && (
                         <button
+                            type="button"
                             onClick={() => onSymbolChange?.(currentAnalysisSymbol)}
                             className="text-xs px-2.5 py-1 rounded border border-emerald-500 text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-500/10 hover:bg-emerald-100 dark:hover:bg-emerald-500/20 transition-colors"
                         >
@@ -693,6 +853,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                     {INDEX_PRESETS.map((item) => (
                         <button
                             key={item.symbol}
+                            type="button"
                             onClick={() => onSymbolChange?.(item.symbol)}
                             className={`text-xs px-2 py-1 rounded border transition-colors ${item.symbol === symbol
                                     ? 'border-blue-500 text-blue-500 bg-blue-50 dark:bg-blue-500/10'
@@ -706,13 +867,43 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
             </div>
             <div className="relative flex-1 min-h-0 rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/50 overflow-hidden">
                 <div ref={containerRef} className="absolute inset-0" />
+                {viewMode === 'intraday' && !error && (
+                    <div
+                        title={intradayMeta?.start && intradayMeta?.end ? `${intradayMeta.start} ~ ${intradayMeta.end}` : undefined}
+                        className="absolute left-3 top-3 z-10 rounded-lg bg-white/90 px-2 py-1 text-[11px] font-medium text-amber-700 shadow-sm ring-1 ring-amber-200 backdrop-blur dark:bg-slate-900/90 dark:text-amber-300 dark:ring-amber-900/50"
+                    >
+                        分时周期：{intradayPeriodLabel}
+                        {intradayLoadedSessions ? ` · ${intradayLoadedSessions}日` : ''}
+                        {candles.length ? ` · ${candles.length}根` : ''}
+                    </div>
+                )}
+                <div className="absolute bottom-3 right-3 z-10 flex overflow-hidden rounded-full border border-slate-200 bg-white/90 shadow-sm backdrop-blur dark:border-slate-700 dark:bg-slate-900/90">
+                    <button
+                        type="button"
+                        title="放大"
+                        aria-label="放大K线"
+                        onClick={() => adjustChartZoom(0.72)}
+                        className="flex h-9 w-9 items-center justify-center text-slate-600 transition hover:bg-slate-100 hover:text-slate-900 dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-white"
+                    >
+                        <Plus className="h-4 w-4" />
+                    </button>
+                    <button
+                        type="button"
+                        title="缩小"
+                        aria-label="缩小K线"
+                        onClick={() => adjustChartZoom(1.38)}
+                        className="flex h-9 w-9 items-center justify-center border-l border-slate-200 text-slate-600 transition hover:bg-slate-100 hover:text-slate-900 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-white"
+                    >
+                        <Minus className="h-4 w-4" />
+                    </button>
+                </div>
                 {loading && (
                     <div className="absolute right-3 top-3 text-xs px-2 py-1 rounded bg-white/90 dark:bg-slate-800/90 text-slate-600 dark:text-slate-400 flex items-center gap-1">
                         <Activity className="w-3 h-3 animate-pulse" />
                         加载中
                     </div>
                 )}
-                {showChanlunOverlay && viewMode === 'daily' && overlayLoading && (
+                {showChanlunOverlay && overlayLoading && (
                     <div className="absolute right-3 top-12 text-xs px-2 py-1 rounded bg-white/90 dark:bg-slate-800/90 text-violet-600 dark:text-violet-300 flex items-center gap-1">
                         <Layers3 className="w-3 h-3 animate-pulse" />
                         缠论计算中
@@ -746,7 +937,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                         </div>
                     </div>
                 )}
-                {showChanlunOverlay && viewMode === 'daily' && overlayMessage && !error && (
+                {showChanlunOverlay && overlayMessage && !error && (
                     <div className="absolute left-3 top-12 text-xs px-2 py-1 rounded bg-white/90 dark:bg-slate-800/90 text-violet-600 dark:text-violet-300">
                         {overlayMessage}
                     </div>

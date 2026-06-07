@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from copy import deepcopy
 
@@ -5,6 +6,7 @@ import pandas as pd
 from fastapi.testclient import TestClient
 
 from api.app import app
+from api.routes import strategy_platform
 from api.routes.strategy_platform import _default_dsl, _first_day_band_dsl
 from api.services.a_share_market_rules import get_a_share_market_rule, round_to_tick
 from api.services.minute_data_service import evaluate_intraday_confirmation, get_minute_cache_root, load_aggregated_minute_bars
@@ -112,6 +114,131 @@ def test_llm_draft_exposes_structured_output_schema_and_compile_report():
     assert draft_payload["llm_runtime"]["shared_with_settings"] is True
     assert draft_payload["llm_runtime"]["source"] in {"server_default", "user_settings"}
     assert "api_key" not in draft_payload["llm_runtime"]
+
+
+def test_llm_draft_uses_complete_user_runtime_config(monkeypatch):
+    captured = {}
+
+    def fake_build_runtime_config(overrides, user_id=None, db=None):
+        del overrides, db
+        assert user_id
+        return {
+            "llm_provider": "openai",
+            "backend_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
+            "quick_think_llm": "deepseek-v4-flash",
+            "deep_think_llm": "deepseek-v4-pro",
+            "api_key": "volcengine-key",
+            "_api_key_source": "user_config",
+            "_llm_provider_source": "user_config",
+            "_backend_url_source": "user_config",
+            "_quick_think_llm_source": "user_config",
+            "_deep_think_llm_source": "user_config",
+            "_llm_runtime_force_skipped": "complete_user_config",
+        }
+
+    class FakeLLM:
+        def invoke(self, messages):
+            captured["messages"] = messages
+            dsl = _default_dsl("selection").model_dump()
+            dsl["universe"]["include_concepts"] = ["半导体", "先进封装"]
+            return type(
+                "Result",
+                (),
+                {
+                    "content": json.dumps(
+                        {
+                            "name": "半导体先进封装选股策略",
+                            "strategy_type": "selection",
+                            "intent_summary": "筛选先进封装产业链里资金与业绩共振的标的。",
+                            "pending_confirmations": [],
+                            "data_dependencies": ["stock_daily_kline.close", "stock_daily_kline.net_profit_ttm"],
+                            "risk_notes": ["样本外验证后再进入纸交易。"],
+                            "dsl": dsl,
+                            "explanation": "由远程 LLM 根据用户提示生成。",
+                        },
+                        ensure_ascii=False,
+                    )
+                },
+            )()
+
+    class FakeClient:
+        def get_llm(self):
+            return FakeLLM()
+
+    def fake_create_llm_client(provider, model, base_url=None, **kwargs):
+        captured.update({"provider": provider, "model": model, "base_url": base_url, "kwargs": kwargs})
+        return FakeClient()
+
+    monkeypatch.setattr(strategy_platform, "build_runtime_config", fake_build_runtime_config)
+    monkeypatch.setattr(strategy_platform, "create_llm_client", fake_create_llm_client)
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/strategies/llm-draft",
+        json={"prompt": "创建一个半导体先进封装选股策略", "strategy_type": "selection"},
+        headers={"Authorization": "Bearer dev-test-token-001"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert captured["provider"] == "openai"
+    assert captured["model"] == "deepseek-v4-pro"
+    assert captured["base_url"] == "https://ark.cn-beijing.volces.com/api/coding/v3"
+    assert captured["kwargs"]["api_key"] == "volcengine-key"
+    assert payload["name"] == "半导体先进封装选股策略"
+    assert payload["compile_report"]["status"] == "passed"
+    assert payload["llm_runtime"]["used"] is True
+    assert payload["llm_runtime"]["source"] == "user_settings"
+    assert payload["llm_runtime"]["api_key_source"] == "user_config"
+    assert payload["llm_runtime"]["base_url_source"] == "user_config"
+    assert payload["llm_runtime"]["model_source"] == "user_config"
+    assert payload["llm_runtime"]["runtime_package_source"] == "user_config"
+    assert payload["llm_runtime"]["mixed_account_runtime"] is False
+    assert "api_key" not in payload["llm_runtime"]
+
+
+def test_llm_draft_rejects_mixed_account_runtime(monkeypatch):
+    captured = {"called": False}
+
+    def fake_build_runtime_config(overrides, user_id=None, db=None):
+        del overrides, db
+        assert user_id
+        return {
+            "llm_provider": "openai",
+            "backend_url": "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2",
+            "quick_think_llm": "env-quick",
+            "deep_think_llm": "env-deep",
+            "api_key": "volcengine-key-only",
+            "_api_key_source": "user_config",
+            "_llm_provider_source": "TA_LLM_PROVIDER",
+            "_backend_url_source": "TA_BASE_URL",
+            "_quick_think_llm_source": "TA_LLM_QUICK",
+            "_deep_think_llm_source": "TA_LLM_DEEP",
+        }
+
+    def fake_create_llm_client(*args, **kwargs):
+        captured["called"] = True
+        raise AssertionError("mixed account runtime must not invoke LLM")
+
+    monkeypatch.setattr(strategy_platform, "build_runtime_config", fake_build_runtime_config)
+    monkeypatch.setattr(strategy_platform, "create_llm_client", fake_create_llm_client)
+
+    client = TestClient(app)
+    response = client.post(
+        "/v1/strategies/llm-draft",
+        json={"prompt": "创建一个AI选股策略", "strategy_type": "selection"},
+        headers={"Authorization": "Bearer dev-test-token-001"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert captured["called"] is False
+    assert payload["llm_runtime"]["ready"] is False
+    assert payload["llm_runtime"]["status"] == "mixed_runtime_rejected"
+    assert payload["llm_runtime"]["runtime_package_source"] == "mixed_runtime"
+    assert payload["llm_runtime"]["mixed_account_runtime"] is True
+    assert payload["llm_runtime"]["api_key_source"] == "user_config"
+    assert "api_key" not in payload["llm_runtime"]
 
 
 def test_llm_draft_respects_requested_selection_strategy_type():

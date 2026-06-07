@@ -8,6 +8,9 @@ import secrets
 import smtplib
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+import logging
+
+logger = logging.getLogger(__name__)
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -197,7 +200,7 @@ def get_env_alias(keys: list[str], default: str = "") -> str:
 def send_login_code(email: str, code: str) -> Optional[str]:
     smtp_host = get_env_alias(["MAIL_HOST", "MAIL_SERVER", "SMTP_HOST"]).strip()
     if not smtp_host:
-        print(f"[auth] login code for {email}: {code}")
+        logger.info("[auth] login code for %s: %s", email, code)
         if os.getenv("APP_ENV", "development") != "production":
             return code
         return None
@@ -221,7 +224,7 @@ def send_login_code(email: str, code: str) -> Optional[str]:
     msg.set_content(f"你的量化之神登录验证码是：{code}\n\n10 分钟内有效。")
 
     try:
-        print(f"[auth] connecting to {smtp_host}:{smtp_port} (SSL: {smtp_ssl_tls}, STARTTLS: {smtp_starttls})")
+        logger.info("[auth] connecting to %s:%s (SSL: %s, STARTTLS: %s)", smtp_host, smtp_port, smtp_ssl_tls, smtp_starttls)
         smtp_cls = smtplib.SMTP_SSL if smtp_ssl_tls else smtplib.SMTP
         with smtp_cls(smtp_host, smtp_port, timeout=20) as server:
             if smtp_starttls and not smtp_ssl_tls:
@@ -231,8 +234,8 @@ def send_login_code(email: str, code: str) -> Optional[str]:
             server.send_message(msg)
         return None
     except Exception as e:
-        print(f"[auth] failed to send email via {smtp_host}: {e}")
-        print(f"[auth] falling back to console log. code for {email}: {code}")
+        logger.warning("[auth] failed to send email via %s: %s", smtp_host, e)
+        logger.info("[auth] falling back to console log. code for %s: %s", email, code)
         if os.getenv("APP_ENV", "development") != "production":
             return code
         return None

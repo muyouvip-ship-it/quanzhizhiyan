@@ -12,16 +12,15 @@ from sqlalchemy import text
 from api.database import SessionLocal
 from api.services.market_data_pipeline_service import preferred_daily_kline_table, preferred_minute_kline_table
 from tradingagents.dataflows.trade_calendar import is_cn_trading_day
+from api.core.utils import run_async, env_flag as _env_flag
 
 
 logger = logging.getLogger(__name__)
 _TASK: asyncio.Task | None = None
 _STOP_EVENT: asyncio.Event | None = None
 _POLL_SECONDS = 60
+_STALE_TASK_MINUTES = max(int(os.getenv("BACKTEST_DATA_TASK_STALE_MINUTES", "120") or 120), 30)
 
-
-def _env_flag(name: str, default: str = "0") -> bool:
-    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def is_worker_enabled() -> bool:
@@ -70,6 +69,10 @@ async def _run_loop() -> None:
 def _scan_and_run_once() -> None:
     now = datetime.now(timezone.utc)
     with SessionLocal() as db:
+        recovered = recover_stale_running_tasks(db, now=now)
+        if recovered:
+            db.commit()
+            logger.warning("[backtest-auto-update] recovered stale running tasks count=%s", recovered)
         rows = db.execute(text("""
             SELECT *
             FROM backtest_data_configs
@@ -154,6 +157,10 @@ def _run_single_config(config_id: int, now: datetime, *, force: bool = False) ->
         """), {"config_id": config_id}).fetchone()
         if row is None:
             return []
+        recovered = recover_stale_running_tasks(db, now=now, user_id=str(row.user_id), config_id=int(row.id))
+        if recovered:
+            db.commit()
+            logger.warning("[backtest-auto-update] recovered stale tasks before config run config=%s count=%s", config_id, recovered)
         data_types = [str(item).strip() for item in (row.enabled_data_types or []) if str(item).strip()]
         if not data_types:
             stats_rows = db.execute(text("""
@@ -171,12 +178,13 @@ def _run_single_config(config_id: int, now: datetime, *, force: bool = False) ->
         target_data_date = _resolve_target_data_date_for_config(row, now)
         for data_type in data_types:
             scope_key = _scope_key(row.default_symbols or [])
+            data_source = _effective_subscription_data_source(data_type, row.data_source_preference)
             date_range = _resolve_incremental_date_range(
                 db,
                 config_id=int(row.id),
                 user_id=str(row.user_id),
                 data_type=data_type,
-                data_source=str(row.data_source_preference or "akshare"),
+                data_source=data_source,
                 scope_key=scope_key,
                 default_days=row.default_date_range_days or 365,
                 target_date=target_data_date,
@@ -201,7 +209,7 @@ def _run_single_config(config_id: int, now: datetime, *, force: bool = False) ->
                 user_id=str(row.user_id),
                 config_id=int(row.id),
                 data_type=data_type,
-                data_source=str(row.data_source_preference or "akshare"),
+                data_source=data_source,
                 scope_key=scope_key,
                 last_run_started_at=now,
                 last_status="running",
@@ -215,7 +223,7 @@ def _run_single_config(config_id: int, now: datetime, *, force: bool = False) ->
             """), {
                 "user_id": row.user_id,
                 "task_type": data_type,
-                "data_source": row.data_source_preference or "akshare",
+                "data_source": data_source,
                 "date_range_start": start_date,
                 "date_range_end": end_date,
                 "symbols": row.default_symbols or [],
@@ -263,7 +271,7 @@ def _launch_download_worker(task_ids: list[int], user_id: str) -> None:
     from api.backtest_data_api import _process_batch_download
 
     try:
-        asyncio.run(_process_batch_download(task_ids, user_id))
+        run_async(_process_batch_download(task_ids, user_id))
     except Exception:
         logger.exception("[backtest-auto-update] background download failed user=%s tasks=%s", user_id, task_ids)
 
@@ -435,6 +443,14 @@ def _scope_key(symbols: list[str]) -> str:
     return "symbols:" + ",".join(normalized[:200])
 
 
+def _effective_subscription_data_source(data_type: str, preferred: str | None) -> str:
+    # Daily K-line subscriptions are backed by QuantClass. Keep alternate
+    # daily sources available only for explicit one-off download tasks.
+    if str(data_type or "").strip() == "daily_kline":
+        return "quantclass"
+    return str(preferred or "akshare").strip() or "akshare"
+
+
 def _build_status_payload(db, row, now: datetime) -> dict:
     timezone_name = str(getattr(row, "timezone", None) or "Asia/Shanghai").strip() or "Asia/Shanghai"
     next_run_at = _compute_next_run_at(row, now)
@@ -458,9 +474,17 @@ def _build_status_payload(db, row, now: datetime) -> dict:
         FROM backtest_data_tasks
         WHERE user_id = :user_id
           AND COALESCE(subscription_config_id, 0) = :config_id
+          AND COALESCE(data_source, '') = :data_source
         ORDER BY created_at DESC, id DESC
         LIMIT 1
-    """), {"user_id": row.user_id, "config_id": int(row.id)}).fetchone()
+    """), {
+        "user_id": row.user_id,
+        "config_id": int(row.id),
+        "data_source": _effective_subscription_data_source(
+            "daily_kline" if "daily_kline" in (getattr(row, "enabled_data_types", None) or []) else "",
+            getattr(row, "data_source_preference", None),
+        ),
+    }).fetchone()
     running_task_count = db.execute(text("""
         SELECT COUNT(*)
         FROM backtest_data_tasks
@@ -571,6 +595,85 @@ def _task_row_to_payload(row) -> dict:
         "completed_at": row.completed_at.isoformat() if getattr(row, "completed_at", None) else None,
         "error_message": row.error_message,
     }
+
+
+def recover_stale_running_tasks(
+    db,
+    *,
+    now: datetime | None = None,
+    user_id: str | None = None,
+    config_id: int | None = None,
+    stale_minutes: int | None = None,
+) -> int:
+    del now
+    effective_stale_minutes = int(stale_minutes if stale_minutes is not None else _STALE_TASK_MINUTES)
+    params: dict[str, object] = {
+        "stale_minutes": effective_stale_minutes,
+        "error_message": f"任务超过 {effective_stale_minutes} 分钟未更新，已自动标记失败；可重新触发订阅。",
+    }
+    filters = ["status IN ('pending', 'running')", "updated_at < (NOW() - (:stale_minutes * INTERVAL '1 minute'))"]
+    if user_id is not None:
+        filters.append("user_id = :user_id")
+        params["user_id"] = str(user_id)
+    if config_id is not None:
+        filters.append("COALESCE(subscription_config_id, 0) = :config_id")
+        params["config_id"] = int(config_id)
+
+    rows = db.execute(text(f"""
+        SELECT id, user_id, task_type, data_source, symbols, subscription_config_id
+        FROM backtest_data_tasks
+        WHERE {" AND ".join(filters)}
+        ORDER BY updated_at ASC, id ASC
+        LIMIT 200
+    """), params).fetchall()
+    if not rows:
+        return 0
+
+    task_ids = [int(row.id) for row in rows]
+    db.execute(text("""
+        UPDATE backtest_data_tasks
+        SET status = 'failed',
+            error_message = :error_message,
+            completed_at = NOW(),
+            updated_at = NOW()
+        WHERE id = ANY(:task_ids)
+    """), {**params, "task_ids": task_ids})
+
+    for row in rows:
+        if not getattr(row, "subscription_config_id", None):
+            continue
+        task_symbols = list(row.symbols or [])
+        scope_key = "all"
+        if task_symbols:
+            scope_key = "symbols:" + ",".join(sorted({str(item).strip().upper() for item in task_symbols if str(item).strip()})[:200])
+        watermark = db.execute(text("""
+            SELECT id
+            FROM backtest_data_watermarks
+            WHERE user_id = :user_id
+              AND config_id = :config_id
+              AND data_type = :data_type
+              AND COALESCE(data_source, '') = :data_source
+              AND scope_key = :scope_key
+            LIMIT 1
+        """), {
+            "user_id": str(row.user_id),
+            "config_id": int(row.subscription_config_id),
+            "data_type": str(row.task_type or ""),
+            "data_source": str(row.data_source or ""),
+            "scope_key": scope_key,
+        }).fetchone()
+        if watermark:
+            db.execute(text("""
+                UPDATE backtest_data_watermarks
+                SET last_status = 'failed',
+                    last_error = :error_message,
+                    updated_at = NOW()
+                WHERE id = :id
+            """), {
+                "id": int(watermark.id),
+                "error_message": params["error_message"],
+            })
+    return len(rows)
 
 
 def _touch_watermark(

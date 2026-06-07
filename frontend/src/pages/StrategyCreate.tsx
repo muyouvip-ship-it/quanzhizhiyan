@@ -306,7 +306,7 @@ export default function StrategyCreate() {
       setSchemaLoaded(
         Boolean(response.structured_output_schema) || schemaLoaded,
       );
-      setMessage("已生成 DSL 草稿；请继续校验并保存。");
+      setMessage(formatLlmDraftMessage(response.llm_runtime));
     } catch (error) {
       console.warn("LLM 草案接口暂不可用", error);
       setDraftMeta(null);
@@ -600,6 +600,7 @@ export default function StrategyCreate() {
                 />
                 {loadingDraft ? "生成中..." : "生成 DSL 草稿"}
               </button>
+              <LlmRuntimeStatus runtime={draftMeta?.llm_runtime} />
             </section>
           )}
 
@@ -838,6 +839,114 @@ function MetricCard({ label, value }: { label: string; value: string }) {
       <div className="mt-1 text-sm font-semibold text-slate-700 dark:text-slate-200">
         {value}
       </div>
+    </div>
+  );
+}
+
+function runtimeText(
+  runtime: Record<string, unknown> | undefined,
+  key: string,
+): string {
+  const value = runtime?.[key];
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return "";
+}
+
+function runtimeBool(
+  runtime: Record<string, unknown> | undefined,
+  key: string,
+): boolean {
+  return runtime?.[key] === true;
+}
+
+function llmRuntimeStatusLabel(runtime?: Record<string, unknown>): {
+  label: string;
+  tone: "emerald" | "amber" | "rose" | "slate";
+} {
+  const status = runtimeText(runtime, "status");
+  if (runtimeBool(runtime, "used") || status === "used") {
+    return { label: "远程 LLM 已使用", tone: "emerald" };
+  }
+  if (status === "failed") return { label: "LLM 失败，已兜底", tone: "rose" };
+  if (status === "missing_api_key") return { label: "缺少 API Key", tone: "amber" };
+  if (status === "local_rejected") return { label: "本地模型已拒绝", tone: "amber" };
+  if (status === "ready") return { label: "远程 LLM 就绪", tone: "emerald" };
+  if (status === "not_authenticated") return { label: "未登录未调用", tone: "slate" };
+  if (status === "missing_model") return { label: "缺少模型配置", tone: "amber" };
+  return { label: "待生成", tone: "slate" };
+}
+
+function formatLlmDraftMessage(runtime?: Record<string, unknown>): string {
+  const status = runtimeText(runtime, "status");
+  const model =
+    runtimeText(runtime, "model_used") ||
+    runtimeText(runtime, "deep_think_llm") ||
+    runtimeText(runtime, "quick_think_llm");
+  if (runtimeBool(runtime, "used") || status === "used") {
+    return `已通过远程 LLM 生成 DSL 草稿${model ? `：${model}` : ""}；请继续校验并保存。`;
+  }
+  if (status === "failed") {
+    return "远程 LLM 生成失败，已使用规则模板兜底；请检查设置页或上游模型状态。";
+  }
+  if (status === "missing_api_key" || status === "missing_model") {
+    return "LLM 配置不完整，已使用规则模板兜底。";
+  }
+  if (status === "local_rejected") {
+    return "当前配置指向本地模型，已拒绝并使用规则模板兜底。";
+  }
+  return "已生成 DSL 草稿；请继续校验并保存。";
+}
+
+function LlmRuntimeStatus({
+  runtime,
+}: {
+  runtime?: Record<string, unknown>;
+}) {
+  const status = llmRuntimeStatusLabel(runtime);
+  const toneClass =
+    status.tone === "emerald"
+      ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-200"
+      : status.tone === "amber"
+        ? "bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-200"
+        : status.tone === "rose"
+          ? "bg-rose-50 text-rose-700 dark:bg-rose-500/10 dark:text-rose-200"
+          : "bg-slate-50 text-slate-600 dark:bg-slate-950 dark:text-slate-300";
+  const model =
+    runtimeText(runtime, "model_used") ||
+    runtimeText(runtime, "deep_think_llm") ||
+    runtimeText(runtime, "quick_think_llm");
+  const rows = [
+    { label: "模型", value: model },
+    { label: "Base URL", value: runtimeText(runtime, "backend_url") },
+    { label: "Key Source", value: runtimeText(runtime, "api_key_source") },
+    { label: "Base Source", value: runtimeText(runtime, "base_url_source") },
+    { label: "Model Source", value: runtimeText(runtime, "model_source") },
+  ].filter((item) => item.value);
+  const reason = runtimeText(runtime, "reason");
+
+  return (
+    <div className="mt-4 space-y-3 text-xs">
+      <div className={`inline-flex rounded-full px-2.5 py-1 font-medium ${toneClass}`}>
+        {status.label}
+      </div>
+      {rows.length ? (
+        <div className="grid gap-2 text-slate-600 dark:text-slate-300">
+          {rows.map((item) => (
+            <div key={item.label} className="flex min-w-0 justify-between gap-3">
+              <span className="shrink-0 text-slate-400">{item.label}</span>
+              <span className="truncate text-right font-medium">{item.value}</span>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="text-slate-500 dark:text-slate-400">
+          生成后显示模型、端点和配置来源。
+        </div>
+      )}
+      {reason ? <div className="text-slate-500 dark:text-slate-400">{reason}</div> : null}
     </div>
   );
 }

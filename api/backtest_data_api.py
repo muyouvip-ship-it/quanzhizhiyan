@@ -1,8 +1,9 @@
+from api.core.utils import run_async
 """
 回测数据配置和管理API
 """
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Body
+from fastapi import APIRouter, Depends, HTTPException, Body
 from sqlalchemy.orm import Session
 from sqlalchemy import bindparam, text
 import calendar as month_calendar
@@ -11,6 +12,7 @@ from typing import Any, List, Optional
 import asyncio
 import json
 import logging
+import threading
 import pandas as pd
 
 from api.database import get_db, get_db_ctx, UserDB
@@ -41,11 +43,13 @@ _TABLE_STATS_MAPPING = {
     # 设置页统计必须走最终物理表，不能扫 market_* 兼容视图。
     "daily_kline": ("stock_daily_kline", "trade_date"),
     "index_data": ("index_daily_data", "trade_date"),
+    "index_daily_kline": ("index_daily_kline", "trade_date"),
     "minute_kline": ("stock_minute_kline", "trade_time"),
     "index_minute_kline": ("index_minute_kline", "trade_time"),
 }
 
 _DAILY_KLINE_CALENDAR_TABLES = ("stock_daily_kline",)
+_FAST_STATS_EXACT_ROW_THRESHOLD = 2_000_000
 
 
 def _normalize_config_payload(payload: dict) -> dict:
@@ -79,6 +83,11 @@ def _normalize_config_payload(payload: dict) -> dict:
         or raw.get("data_source")
         or "akshare"
     ).strip() or "akshare"
+    # Subscription UI no longer exposes Tencent as a selectable daily source.
+    # Keep Tencent available for explicit one-off download tasks, but prevent
+    # stale saved subscription configs from silently bypassing QuantClass.
+    if "daily_kline" in enabled_data_types and data_source_preference.lower() == "tencent":
+        data_source_preference = "quantclass"
     auto_download = bool(raw.get("auto_download")) if "auto_download" in raw else bool(raw.get("auto_update", False))
     update_frequency = raw.get("update_frequency")
     if not update_frequency and auto_download:
@@ -148,10 +157,8 @@ def _build_backtest_table_stat(db: Session, *, data_type: str, table_name: str, 
     if data_type == "daily_kline":
         return _build_daily_kline_stat(db, data_type=data_type, table_name=table_name, date_column=date_column)
 
-    # 分钟级数据量极大，完整 COUNT DISTINCT / 重复检查会拖慢接口。
-    # 这里改为快速估算，避免设置页统计把整个 API 拖进“假死”状态。
     if data_type in {"minute_kline", "index_minute_kline"}:
-        return _build_minute_kline_stat(db, data_type=data_type, table_name=table_name, date_column=date_column)
+        return _build_large_table_stat(db, data_type=data_type, table_name=table_name, date_column=date_column)
 
     normalized_symbol_expr = _normalized_symbol_sql("symbol") if data_type == "daily_kline" else "symbol"
     row = db.execute(text(f"""
@@ -209,7 +216,7 @@ def _build_backtest_table_stat(db: Session, *, data_type: str, table_name: str, 
 
 def _build_daily_kline_stat(db: Session, *, data_type: str, table_name: str, date_column: str) -> BacktestDataStats | None:
     cache_stats = get_daily_kline_parquet_stats()
-    db_stats = _collect_daily_kline_stats(db, table_name=table_name, date_column=date_column)
+    db_stats = _collect_large_table_stats(db, data_type=data_type, table_name=table_name, date_column=date_column)
     cache_end = _coerce_date(cache_stats.get("date_range_end")) if cache_stats else None
     db_end = _coerce_date(db_stats.get("date_range_end")) if db_stats else None
 
@@ -252,7 +259,7 @@ def _build_daily_kline_stat(db: Session, *, data_type: str, table_name: str, dat
         trading_days=int(db_stats.get("trading_days") or 0) if db_stats.get("trading_days") is not None else None,
         last_updated_date=db_stats.get("date_range_end"),
         last_table_updated_at=db_stats.get("last_table_updated_at"),
-        coverage_source=db_stats.get("coverage_source") or "postgresql",
+        coverage_source=db_stats.get("coverage_source") or "postgresql_fast",
         db_date_range_start=db_stats.get("date_range_start"),
         db_date_range_end=db_stats.get("date_range_end"),
         cache_date_range_start=cache_stats.get("date_range_start") if cache_stats else None,
@@ -265,15 +272,14 @@ def _build_daily_kline_stat(db: Session, *, data_type: str, table_name: str, dat
     )
 
 
-def _build_minute_kline_stat(db: Session, *, data_type: str, table_name: str, date_column: str) -> BacktestDataStats | None:
-    base_records = _estimate_table_rows(db, table_name)
-    if int(base_records or 0) <= 0:
+def _build_large_table_stat(db: Session, *, data_type: str, table_name: str, date_column: str) -> BacktestDataStats | None:
+    stats = _collect_large_table_stats(db, data_type=data_type, table_name=table_name, date_column=date_column)
+    if not stats or int(stats.get("total_records") or 0) <= 0:
         return None
 
-    base_range = _fast_min_max_date(db, table_name, date_column) if _estimate_is_small(base_records) else None
-    min_date = base_range[0] if base_range else None
-    max_date = base_range[1] if base_range else None
-    last_table_updated_at = _latest_table_timestamp(db, table_name) if _estimate_is_small(base_records) else None
+    min_date = stats.get("date_range_start")
+    max_date = stats.get("date_range_end")
+    last_table_updated_at = stats.get("last_table_updated_at")
     now = last_table_updated_at or datetime.utcnow()
 
     return BacktestDataStats(
@@ -281,12 +287,12 @@ def _build_minute_kline_stat(db: Session, *, data_type: str, table_name: str, da
         symbol=None,
         date_range_start=min_date,
         date_range_end=max_date,
-        total_records=int(base_records or 0),
-        symbol_count=None,
-        trading_days=None,
+        total_records=int(stats.get("total_records") or 0),
+        symbol_count=stats.get("symbol_count"),
+        trading_days=stats.get("trading_days"),
         last_updated_date=max_date,
         last_table_updated_at=last_table_updated_at,
-        coverage_source="postgresql_estimate",
+        coverage_source=stats.get("coverage_source") or "postgresql_fast",
         db_date_range_start=min_date,
         db_date_range_end=max_date,
         cache_date_range_start=None,
@@ -300,13 +306,105 @@ def _build_minute_kline_stat(db: Session, *, data_type: str, table_name: str, da
 
 
 def _collect_daily_kline_stats(db: Session, *, table_name: str, date_column: str) -> dict | None:
-    base_stats = _aggregate_table_stats(db, table_name=table_name, date_column=date_column)
+    base_stats = _collect_large_table_stats(
+        db,
+        data_type="daily_kline",
+        table_name=table_name,
+        date_column=date_column,
+    )
     if not base_stats:
         return None
     return {
         **base_stats,
-        "coverage_source": "postgresql_final",
+        "coverage_source": "postgresql_final_fast",
     }
+
+
+def _collect_large_table_stats(db: Session, *, data_type: str, table_name: str, date_column: str) -> dict | None:
+    if not _relation_exists(db, table_name):
+        return None
+
+    cached = _load_cached_data_stat(db, data_type=data_type)
+    estimated_records = _estimate_table_rows(db, table_name)
+    primary_key_records = _fast_primary_key_row_estimate(db, table_name)
+    date_range = _fast_min_max_date_by_order(db, table_name=table_name, date_column=date_column)
+    min_date = date_range[0] if date_range else None
+    max_date = date_range[1] if date_range else None
+    if cached:
+        min_date = _min_date(min_date, cached.get("date_range_start"))
+        max_date = _max_date(max_date, cached.get("date_range_end"))
+
+    total_records = _choose_fast_total_records(
+        cached_total=int(cached.get("total_records") or 0) if cached else 0,
+        estimated_records=int(estimated_records or 0),
+        primary_key_records=int(primary_key_records or 0),
+        cached_end=_coerce_date(cached.get("date_range_end")) if cached else None,
+        db_end=max_date,
+    )
+
+    if total_records <= 0 and (min_date is None or max_date is None):
+        return None
+
+    last_table_updated_at = _fast_latest_timestamp_by_primary_key(db, table_name)
+    cached_updated_at = cached.get("updated_at") if cached else None
+    last_table_updated_at = _max_datetime(last_table_updated_at, cached_updated_at)
+
+    symbol_count = None
+    trading_days = None
+    if total_records and total_records <= _FAST_STATS_EXACT_ROW_THRESHOLD:
+        light_stats = _aggregate_table_stats(db, table_name=table_name, date_column=date_column)
+        if light_stats:
+            total_records = int(light_stats.get("total_records") or 0)
+            min_date = _min_date(min_date, light_stats.get("date_range_start"))
+            max_date = _max_date(max_date, light_stats.get("date_range_end"))
+            symbol_count = light_stats.get("symbol_count")
+            trading_days = light_stats.get("trading_days")
+            last_table_updated_at = _max_datetime(last_table_updated_at, light_stats.get("last_table_updated_at"))
+
+    return {
+        "total_records": int(total_records or 0),
+        "symbol_count": symbol_count,
+        "trading_days": trading_days,
+        "date_range_start": min_date,
+        "date_range_end": max_date,
+        "last_table_updated_at": last_table_updated_at,
+        "coverage_source": "postgresql_fast",
+    }
+
+
+def _choose_fast_total_records(
+    *,
+    cached_total: int,
+    estimated_records: int,
+    primary_key_records: int,
+    cached_end: date | None,
+    db_end: date | None,
+) -> int:
+    if cached_total > 0 and cached_end and db_end and cached_end >= db_end:
+        return int(cached_total)
+    if estimated_records >= max(cached_total // 2, 1_000_000):
+        return int(estimated_records)
+    if cached_total > 0 and cached_end and db_end and cached_end >= db_end - timedelta(days=7):
+        return int(cached_total)
+    if cached_total > 0 and primary_key_records <= 0:
+        return int(cached_total)
+    if primary_key_records > 0:
+        return int(primary_key_records)
+    return max(int(cached_total or 0), int(estimated_records or 0))
+
+
+def _load_cached_data_stat(db: Session, *, data_type: str) -> dict | None:
+    if not _relation_exists(db, "backtest_data_stats"):
+        return None
+    row = db.execute(text("""
+        SELECT total_records, date_range_start, date_range_end, last_updated_date, updated_at
+        FROM backtest_data_stats
+        WHERE data_type = :data_type
+          AND (symbol IS NULL OR symbol = '')
+        ORDER BY updated_at DESC, id DESC
+        LIMIT 1
+    """), {"data_type": data_type}).mappings().first()
+    return dict(row) if row else None
 
 
 def _aggregate_table_stats(db: Session, *, table_name: str, date_column: str) -> dict | None:
@@ -368,6 +466,18 @@ def _estimate_table_rows(db: Session, table_name: str) -> int:
     }).scalar() or 0)
 
 
+def _fast_primary_key_row_estimate(db: Session, table_name: str) -> int:
+    if not _relation_exists(db, table_name) or not _table_has_column(db, table_name, "id"):
+        return 0
+    value = db.execute(text(f"""
+        SELECT id
+        FROM {table_name}
+        ORDER BY id DESC
+        LIMIT 1
+    """)).scalar()
+    return int(value or 0)
+
+
 def _estimate_is_small(row_estimate: int | None, *, threshold: int = 5_000_000) -> bool:
     return int(row_estimate or 0) <= threshold
 
@@ -398,12 +508,50 @@ def _fast_min_max_date(db: Session, table_name: str, date_column: str) -> tuple[
     return _coerce_date(row.min_value), _coerce_date(row.max_value)
 
 
+def _fast_min_max_date_by_order(db: Session, *, table_name: str, date_column: str) -> tuple[date | None, date | None] | None:
+    if not _relation_exists(db, table_name):
+        return None
+    min_value = db.execute(text(f"""
+        SELECT {date_column}
+        FROM {table_name}
+        WHERE {date_column} IS NOT NULL
+        ORDER BY {date_column} ASC
+        LIMIT 1
+    """)).scalar()
+    max_value = db.execute(text(f"""
+        SELECT {date_column}
+        FROM {table_name}
+        WHERE {date_column} IS NOT NULL
+        ORDER BY {date_column} DESC
+        LIMIT 1
+    """)).scalar()
+    return _coerce_date(min_value), _coerce_date(max_value)
+
+
 def _latest_table_timestamp(db: Session, table_name: str) -> datetime | None:
     if _table_has_column(db, table_name, "updated_at"):
         return db.execute(text(f"SELECT MAX(updated_at) FROM {table_name}")).scalar()
     if _table_has_column(db, table_name, "created_at"):
         return db.execute(text(f"SELECT MAX(created_at) FROM {table_name}")).scalar()
     return None
+
+
+def _fast_latest_timestamp_by_primary_key(db: Session, table_name: str) -> datetime | None:
+    if not _relation_exists(db, table_name) or not _table_has_column(db, table_name, "id"):
+        return None
+    if _table_has_column(db, table_name, "updated_at"):
+        column = "updated_at"
+    elif _table_has_column(db, table_name, "created_at"):
+        column = "created_at"
+    else:
+        return None
+    return db.execute(text(f"""
+        SELECT {column}
+        FROM {table_name}
+        WHERE {column} IS NOT NULL
+        ORDER BY id DESC
+        LIMIT 1
+    """)).scalar()
 
 
 def _count_distinct_dates_after(db: Session, *, table_name: str, date_column: str, after_date: date) -> int:
@@ -657,7 +805,7 @@ def _normalized_symbol_sql(column_name: str = "symbol") -> str:
 
 # 数据源兼容性映射
 DATA_SOURCE_COMPATIBILITY = {
-    'daily_kline': ['quantclass', 'akshare', 'baostock', 'tushare', 'eastmoney'],
+    'daily_kline': ['quantclass', 'tencent', 'akshare', 'baostock'],
     'minute_kline': ['qmt', 'akshare'],  # QMT 优先，AKShare 作为兜底
     'index_data': ['quantclass', 'akshare', 'baostock', 'tushare', 'eastmoney'],
     'index_minute_kline': ['qmt', 'akshare'],
@@ -1152,32 +1300,23 @@ def get_daily_kline_governance_summary(
     try:
         del current_user
         preferred_table = preferred_daily_kline_table()
-        final_table = _daily_governance_table_stats(db, "stock_daily_kline")
+        final_table = _daily_governance_table_stats(db, preferred_table)
         published = _daily_governance_table_stats(db, "pub_stock_daily_kline")
         norm = _daily_governance_table_stats(db, "norm_stock_daily_kline")
-        final_stats = _collect_daily_kline_stats(db, table_name="stock_daily_kline", date_column="trade_date")
-        final_summary = _serialize_governance_stats(
-            {
-                **(final_stats or {}),
-                "table_name": preferred_table,
-                "layer": "final_table",
-                "description": "最终业务表，吸收治理链路发布后的日 K 数据",
-            }
-        ) if final_stats else {
+        final_summary = _serialize_governance_stats({
+            **final_table,
             "table_name": preferred_table,
             "layer": "final_table",
             "description": "最终业务表，吸收治理链路发布后的日 K 数据",
-            "exists": _relation_exists(db, preferred_table),
-            "total_records": 0,
-        }
-        latest_date = final_summary.get("date_range_end")
-        if latest_date:
-            final_summary["latest_date_row_count"] = _count_rows_on_date(
-                db,
-                table_name=preferred_table,
-                date_column="trade_date",
-                trade_date=_parse_optional_date(latest_date),
-            )
+        }) if final_table.get("exists") else _serialize_governance_stats(
+            {
+                "table_name": preferred_table,
+                "layer": "final_table",
+                "description": "最终业务表，吸收治理链路发布后的日 K 数据",
+                "exists": _relation_exists(db, preferred_table),
+                "total_records": 0,
+            }
+        )
 
         raw_layers = []
         for source, table_name in DAILY_RAW_TABLES.items():
@@ -1232,7 +1371,10 @@ def _daily_governance_table_stats(db: Session, table_name: str) -> dict[str, Any
             "date_range_end": None,
             "latest_date_row_count": 0,
         }
-    stats = _aggregate_table_stats(db, table_name=table_name, date_column="trade_date") or {}
+    if table_name == preferred_daily_kline_table():
+        stats = _collect_daily_kline_stats(db, table_name=table_name, date_column="trade_date") or {}
+    else:
+        stats = _aggregate_table_stats(db, table_name=table_name, date_column="trade_date") or {}
     latest_date = stats.get("date_range_end")
     payload = _serialize_governance_stats({
         "table_name": table_name,
@@ -1396,7 +1538,6 @@ def _daily_reconciliation_item_summary(db: Session, run_id: str | None) -> list[
 @router.post("/batch-download")
 def batch_download_data(
     request: BatchDataDownloadRequest,
-    background_tasks: BackgroundTasks,
     current_user: UserDB = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -1440,8 +1581,13 @@ def batch_download_data(
         
         db.commit()
         
-        # 在后台启动下载任务
-        background_tasks.add_task(_run_process_batch_download, task_ids, current_user.id)
+        thread = threading.Thread(
+            target=_run_process_batch_download,
+            args=(task_ids, current_user.id),
+            daemon=True,
+            name=f"backtest-batch-download-{','.join(map(str, task_ids))}",
+        )
+        thread.start()
         
         return {
             "message": "批量下载任务已创建",
@@ -1616,76 +1762,96 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                     
                     else:
                         # 使用AKShare数据源
-                        logger.info("使用AKShare数据源下载股票日K线")
+                        logger.info("使用%s数据源下载股票日K线", task.data_source or "akshare")
                         
                         # 获取股票列表
                         symbols = downloader.get_all_stock_symbols()
                         if task.symbols:
                             # 如果指定了股票代码，只下载指定的
                             symbols = [s for s in symbols if s in task.symbols]
-                        
-                        total_stocks = len(symbols)
-                        logger.info(f"准备下载 {total_stocks} 只股票的日K线数据 (使用AKShare)")
-                    
-                        # 并行下载（每次处理10只股票，避免源端限流）
-                        batch_size = 10
-                        for i in range(0, len(symbols), batch_size):
-                            batch = symbols[i:i+batch_size]
-                            
-                            # 并行下载这一批股票
-                            download_tasks = [
-                                downloader.download_daily_kline(
-                                    symbol, task.date_range_start, task.date_range_end, source=task.data_source or "akshare"
-                                )
-                                for symbol in batch
-                            ]
-                            results = await asyncio.gather(*download_tasks, return_exceptions=True)
-                            
-                            # 统计结果
-                            for symbol, result in zip(batch, results):
-                                if isinstance(result, Exception):
-                                    logger.error(f"股票 {symbol} 下载异常: {result}")
-                                    error_count += 1
-                                elif result['success']:
-                                    total_records += result['records']
-                                    success_count += 1
-                                else:
-                                    logger.error(f"股票 {symbol} 下载失败: {result.get('error', '未知错误')}")
-                                    error_count += 1
-                            
-                            # 更新进度
-                            progress = int((i + len(batch)) / max(len(symbols), 1) * 100)
+                        if not symbols:
+                            error_count = 1
+                            specific_error_message = "未获取到可下载的股票列表，任务未执行；请稍后重试或改用指定股票范围。"
+                            logger.error(specific_error_message)
                             with get_db_ctx() as db_update:
                                 db_update.execute(text("""
-                                    UPDATE backtest_data_tasks 
-                                    SET progress = :progress, 
-                                        downloaded_records = :records,
+                                    UPDATE backtest_data_tasks
+                                    SET error_message = :error_message,
                                         updated_at = NOW()
                                     WHERE id = :task_id
-                                """), {
-                                    "task_id": task_id,
-                                    "progress": min(progress, 100),
-                                    "records": total_records
-                                })
+                                """), {"task_id": task_id, "error_message": specific_error_message})
                                 db_update.commit()
+                        else:
+                        
+                            total_stocks = len(symbols)
+                            logger.info(f"准备下载 {total_stocks} 只股票的日K线数据 (使用{task.data_source or 'akshare'})")
+                    
+                            # 并行下载（每次处理10只股票，避免源端限流）
+                            batch_size = 10
+                            for i in range(0, len(symbols), batch_size):
+                                batch = symbols[i:i+batch_size]
                             
-                            # 批次间延迟，避免源端限流
-                            await asyncio.sleep(2)
+                                # 并行下载这一批股票
+                                download_tasks = [
+                                    downloader.download_daily_kline(
+                                        symbol, task.date_range_start, task.date_range_end, source=task.data_source or "akshare"
+                                    )
+                                    for symbol in batch
+                                ]
+                                results = await asyncio.gather(*download_tasks, return_exceptions=True)
+                            
+                                # 统计结果
+                                for symbol, result in zip(batch, results):
+                                    if isinstance(result, Exception):
+                                        logger.error(f"股票 {symbol} 下载异常: {result}")
+                                        error_count += 1
+                                    elif result['success']:
+                                        total_records += result['records']
+                                        success_count += 1
+                                    else:
+                                        logger.error(f"股票 {symbol} 下载失败: {result.get('error', '未知错误')}")
+                                        error_count += 1
+                            
+                                # 更新进度
+                                progress = int((i + len(batch)) / max(len(symbols), 1) * 100)
+                                with get_db_ctx() as db_update:
+                                    db_update.execute(text("""
+                                        UPDATE backtest_data_tasks 
+                                        SET progress = :progress, 
+                                            downloaded_records = :records,
+                                            updated_at = NOW()
+                                        WHERE id = :task_id
+                                    """), {
+                                        "task_id": task_id,
+                                        "progress": min(progress, 100),
+                                        "records": total_records
+                                    })
+                                    db_update.commit()
+                            
+                                # 批次间延迟，避免源端限流
+                                await asyncio.sleep(2)
 
-                        if success_count > 0:
-                            cache_refresh = _refresh_daily_kline_cache_from_db(
-                                db,
-                                start_date=task.date_range_start,
-                                end_date=task.date_range_end,
-                                symbols=task.symbols or None,
-                            )
-                            logger.info(
-                                "AKShare日K缓存刷新: updated=%s records=%s range=%s~%s",
-                                cache_refresh.get("updated"),
-                                cache_refresh.get("records"),
-                                cache_refresh.get("date_range_start"),
-                                cache_refresh.get("date_range_end"),
-                            )
+                            if success_count > 0:
+                                cache_refresh = _refresh_daily_kline_cache_from_db(
+                                    db,
+                                    start_date=task.date_range_start,
+                                    end_date=task.date_range_end,
+                                    symbols=task.symbols or None,
+                                )
+                                logger.info(
+                                    "%s日K缓存刷新: updated=%s records=%s range=%s~%s",
+                                    task.data_source or "akshare",
+                                    cache_refresh.get("updated"),
+                                    cache_refresh.get("records"),
+                                    cache_refresh.get("date_range_start"),
+                                    cache_refresh.get("date_range_end"),
+                                )
+                            if total_records <= 0 and error_count == 0:
+                                error_count = 1
+                                specific_error_message = (
+                                    f"{task.data_source or 'akshare'} 未返回 {task.date_range_start} ~ "
+                                    f"{task.date_range_end} 的日K数据，任务未写入新记录。"
+                                )
                 elif task.task_type == 'index_data':
                     # 检查数据源
                     if task.data_source == 'quantclass':
@@ -2176,7 +2342,7 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
 
 def _run_process_batch_download(task_ids: List[int], user_id: str) -> None:
     """Run the async batch processor off the main event loop."""
-    asyncio.run(_process_batch_download(task_ids, user_id))
+    run_async(_process_batch_download(task_ids, user_id))
 
 
 

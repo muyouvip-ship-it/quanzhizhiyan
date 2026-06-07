@@ -12,7 +12,7 @@ from tradingagents.default_config import DEFAULT_CONFIG as _BASE_DEFAULT_CONFIG
 
 from api.app import app
 from api.core.scheduler import scheduled_analysis_slot
-from api.core.runtime_config import deep_merge, user_config_overrides
+from api.core.runtime_config import build_runtime_config
 from api.core.stock_map import (
     _cn_stock_map as _core_cn_stock_map,
     _cn_stock_reverse_map as _core_cn_stock_reverse_map,
@@ -60,25 +60,7 @@ def _build_runtime_config(*args, **kwargs):
     overrides = args[0] if args else kwargs.get("overrides", {})
     user_id = kwargs.get("user_id")
     db = kwargs.get("db")
-
-    config = deepcopy(DEFAULT_CONFIG)
-    config["server_fallback_enabled"] = os.getenv("ALLOW_SERVER_LLM_FALLBACK", "1").strip().lower() in ("1", "true", "yes", "on")
-
-    request_overrides = {k: v for k, v in dict(overrides or {}).items() if v not in (None, "", [])}
-    stored_overrides = {k: v for k, v in user_config_overrides(user_id, db=db).items() if v not in (None, "", [])}
-
-    if stored_overrides:
-        config = deep_merge(config, stored_overrides)
-    if request_overrides:
-        config = deep_merge(config, request_overrides)
-
-    quick = config.get("quick_think_llm")
-    deep = config.get("deep_think_llm")
-    if not deep and quick:
-        config["deep_think_llm"] = quick
-    if not quick and deep:
-        config["quick_think_llm"] = deep
-    return config
+    return build_runtime_config(overrides or {}, user_id=user_id, db=db)
 
 
 def _build_pending_runtime_config(updates: UserRuntimeConfigUpdateRequest, user_id: str, db) -> Dict[str, Any]:

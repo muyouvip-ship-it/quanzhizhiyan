@@ -10,7 +10,7 @@ from api.main import app
 from api.core.strategy_db import get_strategy_db_ctx
 from api.models.strategy_models import RealtimeApprovalDB, RealtimeMonitorDB, RealtimeSignalExecutionDB
 from api.routes.strategy_platform import _default_dsl
-from api.services import qmt_minute_subscription_service, qmt_virtual_account_service, realtime_monitor_service
+from api.services import catalyst_selection_service, qmt_minute_subscription_service, qmt_virtual_account_service, realtime_monitor_service
 from api.services.qmt_virtual_account_service import QmtRuntimeConfig
 
 
@@ -812,6 +812,96 @@ def test_qmt_minute_subscription_resolve_capture_symbols_has_no_200_cap(monkeypa
     assert scope_key.startswith("intraday_capture:count=250:")
 
 
+def test_qmt_minute_subscription_refreshes_realtime_selection_after_capture(monkeypatch):
+    qmt_minute_subscription_service._LAST_SELECTION_REFRESH_AT = None
+    monkeypatch.setenv("AI_QUANT_MINUTE_CAPTURE_REFRESH_SELECTION", "1")
+    monkeypatch.setenv("AI_QUANT_MINUTE_SELECTION_REFRESH_INTERVAL_SECONDS", "55")
+    calls: list[dict[str, object]] = []
+
+    class FakeDb:
+        def rollback(self):
+            calls.append({"rollback": True})
+
+    fake_db = FakeDb()
+
+    def fake_refresh(*args, **kwargs):
+        raise AssertionError("minute capture should schedule selection refresh asynchronously")
+
+    def fake_schedule(*, trigger, windows, limit, user_id=None, trade_date=None, reason=None, context=None):
+        calls.append(
+            {
+                "trigger": trigger,
+                "windows": tuple(windows),
+                "limit": limit,
+                "user_id": user_id,
+                "trade_date": trade_date,
+                "reason": reason,
+                "context": context,
+            }
+        )
+        return {
+            "trigger": trigger,
+            "windows": list(windows),
+            "generated": [],
+            "errors": [],
+            "skipped": False,
+            "status": "scheduled",
+        }
+
+    monkeypatch.setattr(catalyst_selection_service, "refresh_event_driven_selection", fake_refresh)
+    monkeypatch.setattr(catalyst_selection_service, "schedule_event_driven_selection_refresh", fake_schedule)
+    now = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
+
+    refreshed = qmt_minute_subscription_service._refresh_realtime_selection_after_capture(
+        fake_db,
+        user_id="user-1",
+        now=now,
+        capture_result={"success": True, "rows": 128},
+    )
+    debounced = qmt_minute_subscription_service._refresh_realtime_selection_after_capture(
+        fake_db,
+        user_id="user-1",
+        now=now + timedelta(seconds=10),
+        capture_result={"success": True, "rows": 88},
+    )
+
+    assert refreshed["status"] == "scheduled"
+    assert refreshed["scheduled"] is True
+    assert refreshed["generated_count"] == 0
+    assert refreshed["capture_success"] is True
+    assert refreshed["capture_rows"] == 128
+    assert debounced == {"status": "skipped", "reason": "debounced"}
+    assert calls == [
+        {
+            "trigger": "qmt-minute-subscription:intraday",
+            "windows": ("24h",),
+            "limit": 10,
+            "user_id": "user-1",
+            "trade_date": None,
+            "reason": "minute_capture",
+            "context": {
+                "capture_success": True,
+                "capture_rows": 128,
+                "source": "qmt_minute_subscription",
+            },
+        }
+    ]
+
+
+def test_qmt_minute_subscription_selection_refresh_can_be_disabled(monkeypatch):
+    qmt_minute_subscription_service._LAST_SELECTION_REFRESH_AT = None
+    monkeypatch.setenv("AI_QUANT_MINUTE_CAPTURE_REFRESH_SELECTION", "0")
+
+    result = qmt_minute_subscription_service._refresh_realtime_selection_after_capture(
+        object(),
+        user_id="user-1",
+        now=datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc),
+        capture_result={"success": True, "rows": 128},
+    )
+
+    assert result == {"status": "skipped", "reason": "disabled"}
+
+
 def test_first_day_band_signals_ignore_position_side_limits():
     monitor = SimpleNamespace(
         config_json={"signal_mode": "first_day_band", "signal_timeframe": "5m"},
@@ -1209,6 +1299,23 @@ def test_repetitive_status_event_guard_suppresses_until_cooldown():
         "outside_trading_session",
         now + timedelta(seconds=301),
     ) is True
+
+
+def test_catalyst_feedback_hook_only_runs_for_catalyst_monitor_pool(monkeypatch):
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        catalyst_selection_service,
+        "capture_realtime_monitor_feedback",
+        lambda strategy_db, main_db, **kwargs: calls.append(kwargs),
+    )
+
+    catalyst_monitor = SimpleNamespace(id="monitor-1", monitor_pool_json={"source": "catalyst-selection"})
+    ordinary_monitor = SimpleNamespace(id="monitor-2", monitor_pool_json={"source": "watchlist"})
+
+    realtime_monitor_service._capture_catalyst_feedback_after_cycle(object(), object(), catalyst_monitor)
+    realtime_monitor_service._capture_catalyst_feedback_after_cycle(object(), object(), ordinary_monitor)
+
+    assert calls == [{"monitor_id": "monitor-1", "limit": 100, "refresh_profiles": True}]
 
 
 def test_build_position_items_skips_broken_row(monkeypatch):

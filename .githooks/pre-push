@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# pre-push hook: auto-tag the latest version on push to main/master.
+#
+# Reads version from pyproject.toml, creates an annotated tag vX.Y.Z
+# if it doesn't already exist, and pushes it.
+
+set -euo pipefail
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+PYPROJECT="$REPO_ROOT/pyproject.toml"
+
+# Only run when pushing to main/master
+while read -r local_ref local_sha remote_ref remote_sha; do
+    branch=$(echo "$remote_ref" | sed 's|refs/heads/||')
+    case "$branch" in
+        main|master) ;;
+        *) exit 0 ;;
+    esac
+done
+
+version=$(grep -E '^version\s*=' "$PYPROJECT" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+if [ -z "$version" ]; then
+    echo "[pre-push] could not parse version, skipping tag"
+    exit 0
+fi
+
+tag="v${version}"
+
+if git rev-parse "$tag" >/dev/null 2>&1; then
+    echo "[pre-push] tag $tag already exists, skipping"
+    exit 0
+fi
+
+# Check if there are new commits since last tag
+last_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+if [ -n "$last_tag" ] && [ "$(git rev-list "$last_tag"..HEAD --count)" -eq 0 ]; then
+    echo "[pre-push] no new commits since $last_tag, skipping tag"
+    exit 0
+fi
+
+git tag -a "$tag" -m "$tag"
+echo "[pre-push] created tag $tag, pushing..."
+git push origin "$tag" 2>/dev/null || echo "[pre-push] (tag push skipped, will be pushed with --follow-tags)"

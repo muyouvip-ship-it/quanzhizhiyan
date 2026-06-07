@@ -8,6 +8,9 @@ from datetime import datetime
 from typing import Optional
 from sqlalchemy import Column, String, Integer, Boolean, Float, Text, DateTime, Date, JSON, ForeignKey, Enum, Index, UniqueConstraint
 from sqlalchemy.orm import declarative_base, relationship
+import logging
+
+logger = logging.getLogger(__name__)
 import enum
 import uuid
 
@@ -773,7 +776,7 @@ class EvolutionCandidateDB(Base):
 def init_database(engine):
     """初始化数据库表"""
     Base.metadata.create_all(engine)
-    print("✅ 数据库表创建完成")
+    logger.info("数据库表创建完成")
 
 
 if __name__ == "__main__":

@@ -189,62 +189,26 @@ def _import_index_daily(db_session, df: pd.DataFrame) -> dict:
 
 
 def _import_chip_data(db_session, df: pd.DataFrame) -> dict:
-    """导入筹码数据"""
-    try:
-        # 筹码数据需要特殊的表结构
-        # 这里先创建一个简单的实现
-        
-        records_imported = 0
-        
-        for idx, row in df.iterrows():
-            try:
-                # TODO: 实现筹码数据导入逻辑
-                # 需要先创建筹码数据表
-                records_imported += 1
-            except Exception as e:
-                continue
-        
-        return {
-            'success': True,
-            'records_imported': records_imported,
-            'message': f'成功导入 {records_imported} 条筹码数据'
-        }
-        
-    except Exception as e:
-        logger.error(f"导入筹码数据失败: {e}")
-        return {
-            'success': False,
-            'error': str(e),
-            'records_imported': 0
-        }
+    """导入筹码数据（暂未实现完整表结构，返回未支持状态）。"""
+    logger.warning(
+        "筹码数据导入功能尚未实现完整表结构，跳过 %d 条记录",
+        len(df) if df is not None else 0,
+    )
+    return {
+        "success": False,
+        "error": "筹码数据导入功能尚未实现，需要先创建筹码数据表结构",
+        "records_imported": 0,
+    }
 
 
 def _import_money_flow(db_session, df: pd.DataFrame) -> dict:
-    """导入资金流数据"""
-    try:
-        # 资金流数据需要特殊的表结构
-        # 这里先创建一个简单的实现
-        
-        records_imported = 0
-        
-        for idx, row in df.iterrows():
-            try:
-                # TODO: 实现资金流数据导入逻辑
-                # 需要先创建资金流数据表
-                records_imported += 1
-            except Exception as e:
-                continue
-        
-        return {
-            'success': True,
-            'records_imported': records_imported,
-            'message': f'成功导入 {records_imported} 条资金流数据'
-        }
-        
-    except Exception as e:
-        logger.error(f"导入资金流数据失败: {e}")
-        return {
-            'success': False,
-            'error': str(e),
-            'records_imported': 0
-        }
+    """导入资金流数据（暂未实现完整表结构，返回未支持状态）。"""
+    logger.warning(
+        "资金流数据导入功能尚未实现完整表结构，跳过 %d 条记录",
+        len(df) if df is not None else 0,
+    )
+    return {
+        "success": False,
+        "error": "资金流数据导入功能尚未实现，需要先创建资金流数据表结构",
+        "records_imported": 0,
+    }

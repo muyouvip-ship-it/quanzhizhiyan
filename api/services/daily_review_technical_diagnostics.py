@@ -9,7 +9,9 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
 from api.core.stock_map import get_reverse_stock_map
+from api.services.daily_kline_parquet_store import load_daily_kline_slice_from_parquet
 from api.services.market_data_pipeline_service import preferred_daily_kline_table, preferred_minute_kline_table
+from api.core.utils import safe_float as _safe_float
 
 
 def build_portfolio_technical_diagnostics(
@@ -152,32 +154,153 @@ def _select_targets(
 
 def _load_recent_daily_frame(db: Session, *, symbols: list[str], trade_date: str) -> tuple[pd.DataFrame, str]:
     table_name = preferred_daily_kline_table()
-    source = f"postgresql:{table_name}"
+    postgres_source = f"postgresql:{table_name}"
     if not symbols:
+        return pd.DataFrame(), postgres_source
+    start_date = _daily_history_start_date(trade_date)
+    query_symbols = sorted({variant for symbol in symbols for variant in _symbol_variants(symbol)})
+
+    parquet_frame = _load_daily_frame_from_parquet(query_symbols, start_date=start_date, trade_date=trade_date)
+    if parquet_frame is not None and not parquet_frame.empty:
+        frames = [parquet_frame]
+        sources = ["parquet:daily_kline"]
+        requested_symbols = {_normalize_symbol(symbol) for symbol in symbols if _normalize_symbol(symbol)}
+        covered_symbols = set(parquet_frame["normalized_symbol"].dropna().astype(str).unique())
+        missing_symbols = sorted(requested_symbols - covered_symbols)
+        if missing_symbols:
+            missing_query_symbols = sorted({variant for symbol in missing_symbols for variant in _symbol_variants(symbol)})
+            missing_frame, missing_source = _query_daily_frame_from_db(
+                db,
+                table_name=table_name,
+                query_symbols=missing_query_symbols,
+                trade_date=trade_date,
+                start_date=start_date,
+                start_exclusive=False,
+                source_prefix="postgresql_missing",
+            )
+            sources.append(missing_source)
+            if not missing_frame.empty:
+                frames.append(missing_frame)
+        max_parquet_date = parquet_frame["trade_date"].max()
+        if pd.notna(max_parquet_date) and str(max_parquet_date)[:10] < str(trade_date)[:10]:
+            tail_frame, tail_source = _query_daily_frame_from_db(
+                db,
+                table_name=table_name,
+                query_symbols=query_symbols,
+                trade_date=trade_date,
+                start_date=str(max_parquet_date)[:10],
+                start_exclusive=True,
+                source_prefix="postgresql_tail",
+            )
+            sources.append(tail_source)
+            if not tail_frame.empty:
+                frames.append(tail_frame)
+        merged = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if merged.empty:
+            return pd.DataFrame(), "+".join(sources)
+        merged = (
+            merged.sort_values(["normalized_symbol", "trade_date"])
+            .drop_duplicates(subset=["normalized_symbol", "trade_date"], keep="last")
+            .reset_index(drop=True)
+        )
+        return merged, "+".join(sources)
+
+    return _query_daily_frame_from_db(
+        db,
+        table_name=table_name,
+        query_symbols=query_symbols,
+        trade_date=trade_date,
+        start_date=start_date,
+        start_exclusive=False,
+        source_prefix="postgresql",
+    )
+
+
+def _daily_history_start_date(trade_date: str) -> str:
+    try:
+        return (pd.to_datetime(trade_date) - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
+    except Exception:
+        return (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
+
+
+def _load_daily_frame_from_parquet(query_symbols: list[str], *, start_date: str, trade_date: str) -> pd.DataFrame | None:
+    try:
+        frame = load_daily_kline_slice_from_parquet(
+            symbols=query_symbols,
+            start_date=start_date,
+            end_date=trade_date,
+            columns=["open", "high", "low", "close", "volume", "amount", "pre_close"],
+        )
+    except Exception:
+        return None
+    if frame is None or frame.empty:
+        return None
+    normalized = _normalize_daily_source_frame(frame, date_column="date")
+    return normalized if not normalized.empty else None
+
+
+def _query_daily_frame_from_db(
+    db: Session,
+    *,
+    table_name: str,
+    query_symbols: list[str],
+    trade_date: str,
+    start_date: str | None,
+    start_exclusive: bool,
+    source_prefix: str,
+) -> tuple[pd.DataFrame, str]:
+    source = f"{source_prefix}:{table_name}"
+    if not query_symbols:
         return pd.DataFrame(), source
     try:
-        query_symbols = sorted({variant for symbol in symbols for variant in _symbol_variants(symbol)})
+        start_condition = ""
+        params: dict[str, Any] = {"symbols": query_symbols, "trade_date": trade_date}
+        if start_date:
+            comparator = ">" if start_exclusive else ">="
+            start_condition = f"AND trade_date {comparator} :start_date"
+            params["start_date"] = start_date
         statement = text(
             f"""
             SELECT symbol, trade_date, open, high, low, close, volume, amount, pre_close
             FROM {table_name}
             WHERE symbol IN :symbols
+              {start_condition}
               AND trade_date <= :trade_date
             ORDER BY symbol, trade_date
             """
         ).bindparams(bindparam("symbols", expanding=True))
-        rows = db.execute(statement, {"symbols": query_symbols, "trade_date": trade_date}).mappings().all()
+        rows = db.execute(statement, params).mappings().all()
     except Exception as exc:
         return pd.DataFrame(), f"{source}:error:{exc.__class__.__name__}"
     if not rows:
         return pd.DataFrame(), source
     frame = pd.DataFrame([dict(row) for row in rows])
+    return _normalize_daily_source_frame(frame, date_column="trade_date"), source
+
+
+def _normalize_daily_source_frame(frame: pd.DataFrame, *, date_column: str) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame()
+    frame = frame.copy()
+    if date_column != "trade_date" and date_column in frame.columns:
+        frame = frame.rename(columns={date_column: "trade_date"})
+    if "symbol" not in frame.columns:
+        return pd.DataFrame()
+    if "trade_date" not in frame.columns:
+        frame["trade_date"] = pd.NaT
     frame["normalized_symbol"] = frame["symbol"].map(_normalize_symbol)
     frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
     for column in ("open", "high", "low", "close", "volume", "amount", "pre_close"):
+        if column not in frame.columns:
+            frame[column] = pd.NA
         if column in frame.columns:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    return frame.sort_values(["normalized_symbol", "trade_date"]).reset_index(drop=True), source
+    return (
+        frame.dropna(subset=["normalized_symbol", "trade_date"])
+        .loc[lambda item: item["normalized_symbol"].astype(str).str.len() > 0]
+        .sort_values(["normalized_symbol", "trade_date"])
+        .reset_index(drop=True)
+    )
 
 
 def _load_minute_frame(db: Session, *, symbols: list[str], trade_date: str) -> tuple[pd.DataFrame, str]:
@@ -596,16 +719,6 @@ def _symbol_variants(symbol: str) -> set[str]:
     return {raw, normalized, code}
 
 
-def _safe_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        result = float(value)
-    except Exception:
-        return None
-    if math.isnan(result) or math.isinf(result):
-        return None
-    return result
 
 
 def _round_float(value: Any, digits: int = 2) -> float | None:

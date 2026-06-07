@@ -8,6 +8,7 @@ from uuid import uuid4
 from sqlalchemy.orm import Session
 
 from api.database import ReportDB
+from api.core.utils import safe_float as _safe_float
 
 ACTIVE_REPORT_STATUSES = ("pending", "running")
 STALE_REPORT_ERROR_MESSAGE = "分析任务已中断，请重新发起分析"
@@ -79,13 +80,6 @@ def resolve_report_fields(
     }
 
 
-def _safe_float(value: Any) -> Optional[float]:
-    if value in (None, ""):
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def init_report(db: Session, report_id: str, symbol: str, trade_date: str, user_id: Optional[str] = None) -> ReportDB:
