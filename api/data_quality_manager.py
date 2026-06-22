@@ -4,12 +4,26 @@
 """
 import pandas as pd
 from typing import Dict, Any, List, Optional
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import logging
+import os
 
 from api.services.daily_kline_parquet_store import get_daily_kline_parquet_stats
 
 logger = logging.getLogger(__name__)
+MINUTE_QUALITY_SAMPLE_ROWS = max(int(os.getenv("MINUTE_QUALITY_SAMPLE_ROWS", "50000") or 50000), 1)
+MINUTE_QUALITY_APPROXIMATE_THRESHOLD = max(
+    int(os.getenv("MINUTE_QUALITY_APPROXIMATE_THRESHOLD", "500000") or 500000),
+    1,
+)
+
+
+_ALLOWED_DB_QUALITY_TABLES = {
+    "stock_daily_kline",
+    "stock_minute_kline",
+    "index_daily_kline",
+    "index_minute_kline",
+}
 
 
 def _normalized_symbol_sql(column_name: str = "symbol") -> str:
@@ -19,6 +33,100 @@ def _normalized_symbol_sql(column_name: str = "symbol") -> str:
         f"'\\.(SH|SZ|BJ)$', ''"
         f")"
     )
+
+
+def _validate_quality_table_name(table_name: str) -> str:
+    if table_name not in _ALLOWED_DB_QUALITY_TABLES:
+        raise ValueError(f"不支持的数据质量检查表: {table_name}")
+    return table_name
+
+
+def _load_fast_minute_stats(db_session, table_name: str) -> Dict[str, Any]:
+    from sqlalchemy import text
+
+    estimated_rows = db_session.execute(
+        text(
+            """
+            SELECT GREATEST(c.reltuples::bigint, 0) AS estimated_rows
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'public'
+              AND c.relname = :table_name
+            """
+        ),
+        {"table_name": table_name},
+    ).scalar()
+    estimated_rows = int(estimated_rows or 0)
+
+    bounds = db_session.execute(
+        text(f"SELECT MIN(trade_time) AS min_time, MAX(trade_time) AS max_time FROM {table_name}")
+    ).fetchone()
+    min_time = bounds.min_time if bounds and getattr(bounds, "min_time", None) else None
+    max_time = bounds.max_time if bounds and getattr(bounds, "max_time", None) else None
+
+    stats: Dict[str, Any] = {
+        "total_records": estimated_rows,
+        "total_records_estimated": True,
+        "unique_symbols": 0,
+        "min_date": str(min_time) if min_time else None,
+        "max_date": str(max_time) if max_time else None,
+        "trading_days": None,
+    }
+    if max_time is None:
+        return stats
+
+    latest_day = max_time.date() if hasattr(max_time, "date") else datetime.fromisoformat(str(max_time)[:19]).date()
+    start_dt = datetime.combine(latest_day, datetime.min.time())
+    end_dt = start_dt + timedelta(days=1)
+    latest = db_session.execute(
+        text(
+            f"""
+            SELECT COUNT(*) AS latest_records,
+                   COUNT(DISTINCT symbol) AS latest_symbols
+            FROM {table_name}
+            WHERE trade_time >= :start_dt
+              AND trade_time < :end_dt
+            """
+        ),
+        {"start_dt": start_dt, "end_dt": end_dt},
+    ).fetchone()
+    stats.update(
+        {
+            "latest_trade_date": latest_day,
+            "latest_day_records": int(latest.latest_records or 0) if latest else 0,
+            "unique_symbols": int(latest.latest_symbols or 0) if latest else 0,
+            "unique_symbols_scope": "latest_trade_date",
+        }
+    )
+
+    if estimated_rows <= MINUTE_QUALITY_APPROXIMATE_THRESHOLD:
+        exact = db_session.execute(
+            text(
+                f"""
+                SELECT COUNT(*) AS total_records,
+                       COUNT(DISTINCT symbol) AS unique_symbols,
+                       COUNT(DISTINCT DATE(trade_time)) AS trading_days
+                FROM {table_name}
+                """
+            )
+        ).fetchone()
+        if exact:
+            stats.update(
+                {
+                    "total_records": int(exact.total_records or 0),
+                    "total_records_estimated": False,
+                    "unique_symbols": int(exact.unique_symbols or 0),
+                    "unique_symbols_scope": "all",
+                    "trading_days": int(exact.trading_days or 0),
+                }
+            )
+    else:
+        stats["trading_days_estimated"] = True
+        if min_time:
+            min_day = min_time.date() if hasattr(min_time, "date") else datetime.fromisoformat(str(min_time)[:19]).date()
+            stats["trading_days"] = max((latest_day - min_day).days + 1, 1)
+
+    return stats
 
 
 class DataQualityManager:
@@ -187,8 +295,9 @@ class DataQualityManager:
 
         try:
             from sqlalchemy import text
+            table_name = _validate_quality_table_name(table_name)
             date_column = "trade_date"
-            if data_type == "minute_kline":
+            if data_type in {"minute_kline", "index_minute_kline"}:
                 date_column = "trade_time"
 
             # 1. 检查表是否存在
@@ -204,72 +313,124 @@ class DataQualityManager:
                 result['issues'].append(f"表 {table_name} 不存在")
                 return result
 
-            # 2. 统计基本信息
-            normalized_symbol_expr = _normalized_symbol_sql("symbol") if data_type == "daily_kline" else "symbol"
-            stats_query = text(f"""
-                SELECT
-                    COUNT(*) as total_records,
-                    COUNT(DISTINCT {normalized_symbol_expr}) as unique_symbols,
-                    MIN({date_column}) as min_date,
-                    MAX({date_column}) as max_date,
-                    COUNT(DISTINCT DATE({date_column})) as trading_days
-                FROM {table_name}
-            """)
-            stats = db_session.execute(stats_query).fetchone()
-
-            result['stats'] = {
-                'total_records': stats[0],
-                'unique_symbols': stats[1],
-                'min_date': str(stats[2]) if stats[2] else None,
-                'max_date': str(stats[3]) if stats[3] else None,
-                'trading_days': stats[4]
-            }
-
-            # 3. 检查空值
-            null_check = text(f"""
-                SELECT
-                    COUNT(*) FILTER (WHERE symbol IS NULL) as null_symbols,
-                    COUNT(*) FILTER (WHERE {date_column} IS NULL) as null_dates,
-                    COUNT(*) FILTER (WHERE close IS NULL) as null_close
-                FROM {table_name}
-            """)
-            null_stats = db_session.execute(null_check).fetchone()
-
-            if null_stats[0] > 0 or null_stats[1] > 0 or null_stats[2] > 0:
-                result['issues'].append(
-                    f"存在空值 - 股票代码: {null_stats[0]}, 日期: {null_stats[1]}, 收盘价: {null_stats[2]}"
-                )
-
-            # 4. 检查重复数据
-            duplicate_check = text(f"""
-                SELECT COUNT(*) FROM (
-                    SELECT {normalized_symbol_expr} AS symbol_key, {date_column}, COUNT(*)
+            abnormal_close_limit = 100000 if data_type in {"index_data", "index_minute_kline"} else 10000
+            if data_type in {"minute_kline", "index_minute_kline"}:
+                stats = _load_fast_minute_stats(db_session, table_name)
+                result['stats'] = stats
+                result['stats']['quality_mode'] = 'fast_minute_sample'
+                result['stats']['quality_sample_rows'] = MINUTE_QUALITY_SAMPLE_ROWS
+                latest_day = stats.get("latest_trade_date")
+                if isinstance(latest_day, str):
+                    latest_day = datetime.fromisoformat(latest_day[:10]).date()
+                if latest_day is not None:
+                    start_dt = datetime.combine(latest_day, datetime.min.time())
+                    end_dt = start_dt + timedelta(days=1)
+                    sample_check = text(f"""
+                        SELECT
+                            COUNT(*) FILTER (WHERE symbol IS NULL) as null_symbols,
+                            COUNT(*) FILTER (WHERE trade_time IS NULL) as null_dates,
+                            COUNT(*) FILTER (WHERE close IS NULL) as null_close,
+                            COUNT(*) FILTER (WHERE close <= 0) as negative_close,
+                            COUNT(*) FILTER (WHERE close > :abnormal_close_limit) as abnormal_close,
+                            COUNT(*) FILTER (WHERE high < low) as invalid_high_low,
+                            COUNT(*) as checked_rows
+                        FROM (
+                            SELECT symbol, trade_time, close, high, low
+                            FROM {table_name}
+                            WHERE trade_time >= :start_dt
+                              AND trade_time < :end_dt
+                            LIMIT :sample_rows
+                        ) sample
+                    """)
+                    sample_stats = db_session.execute(
+                        sample_check,
+                        {
+                            "start_dt": start_dt,
+                            "end_dt": end_dt,
+                            "sample_rows": MINUTE_QUALITY_SAMPLE_ROWS,
+                            "abnormal_close_limit": abnormal_close_limit,
+                        },
+                    ).fetchone()
+                    result['stats']['quality_sample_date'] = str(latest_day)
+                    result['stats']['quality_checked_rows'] = int(sample_stats[6] or 0) if sample_stats else 0
+                    if sample_stats and (sample_stats[0] > 0 or sample_stats[1] > 0 or sample_stats[2] > 0):
+                        result['issues'].append(
+                            f"最近交易日样本存在空值 - 股票代码: {sample_stats[0]}, 日期: {sample_stats[1]}, 收盘价: {sample_stats[2]}"
+                        )
+                    if sample_stats and sample_stats[3] > 0:
+                        result['issues'].append(f"最近交易日样本存在{sample_stats[3]}条收盘价<=0的数据")
+                    if sample_stats and sample_stats[4] > 0:
+                        result['issues'].append(f"最近交易日样本存在{sample_stats[4]}条收盘价>{abnormal_close_limit}的异常数据")
+                    if sample_stats and sample_stats[5] > 0:
+                        result['issues'].append(f"最近交易日样本存在{sample_stats[5]}条最高价<最低价的错误数据")
+                result['stats']['duplicate_check'] = 'skipped_unique_index'
+            else:
+                # 2. 统计基本信息。日线/指数日线规模较小，保留精确检查。
+                normalized_symbol_expr = _normalized_symbol_sql("symbol") if data_type in {"daily_kline", "index_data"} else "symbol"
+                stats_query = text(f"""
+                    SELECT
+                        COUNT(*) as total_records,
+                        COUNT(DISTINCT {normalized_symbol_expr}) as unique_symbols,
+                        MIN({date_column}) as min_date,
+                        MAX({date_column}) as max_date,
+                        COUNT(DISTINCT DATE({date_column})) as trading_days
                     FROM {table_name}
-                    GROUP BY symbol_key, {date_column}
-                    HAVING COUNT(*) > 1
-                ) duplicates
-            """)
-            duplicate_count = db_session.execute(duplicate_check).scalar()
+                """)
+                stats = db_session.execute(stats_query).fetchone()
 
-            if duplicate_count > 0:
-                result['issues'].append(f"存在{duplicate_count}条重复数据")
+                result['stats'] = {
+                    'total_records': stats[0],
+                    'unique_symbols': stats[1],
+                    'min_date': str(stats[2]) if stats[2] else None,
+                    'max_date': str(stats[3]) if stats[3] else None,
+                    'trading_days': stats[4]
+                }
 
-            # 5. 检查价格合理性
-            price_check = text(f"""
-                SELECT
-                    COUNT(*) FILTER (WHERE close <= 0) as negative_close,
-                    COUNT(*) FILTER (WHERE close > 10000) as abnormal_close,
-                    COUNT(*) FILTER (WHERE high < low) as invalid_high_low
-                FROM {table_name}
-            """)
-            price_stats = db_session.execute(price_check).fetchone()
+                # 3. 检查空值
+                null_check = text(f"""
+                    SELECT
+                        COUNT(*) FILTER (WHERE symbol IS NULL) as null_symbols,
+                        COUNT(*) FILTER (WHERE {date_column} IS NULL) as null_dates,
+                        COUNT(*) FILTER (WHERE close IS NULL) as null_close
+                    FROM {table_name}
+                """)
+                null_stats = db_session.execute(null_check).fetchone()
 
-            if price_stats[0] > 0:
-                result['issues'].append(f"存在{price_stats[0]}条收盘价<=0的数据")
-            if price_stats[1] > 0:
-                result['issues'].append(f"存在{price_stats[1]}条收盘价>10000的异常数据")
-            if price_stats[2] > 0:
-                result['issues'].append(f"存在{price_stats[2]}条最高价<最低价的错误数据")
+                if null_stats[0] > 0 or null_stats[1] > 0 or null_stats[2] > 0:
+                    result['issues'].append(
+                        f"存在空值 - 股票代码: {null_stats[0]}, 日期: {null_stats[1]}, 收盘价: {null_stats[2]}"
+                    )
+
+                # 4. 检查重复数据
+                duplicate_check = text(f"""
+                    SELECT COUNT(*) FROM (
+                        SELECT {normalized_symbol_expr} AS symbol_key, {date_column}, COUNT(*)
+                        FROM {table_name}
+                        GROUP BY symbol_key, {date_column}
+                        HAVING COUNT(*) > 1
+                    ) duplicates
+                """)
+                duplicate_count = db_session.execute(duplicate_check).scalar()
+
+                if duplicate_count > 0:
+                    result['issues'].append(f"存在{duplicate_count}条重复数据")
+
+                # 5. 检查价格合理性
+                price_check = text(f"""
+                    SELECT
+                        COUNT(*) FILTER (WHERE close <= 0) as negative_close,
+                        COUNT(*) FILTER (WHERE close > :abnormal_close_limit) as abnormal_close,
+                        COUNT(*) FILTER (WHERE high < low) as invalid_high_low
+                    FROM {table_name}
+                """)
+                price_stats = db_session.execute(price_check, {"abnormal_close_limit": abnormal_close_limit}).fetchone()
+
+                if price_stats[0] > 0:
+                    result['issues'].append(f"存在{price_stats[0]}条收盘价<=0的数据")
+                if price_stats[1] > 0:
+                    result['issues'].append(f"存在{price_stats[1]}条收盘价>{abnormal_close_limit}的异常数据")
+                if price_stats[2] > 0:
+                    result['issues'].append(f"存在{price_stats[2]}条最高价<最低价的错误数据")
 
             # 6. 检查数据连续性
             if data_type == 'daily_kline':

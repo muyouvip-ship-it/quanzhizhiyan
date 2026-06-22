@@ -405,6 +405,7 @@ def _build_lightweight_analysis(symbol: str, trade_date: str, query: str, user_i
         "query": query,
         "decision": decision,
         "direction": direction,
+        "analysis_mode": "lightweight",
         "market_report": market_report,
         "sentiment_report": sentiment_report,
         "news_report": news_report,
@@ -430,6 +431,7 @@ async def _run_analysis_with_fallback(
     selected_analysts: list[str],
     tracker: AgentProgressTracker,
     job_id: str,
+    allow_lightweight_fallback: bool = True,
 ) -> tuple[dict, list[dict], list[dict], str]:
     try:
         return await _run_deep_analysis_pipeline(
@@ -443,7 +445,7 @@ async def _run_analysis_with_fallback(
         )
     except Exception:
         logger.exception("Deep multi-agent analysis failed for %s", symbol)
-        if tracker.has_streamed_content:
+        if tracker.has_streamed_content or not allow_lightweight_fallback:
             raise
         return _build_lightweight_analysis(
             symbol=symbol,
@@ -484,6 +486,7 @@ async def _run_background_analysis_job(
             selected_analysts=selected_analysts,
             tracker=tracker,
             job_id=job_id,
+            allow_lightweight_fallback=False,
         )
         tracker.mark_stage("finalizing", "result_persistence")
         with get_db_ctx() as db:

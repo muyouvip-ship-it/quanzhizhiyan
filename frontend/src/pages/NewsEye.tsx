@@ -20,10 +20,9 @@ import {
   Zap,
 } from 'lucide-react'
 
-import DataSourceGovernanceCard, { type DataSourceGovernanceItem } from '@/components/DataSourceGovernanceCard'
 import { usePolling } from '@/hooks/usePolling'
 import { api } from '@/services/api'
-import type { ApiDataSourceGovernancePayload, NewsEyeAnalyzeResponse, NewsEyeItem, NewsEyeSymbolTag, NewsThemeRankingItem, NewsThemeWindow } from '@/types'
+import type { NewsEyeAnalyzeResponse, NewsEyeItem, NewsEyeSymbolTag, NewsThemeRankingItem, NewsThemeWindow } from '@/types'
 
 const PAGE_SIZE = 80
 const NEWS_PREVIEW_COLLAPSE_THRESHOLD = 90
@@ -330,8 +329,6 @@ export default function NewsEye() {
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [updatedAt, setUpdatedAt] = useState<string | null>(null)
-  const [pageSource, setPageSource] = useState<string | null>(null)
-  const [pageFallback, setPageFallback] = useState(false)
   const [historyMeta, setHistoryMeta] = useState<{
     offset: number
     limit: number
@@ -347,7 +344,6 @@ export default function NewsEye() {
   const [analysisErrorById, setAnalysisErrorById] = useState<Record<string, string>>({})
   const [expandedById, setExpandedById] = useState<Record<string, boolean>>({})
   const [copiedItemId, setCopiedItemId] = useState<string | null>(null)
-  const [backendGovernance, setBackendGovernance] = useState<ApiDataSourceGovernancePayload | null>(null)
   const [backgroundMeta, setBackgroundMeta] = useState<{
     interval_seconds?: number
     status?: string
@@ -431,9 +427,6 @@ export default function NewsEye() {
         return merged
       })
       setUpdatedAt(response.updated_at)
-      setPageSource(response.source || null)
-      setPageFallback(!!response.fallback)
-      setBackendGovernance(response.data_governance || null)
       setBackgroundMeta(response.background || null)
       setHistoryMeta(response.history)
       setError(null)
@@ -569,77 +562,6 @@ export default function NewsEye() {
   const llmCoreStockReady = Boolean(llmCoreStockGovernance?.ready)
   const llmUsedSymbolThemeCount = numberFromUnknown(llmCoreStockGovernance?.used_symbol_theme_count)
   const llmUsedSemanticThemeCount = numberFromUnknown(llmCoreStockGovernance?.used_semantic_theme_count)
-  const governanceItems = useMemo<DataSourceGovernanceItem[]>(() => (backendGovernance?.items?.length ? backendGovernance.items : [
-    {
-      label: '页面主数据源',
-      value: pageSource || '--',
-      detail: pageFallback ? '当前资讯列表已处于回退或仅缓存链路' : '页面当前读取的是资讯缓存层返回结果',
-      tone: pageFallback ? 'warn' : 'good',
-    },
-    {
-      label: '外部活跃源',
-      value: activeSources.length ? activeSources.join(' / ') : '暂无活跃源',
-      detail: '这是真正对外抓取资讯的源头列表，不等同于页面缓存表本身',
-      tone: activeSources.length ? 'info' : 'warn',
-    },
-    {
-      label: '后台轮询状态',
-      value: statusLabel(backgroundMeta?.status),
-      detail: backgroundMeta?.interval_seconds ? `${backgroundMeta.interval_seconds}s / 次` : '等待后台轮询启动',
-      tone: backgroundMeta?.status === 'error' ? 'bad' : backgroundMeta?.status === 'degraded' ? 'warn' : backgroundMeta?.status ? 'good' : 'neutral',
-    },
-    {
-      label: '最近成功入库',
-      value: formatDateTime(backgroundMeta?.last_success_at || updatedAt),
-      detail: '这里显示的是资讯入库或最近成功同步时间，不代表新闻原始发布时间',
-      tone: 'info',
-    },
-    {
-      label: '新事件触发',
-      value: String(freshEventCount ?? 0),
-      detail: `新增 ${backgroundMeta?.new_count ?? 0} / 更新 ${backgroundMeta?.updated_count ?? 0} / 重复 ${backgroundMeta?.unchanged_count ?? 0}`,
-      tone: freshEventCount > 0 ? 'good' : 'neutral',
-    },
-    {
-      label: '机会榜重算',
-      value: eventSelectionLabel(eventSelectionMeta),
-      detail: eventSelectionErrors.length
-        ? String(objectFromUnknown(eventSelectionErrors[0])?.error || '重算失败')
-        : eventSelectionGenerated.length
-          ? `窗口 ${eventSelectionGenerated.length} 个`
-          : String(eventSelectionMeta?.reason || eventSelectionMeta?.trigger || '等待新事件'),
-      tone: eventSelectionErrors.length ? 'bad' : eventSelectionMeta?.triggered === true ? 'good' : 'neutral',
-    },
-  ]), [
-    activeSources,
-    backendGovernance?.items,
-    backgroundMeta?.interval_seconds,
-    backgroundMeta?.last_success_at,
-    backgroundMeta?.new_count,
-    backgroundMeta?.status,
-    backgroundMeta?.unchanged_count,
-    backgroundMeta?.updated_count,
-    eventSelectionErrors,
-    eventSelectionGenerated,
-    eventSelectionMeta,
-    freshEventCount,
-    pageFallback,
-    pageSource,
-    updatedAt,
-  ])
-  const governanceWarnings = useMemo(() => {
-    if (backendGovernance?.warnings?.length) {
-      const merged = [...backendGovernance.warnings]
-      if (error && !merged.includes(error)) merged.push(error)
-      return merged
-    }
-    const warnings: string[] = []
-    if (backgroundMeta?.last_error) warnings.push(`资讯采集异常：${backgroundMeta.last_error}`)
-    if (!activeSources.length) warnings.push('当前没有识别到活跃外部源，页面可能只是在读取历史缓存。')
-    if (error) warnings.push(error)
-    return warnings
-  }, [activeSources.length, backendGovernance?.warnings, backgroundMeta?.last_error, error])
-
   const handleCopyContent = useCallback(async (item: NewsEyeItem) => {
     try {
       await navigator.clipboard.writeText(item.content)
@@ -664,7 +586,6 @@ export default function NewsEye() {
 
   const handleThemeSelect = useCallback((item: NewsThemeRankingItem) => {
     setSelectedTheme(item.theme)
-    setFilters(prev => ({ ...prev, sentiment: 'all', sector: item.theme }))
   }, [])
 
   return (
@@ -1090,16 +1011,9 @@ export default function NewsEye() {
         </div>
 
         <div className="mt-3 text-[11px] text-slate-400 dark:text-slate-500">
-          榜单更新时间 {formatDateTime(themeUpdatedAt)}，点击主题会同步筛选下方资讯流。
+          榜单更新时间 {formatDateTime(themeUpdatedAt)}，点击主题查看右侧证据，下方资讯流保持独立筛选。
         </div>
       </section>
-
-      <DataSourceGovernanceCard
-        title="数据源治理"
-        description={backendGovernance?.description || '资讯页的页面缓存、后台轮询状态和真实外部新闻源必须分开看。'}
-        items={governanceItems}
-        warnings={governanceWarnings}
-      />
 
       <section className="rounded-[22px] border border-slate-200 bg-white/90 p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900/78">
         <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">

@@ -3121,7 +3121,7 @@ def maintain_realtime_monitor_from_selection(
     """Create or refresh a monitor-only realtime monitor for a catalyst selection."""
     if not user_id:
         return {"status": "skipped", "reason": "missing_user_id", "enabled": False}
-    if not _ai_quant_env_enabled(CATALYST_AUTO_MONITOR_ENABLED, default=True):
+    if not _ai_quant_env_enabled(CATALYST_AUTO_MONITOR_ENABLED, default=False):
         return {"status": "disabled", "reason": "auto_monitor_disabled", "enabled": False}
 
     pool_payload = build_monitor_pool_from_selection(selection)
@@ -3188,9 +3188,40 @@ def maintain_realtime_monitor_from_selection(
             strategy_db,
             RealtimeMonitorDB=RealtimeMonitorDB,
             user_id=user_id,
-            trade_date=str(pool_payload.get("trade_date") or ""),
             window=str(pool_payload.get("window") or ""),
         )
+        cleanup_ids = _stale_catalyst_monitor_ids(
+            strategy_db,
+            RealtimeMonitorDB=RealtimeMonitorDB,
+            user_id=user_id,
+            window=str(pool_payload.get("window") or ""),
+            keep_id=getattr(existing, "id", None),
+        )
+        if cleanup_ids:
+            realtime_monitor_service.delete_monitor_records(strategy_db, cleanup_ids, user_id=user_id)
+        incoming_trade_date = str(pool_payload.get("trade_date") or "")
+        if existing is not None:
+            existing_pool = existing.monitor_pool_json if isinstance(existing.monitor_pool_json, dict) else {}
+            existing_config = existing.config_json if isinstance(existing.config_json, dict) else {}
+            existing_trade_date = _catalyst_monitor_trade_date(existing, pool=existing_pool, config=existing_config)
+            if existing_trade_date and incoming_trade_date and existing_trade_date > incoming_trade_date:
+                if cleanup_ids:
+                    strategy_db.commit()
+                monitor_payload = realtime_monitor_service.get_monitor(strategy_db, user_id, existing.id)
+                return {
+                    "status": "skipped_stale_selection",
+                    "enabled": True,
+                    "monitor_id": monitor_payload.get("id"),
+                    "monitor_status": monitor_payload.get("status"),
+                    "strategy_id": resolved_strategy_id,
+                    "account_key": resolved_account_key,
+                    "monitor_symbol_count": len(monitor_symbols),
+                    "trade_date": pool_payload.get("trade_date"),
+                    "window": pool_payload.get("window"),
+                    "started": False,
+                    "stale_monitor_cleanup_count": len(cleanup_ids),
+                    "kept_trade_date": existing_trade_date,
+                }
         config_patch = {
             "source": "catalyst-selection",
             "catalyst_trade_date": pool_payload.get("trade_date"),
@@ -3243,6 +3274,7 @@ def maintain_realtime_monitor_from_selection(
                 "started": bool(start_monitor and monitor_payload.get("status") == "running"),
                 "pool_changed": pool_changed,
                 "signal_clock_reset": pool_changed,
+                "stale_monitor_cleanup_count": len(cleanup_ids),
             }
 
         monitor_payload = realtime_monitor_service.create_monitor(
@@ -3274,6 +3306,7 @@ def maintain_realtime_monitor_from_selection(
             "trade_date": pool_payload.get("trade_date"),
             "window": pool_payload.get("window"),
             "started": bool(start_monitor and monitor_payload.get("status") == "running"),
+            "stale_monitor_cleanup_count": len(cleanup_ids),
         }
 
 
@@ -3316,7 +3349,6 @@ def _find_existing_catalyst_monitor(
     *,
     RealtimeMonitorDB: Any,
     user_id: str,
-    trade_date: str,
     window: str,
 ) -> Any | None:
     rows = (
@@ -3325,15 +3357,91 @@ def _find_existing_catalyst_monitor(
         .order_by(RealtimeMonitorDB.updated_at.desc(), RealtimeMonitorDB.created_at.desc())
         .all()
     )
-    for row in rows:
+    for row in sorted(rows, key=_catalyst_monitor_recency_key, reverse=True):
         pool = row.monitor_pool_json if isinstance(row.monitor_pool_json, dict) else {}
+        config = row.config_json if isinstance(row.config_json, dict) else {}
         if (
-            str(pool.get("source") or "") == "catalyst-selection"
-            and str(pool.get("trade_date") or "") == str(trade_date or "")
-            and str(pool.get("window") or "") == str(window or "")
+            _is_catalyst_realtime_monitor(row, pool=pool, config=config)
+            and _catalyst_monitor_window(row, pool=pool, config=config) == str(window or "")
         ):
             return row
     return None
+
+
+def _stale_catalyst_monitor_ids(
+    strategy_db: Session,
+    *,
+    RealtimeMonitorDB: Any,
+    user_id: str,
+    window: str,
+    keep_id: str | None = None,
+) -> list[str]:
+    keep = str(keep_id or "").strip()
+    target_window = str(window or "").strip()
+    rows = (
+        strategy_db.query(RealtimeMonitorDB)
+        .filter(RealtimeMonitorDB.user_id == user_id)
+        .order_by(RealtimeMonitorDB.updated_at.desc(), RealtimeMonitorDB.created_at.desc())
+        .all()
+    )
+    stale_ids: list[str] = []
+    newest_seen = bool(keep)
+    for row in sorted(rows, key=_catalyst_monitor_recency_key, reverse=True):
+        pool = row.monitor_pool_json if isinstance(row.monitor_pool_json, dict) else {}
+        config = row.config_json if isinstance(row.config_json, dict) else {}
+        if not _is_catalyst_realtime_monitor(row, pool=pool, config=config):
+            continue
+        if _catalyst_monitor_window(row, pool=pool, config=config) != target_window:
+            continue
+        if keep and row.id == keep:
+            continue
+        if not newest_seen:
+            newest_seen = True
+            continue
+        stale_ids.append(row.id)
+    return stale_ids
+
+
+def _catalyst_monitor_recency_key(row: Any) -> tuple[str, datetime, datetime]:
+    pool = row.monitor_pool_json if isinstance(row.monitor_pool_json, dict) else {}
+    config = row.config_json if isinstance(row.config_json, dict) else {}
+    return (
+        _catalyst_monitor_trade_date(row, pool=pool, config=config),
+        getattr(row, "updated_at", None) or datetime.min,
+        getattr(row, "created_at", None) or datetime.min,
+    )
+
+
+def _is_catalyst_realtime_monitor(row: Any, *, pool: dict[str, Any], config: dict[str, Any]) -> bool:
+    return (
+        str(pool.get("source") or "").strip() == "catalyst-selection"
+        or str(config.get("source") or "").strip() == "catalyst-selection"
+        or str(getattr(row, "name", "") or "").strip().startswith("AI监控池 ")
+    )
+
+
+def _catalyst_monitor_window(row: Any, *, pool: dict[str, Any], config: dict[str, Any]) -> str:
+    if pool.get("window"):
+        return str(pool.get("window") or "").strip()
+    if config.get("catalyst_window"):
+        return str(config.get("catalyst_window") or "").strip()
+    name = str(getattr(row, "name", "") or "").strip()
+    parts = name.split()
+    if len(parts) >= 2 and parts[0] == "AI监控池":
+        return parts[1]
+    return ""
+
+
+def _catalyst_monitor_trade_date(row: Any, *, pool: dict[str, Any], config: dict[str, Any]) -> str:
+    if pool.get("trade_date"):
+        return str(pool.get("trade_date") or "").strip()
+    if config.get("catalyst_trade_date"):
+        return str(config.get("catalyst_trade_date") or "").strip()
+    name = str(getattr(row, "name", "") or "").strip()
+    parts = name.split()
+    if len(parts) >= 3 and parts[0] == "AI监控池":
+        return parts[2]
+    return ""
 
 
 def _monitor_pool_runtime_signature(pool: dict[str, Any]) -> str:

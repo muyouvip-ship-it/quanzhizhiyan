@@ -11,7 +11,7 @@ from datetime import date, datetime
 class BacktestDataTaskCreate(BaseModel):
     """创建回测数据下载任务的请求"""
     task_type: str = Field(..., description="数据类型: daily_kline, minute_kline, index_data, index_minute_kline, chip_data, financial_data, research_reports")
-    data_source: Optional[str] = Field("akshare", description="数据源")
+    data_source: Optional[str] = Field("tdx", description="数据源")
     date_range_start: date = Field(..., description="开始日期")
     date_range_end: date = Field(..., description="结束日期")
     symbols: Optional[List[str]] = Field(default_factory=list, description="股票代码列表，空表示下载所有股票")
@@ -44,10 +44,10 @@ class BacktestDataConfigCreate(BaseModel):
     enabled_data_types: List[str] = Field(default_factory=list, description="启用的数据类型")
     default_date_range_days: int = Field(365, description="默认下载天数")
     default_symbols: Optional[List[str]] = Field(default_factory=list, description="默认股票代码")
-    data_source_preference: str = Field("akshare", description="数据源偏好")
+    data_source_preference: str = Field("tdx", description="数据源偏好")
     auto_download: bool = Field(False, description="是否自动下载")
     update_frequency: Optional[str] = Field(None, description="更新频率")
-    schedule_time: Optional[str] = Field("18:30", description="每日调度时间，格式 HH:MM")
+    schedule_time: Optional[str] = Field("15:05", description="每日调度时间，格式 HH:MM")
     timezone: Optional[str] = Field("Asia/Shanghai", description="调度时区")
     only_trading_day: bool = Field(True, description="仅交易日执行")
     daily_kline_policy: Optional[Dict[str, Any]] = Field(None, description="日线多源策略")
@@ -93,6 +93,7 @@ class BacktestDataSubscriptionStatus(BaseModel):
     watermarks: List[Dict[str, Any]] = Field(default_factory=list)
     latest_watermark_date: Optional[date] = None
     intraday_capture: Optional[Dict[str, Any]] = None
+    daily_enrichment: Optional[Dict[str, Any]] = None
 
 
 # 数据统计模型
@@ -123,7 +124,7 @@ class BacktestDataStats(BaseModel):
 class BatchDataDownloadRequest(BaseModel):
     """批量数据下载请求"""
     data_types: List[str] = Field(..., description="要下载的数据类型列表")
-    data_source: Optional[str] = Field("quantclass", description="数据源，默认量化课堂")
+    data_source: Optional[str] = Field("tdx", description="数据源，默认通达信/TDX")
     date_range_start: date = Field(..., description="开始日期")
     date_range_end: date = Field(..., description="结束日期")
     symbols: Optional[List[str]] = Field(default_factory=list, description="股票代码列表")

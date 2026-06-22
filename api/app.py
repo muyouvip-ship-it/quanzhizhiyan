@@ -26,8 +26,7 @@ from api.routes.portfolio import router as portfolio_router
 from api.routes.reports import router as reports_router
 from api.routes.realtime import router as realtime_router
 from api.routes.scheduled import router as scheduled_router
-from api.routes.backtest_v2 import router as backtest_v2_router
-from api.routes.strategies_v2 import router as strategies_v2_router
+from api.routes.selection_center import router as selection_center_router
 from api.routes.strategy_platform import router as strategy_platform_router
 from api.routes.tokens import router as tokens_router
 from api.routes.virtual_warehouse import router as virtual_warehouse_router
@@ -74,9 +73,8 @@ app.include_router(jobs_router)
 app.include_router(chat_router)
 app.include_router(watchlist_router)
 app.include_router(scheduled_router)
+app.include_router(selection_center_router)
 app.include_router(portfolio_router)
 app.include_router(virtual_warehouse_router)
 app.include_router(realtime_router)
 app.include_router(strategy_platform_router)
-app.include_router(strategies_v2_router)
-app.include_router(backtest_v2_router)

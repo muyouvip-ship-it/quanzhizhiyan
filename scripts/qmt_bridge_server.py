@@ -134,12 +134,39 @@ def _bridge_trading_allowed() -> bool:
     return _bridge_role() == "paper"
 
 
+def _bridge_account_key() -> str:
+    return str(os.getenv("QMT_BRIDGE_ACCOUNT_KEY") or "").strip().lower()
+
+
+def _account_key_role(account_key: str | None) -> str:
+    key = str(account_key or "").strip().lower()
+    if not key:
+        return ""
+    if key.startswith("live") or key.endswith("_real"):
+        return "live"
+    if key.startswith("paper") or "sim" in key or "demo" in key:
+        return "paper"
+    return ""
+
+
 def _require_trading_allowed(action: str, account_key: str | None) -> None:
     role = _bridge_role()
-    if _bridge_trading_allowed() and role == "paper" and str(account_key or "").strip().lower() != "live_real":
+    normalized_key = str(account_key or "").strip().lower()
+    if not _bridge_trading_allowed():
+        _log(f"reject trading action={action} role={role} account_key={account_key} allow={_bridge_trading_allowed()}")
+        raise HTTPException(status_code=403, detail="QMT bridge is readonly for this account; trading is disabled")
+    expected_key = _bridge_account_key()
+    if expected_key and normalized_key and normalized_key != expected_key:
+        _log(f"reject trading action={action} role={role} account_key={account_key} expected_account_key={expected_key}")
+        raise HTTPException(status_code=403, detail="QMT bridge account_key mismatch; trading is disabled")
+    account_role = _account_key_role(normalized_key)
+    if account_role and role in {"paper", "live"} and account_role != role:
+        _log(f"reject trading action={action} role={role} account_key={account_key} account_role={account_role}")
+        raise HTTPException(status_code=403, detail="QMT bridge role/account_key mismatch; trading is disabled")
+    if role in {"paper", "live"}:
         return
     _log(f"reject trading action={action} role={role} account_key={account_key} allow={_bridge_trading_allowed()}")
-    raise HTTPException(status_code=403, detail="QMT bridge is readonly for this account; trading is disabled")
+    raise HTTPException(status_code=403, detail="QMT bridge role is invalid; trading is disabled")
 
 
 def _symbol_for_xt(value: str) -> str:
@@ -1147,6 +1174,9 @@ def _query_quotes(symbols: list[str]) -> dict[str, Any]:
     if not normalized_symbols:
         raise HTTPException(status_code=400, detail="symbols is required")
 
+    for symbol in normalized_symbols:
+        _ensure_quote_subscription_light(xtdata, symbol, "1m")
+
     raw = xtdata.get_full_tick(normalized_symbols) or {}
     items: list[dict[str, Any]] = []
     for symbol in normalized_symbols:
@@ -1288,6 +1318,7 @@ def health(authorization: str | None = Header(default=None)):
         "status": "ok",
         "bridge": "qmt",
         "role": _bridge_role(),
+        "account_key": _bridge_account_key() or None,
         "trading_allowed": _bridge_trading_allowed(),
         "userdata_path": str(os.getenv("QMT_USERDATA_PATH") or ""),
     }

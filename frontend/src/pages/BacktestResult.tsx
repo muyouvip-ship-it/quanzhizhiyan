@@ -18,9 +18,6 @@ import {
   PresentationChartLineIcon,
 } from "@heroicons/react/24/outline";
 import VirtualList from "../components/VirtualList";
-import DataSourceGovernanceCard, {
-  type DataSourceGovernanceItem,
-} from "@/components/DataSourceGovernanceCard";
 import { api } from "@/services/api";
 import type {
   BacktestEquityPoint,
@@ -713,57 +710,6 @@ export default function BacktestResult() {
   const truthTone = getBacktestTruthTone(truthLevel);
   const dataSourceText = getBacktestDataSourceText(run);
   const syntheticMode = truthLevel === "synthetic";
-  const backendGovernance = run?.data_governance || null;
-  const governanceItems = useMemo<DataSourceGovernanceItem[]>(
-    () => backendGovernance?.items?.length ? backendGovernance.items : [
-      {
-        label: "结果可信度",
-        value: truthLabel,
-        detail:
-          truthLevel === "real"
-            ? "当前结果来自真实数据链路，可继续做正式分析。"
-            : "当前结果不应直接作为正式收益结论，需要先确认回退原因。",
-        tone: truthLevel === "real" ? "good" : "warn",
-      },
-      {
-        label: "原始数据源",
-        value: dataSourceText,
-        detail: "这是回测引擎 summary 中写入的真实数据源标识。",
-        tone: dataSourceText.startsWith("synthetic:") ? "bad" : "info",
-      },
-      {
-        label: "执行链路",
-        value: toChineseEngineMode(String(summary.engine_mode ?? "--")),
-        detail: "真引擎与回退链路的行为边界并不相同。",
-        tone: String(summary.engine_mode ?? "") === "true_engine" ? "good" : "warn",
-      },
-      {
-        label: "分钟数据缺口",
-        value: String(diagnostics.minute_data_missing ?? 0),
-        detail: `分钟聚合周期 ${toChineseTimeframe(String(summary.minute_aggregation ?? "--"))}`,
-        tone: Number(diagnostics.minute_data_missing ?? 0) > 0 ? "warn" : "good",
-      },
-      {
-        label: "运行完成时间",
-        value: formatDateTime(run?.completed_at || run?.created_at),
-        detail: run?.artifact_root ? `结果目录 ${run.artifact_root}` : "当前未记录结果目录",
-        tone: "info",
-      },
-    ],
-    [backendGovernance?.items, dataSourceText, diagnostics.minute_data_missing, run?.artifact_root, run?.completed_at, run?.created_at, summary.engine_mode, summary.minute_aggregation, truthLabel, truthLevel],
-  );
-  const governanceWarnings = useMemo(() => {
-    if (backendGovernance?.warnings?.length) {
-      const merged = [...backendGovernance.warnings]
-      if (error && !merged.includes(error)) merged.push(error)
-      return merged
-    }
-    const warnings: string[] = []
-    if (syntheticMode) warnings.push("当前回测使用 Synthetic 数据，只适合验证流程，不应解释收益、胜率和成交质量。")
-    if (diagnostics.fallback_mode) warnings.push("当前结果经过 fallback_engine 回退链路，精度与真实性应以真引擎结果为准。")
-    if (error) warnings.push(error)
-    return warnings
-  }, [backendGovernance?.warnings, diagnostics.fallback_mode, error, syntheticMode])
   const showPerformanceMetrics = !selectionOnlyMode && !syntheticMode;
   const runDisplayName = getRunDisplayName(run, summary);
   const runModeLabel = getRunModeLabel(run, summary);
@@ -1099,13 +1045,6 @@ export default function BacktestResult() {
             </div>
           </div>
         )}
-
-        <DataSourceGovernanceCard
-          title="数据源治理"
-          description={backendGovernance?.description || "回测结果必须同时看到原始数据源、执行链路和是否进入 synthetic / fallback。"}
-          items={governanceItems}
-          warnings={governanceWarnings}
-        />
 
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-6">
           {strategyType === "selection" ||

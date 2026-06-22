@@ -54,18 +54,22 @@ export default function Dashboard() {
     }, [user?.id])
 
     return (
-        <div className="space-y-6">
+        <div className="space-y-5">
             {dashboardError && (
-                <div className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-600 dark:border-rose-900/50 dark:bg-rose-950/30 dark:text-rose-300">
+                <div className="border border-[var(--skin-red)] bg-[color-mix(in_srgb,var(--skin-red)_10%,transparent)] px-4 py-3 text-sm text-[var(--skin-red)]">
                     {dashboardError}
                 </div>
             )}
             <div className="flex items-center justify-between">
                 <div>
-                    <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">控制台</h1>
-                    <p className="mt-1 text-slate-500 dark:text-slate-400">
+                    <h1 className="skin-display text-2xl font-bold tracking-[0.08em] text-[var(--skin-accent)]">控制台</h1>
+                    <p className="mt-1 text-sm text-[var(--skin-muted)]">
                         {user?.email ? `当前账户：${user.email}` : '欢迎使用量化之神研究系统'}
                     </p>
+                </div>
+                <div className="hidden items-center gap-2 border border-[var(--skin-border)] bg-[var(--skin-panel)] px-3 py-2 text-[11px] tracking-[0.14em] text-[var(--skin-muted)] md:flex">
+                    <span className="h-2 w-2 rounded-full bg-[var(--skin-green)] shadow-[0_0_8px_rgba(63,185,80,0.7)]" />
+                    RESEARCH TERMINAL
                 </div>
             </div>
 
@@ -106,7 +110,9 @@ export default function Dashboard() {
             />
 
             <div className="card">
-                <h2 className="mb-4 text-lg font-semibold text-slate-900 dark:text-slate-100">快速开始</h2>
+                <div className="mb-4 border-b border-[var(--skin-border)] pb-3">
+                    <h2 className="skin-display text-base font-semibold tracking-[0.06em] text-[var(--skin-text)]">快速开始</h2>
+                </div>
                 <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
                     <QuickActionCard
                         title="开始新分析"
@@ -131,11 +137,11 @@ export default function Dashboard() {
 
             <div className="card">
                 <div className="mb-4 flex items-center justify-between">
-                    <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">最近分析</h2>
+                    <h2 className="skin-display text-base font-semibold tracking-[0.06em] text-[var(--skin-text)]">最近分析</h2>
                     {recentReports.length > 0 && (
                         <button
                             onClick={() => navigate('/reports')}
-                            className="flex items-center gap-1 text-sm text-blue-600 hover:underline dark:text-blue-400"
+                            className="skin-link flex items-center gap-1 text-sm"
                         >
                             查看全部 <ArrowRight className="h-3.5 w-3.5" />
                         </button>
@@ -143,33 +149,33 @@ export default function Dashboard() {
                 </div>
 
                 {recentReports.length === 0 ? (
-                    <p className="py-8 text-center text-slate-400 dark:text-slate-500">
+                    <p className="py-8 text-center text-[var(--skin-muted)]">
                         暂无分析记录，
-                        <button onClick={() => navigate('/analysis')} className="text-blue-500 hover:underline">
+                        <button onClick={() => navigate('/analysis')} className="skin-link">
                             开始新分析
                         </button>
                     </p>
                 ) : (
-                    <div className="divide-y divide-slate-100 dark:divide-slate-700">
+                    <div className="divide-y divide-[var(--skin-border)]">
                         {recentReports.map(report => {
                             const decisionColor = report.decision?.toUpperCase().includes('BUY') || report.decision?.includes('增持')
-                                ? 'text-red-600 dark:text-red-400'
+                                ? 'text-[var(--skin-red)]'
                                 : report.decision?.toUpperCase().includes('SELL') || report.decision?.includes('减持')
-                                    ? 'text-green-600 dark:text-green-400'
-                                    : 'text-slate-500 dark:text-slate-400'
+                                    ? 'text-[var(--skin-green)]'
+                                    : 'text-[var(--skin-muted)]'
                             return (
                                 <div
                                     key={report.id}
-                                    className="mx-[-1rem] flex cursor-pointer items-center justify-between px-4 py-3 transition-colors hover:bg-slate-50 dark:hover:bg-slate-800/50"
+                                    className="mx-[-1rem] flex cursor-pointer items-center justify-between px-4 py-3 transition-colors hover:bg-[var(--skin-accent-soft)]"
                                     onClick={() => navigate(`/reports?report=${report.id}`)}
                                 >
                                     <div className="flex items-center gap-3">
-                                        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-blue-100 dark:bg-blue-500/10">
-                                            <FileText className="h-4 w-4 text-blue-600 dark:text-blue-400" />
+                                        <div className="tone-blue flex h-8 w-8 items-center justify-center border">
+                                            <FileText className="h-4 w-4" />
                                         </div>
                                         <div>
-                                            <p className="font-medium text-slate-900 dark:text-slate-100 text-sm">{report.name || report.symbol}</p>
-                                            <p className="text-xs text-slate-400 dark:text-slate-500">{report.trade_date}</p>
+                                            <p className="text-sm font-medium text-[var(--skin-text)]">{report.name || report.symbol}</p>
+                                            <p className="text-xs text-[var(--skin-dim)]">{report.trade_date}</p>
                                         </div>
                                     </div>
                                     <div className="flex items-center gap-4">
@@ -177,9 +183,9 @@ export default function Dashboard() {
                                             {report.decision || '-'}
                                         </span>
                                         {report.confidence != null && (
-                                            <span className="text-xs text-slate-400">{report.confidence}%</span>
+                                            <span className="text-xs text-[var(--skin-muted)]">{report.confidence}%</span>
                                         )}
-                                        <p className="hidden text-xs text-slate-400 dark:text-slate-500 sm:block">
+                                        <p className="hidden text-xs text-[var(--skin-dim)] sm:block">
                                             {report.created_at ? new Date(report.created_at).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : ''}
                                         </p>
                                     </div>
@@ -210,15 +216,15 @@ function TrackingBoardSummary({
         <div className="card">
             <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
                 <div>
-                    <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">跟踪看板摘要</h2>
-                    <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+                    <h2 className="skin-display text-base font-semibold tracking-[0.06em] text-[var(--skin-text)]">跟踪看板摘要</h2>
+                    <p className="mt-1 text-sm text-[var(--skin-muted)]">
                         控制台仅展示元数据，持仓明细、区间图和交易建议请进入完整看板查看。
                     </p>
                 </div>
                 <button
                     type="button"
                     onClick={onOpen}
-                    className="flex items-center gap-1 text-sm text-blue-600 hover:underline dark:text-blue-400"
+                    className="skin-link flex items-center gap-1 text-sm"
                 >
                     查看完整看板 <ArrowRight className="h-3.5 w-3.5" />
                 </button>
@@ -260,10 +266,10 @@ function MetaCard({
     subValue: string
 }) {
     return (
-        <div className="rounded-2xl border border-slate-200 bg-slate-50/80 px-4 py-3 dark:border-slate-700 dark:bg-slate-800/40">
-            <p className="text-xs uppercase tracking-[0.14em] text-slate-400">{label}</p>
-            <p className="mt-2 text-xl font-semibold text-slate-900 dark:text-slate-100">{value}</p>
-            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{subValue}</p>
+        <div className="border border-[var(--skin-border)] bg-[var(--skin-panel)] px-4 py-3">
+            <p className="text-xs uppercase tracking-[0.14em] text-[var(--skin-dim)]">{label}</p>
+            <p className="mt-2 text-xl font-semibold text-[var(--skin-text)]">{value}</p>
+            <p className="mt-1 text-xs text-[var(--skin-muted)]">{subValue}</p>
         </div>
     )
 }
@@ -290,22 +296,22 @@ interface StatCardProps {
 
 function StatCard({ icon: Icon, label, value, subValue, color }: StatCardProps) {
     const colorClasses = {
-        blue: 'bg-blue-100 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400',
-        green: 'bg-green-100 dark:bg-green-500/10 text-green-600 dark:text-green-400',
-        orange: 'bg-orange-100 dark:bg-orange-500/10 text-orange-600 dark:text-orange-400',
-        purple: 'bg-purple-100 dark:bg-purple-500/10 text-purple-600 dark:text-purple-400',
-        red: 'bg-red-100 dark:bg-red-500/10 text-red-600 dark:text-red-400',
+        blue: 'tone-blue',
+        green: 'tone-green',
+        orange: 'tone-orange',
+        purple: 'tone-purple',
+        red: 'tone-red',
     }
 
     return (
         <div className="card card-hover">
             <div className="flex items-start justify-between">
                 <div>
-                    <p className="text-sm text-slate-500 dark:text-slate-400">{label}</p>
-                    <p className="mt-1 text-2xl font-bold text-slate-900 dark:text-slate-100">{value}</p>
-                    <p className="mt-1 text-xs text-slate-400 dark:text-slate-500">{subValue}</p>
+                    <p className="text-xs uppercase tracking-[0.14em] text-[var(--skin-muted)]">{label}</p>
+                    <p className="mt-2 text-2xl font-bold text-[var(--skin-text)]">{value}</p>
+                    <p className="mt-1 text-xs text-[var(--skin-dim)]">{subValue}</p>
                 </div>
-                <div className={`rounded-lg p-3 ${colorClasses[color]}`}>
+                <div className={`border p-3 ${colorClasses[color]}`}>
                     <Icon className="h-5 w-5" />
                 </div>
             </div>
@@ -324,11 +330,11 @@ function QuickActionCard({ title, description, action, onClick }: QuickActionCar
     return (
         <button
             onClick={onClick}
-            className="block w-full rounded-lg border border-slate-200 bg-white p-4 text-left transition-all duration-200 hover:border-blue-400 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800/30 dark:hover:border-blue-500 dark:hover:bg-slate-800/50"
+            className="block w-full border border-[var(--skin-border)] bg-[var(--skin-panel)] p-4 text-left transition-all duration-200 hover:border-[var(--skin-accent)] hover:bg-[var(--skin-accent-soft)]"
         >
-            <h3 className="font-medium text-slate-900 dark:text-slate-100">{title}</h3>
-            <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">{description}</p>
-            <span className="mt-3 inline-block text-sm text-blue-600 dark:text-blue-400">
+            <h3 className="font-medium text-[var(--skin-text)]">{title}</h3>
+            <p className="mt-1 text-sm text-[var(--skin-muted)]">{description}</p>
+            <span className="skin-link mt-3 inline-block text-sm">
                 {action} →
             </span>
         </button>

@@ -82,6 +82,15 @@
 
 ## 运行方式
 
+推荐使用统一启动脚本，完整说明见 `docs/startup.md`。
+
+```bash
+./scripts/start_services.sh
+./scripts/status_services.sh
+```
+
+常用访问地址：`http://127.0.0.1:5173/`。
+
 ### 后端
 
 ```bash
@@ -102,8 +111,6 @@ cd frontend
 npm install
 npm run dev
 ```
-
-常用访问地址：`http://127.0.0.1:5174/`。
 
 ### 调度器
 
@@ -135,6 +142,7 @@ cd frontend && npm run build
 
 - `AI_PROGRESS.md`：AI 交接进度。
 - `AI_RULES.md`：长期协作规则。
+- `docs/startup.md`：项目启动与排障指南。
 - `产品文档.md`：完整产品说明。
 - `项目性能与功能拓展分析.md`：平台升级方向。
 - `多源行情数据增量治理机制说明.md`：多源行情治理。

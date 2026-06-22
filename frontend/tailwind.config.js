@@ -24,7 +24,8 @@ export default {
             },
             fontFamily: {
                 mono: ['JetBrains Mono', 'SF Mono', 'monospace'],
-                sans: ['Inter', 'PingFang SC', 'Microsoft YaHei', 'sans-serif'],
+                sans: ['JetBrains Mono', 'PingFang SC', 'Microsoft YaHei', 'monospace'],
+                serif: ['Noto Serif SC', 'Songti SC', 'serif'],
             },
             animation: {
                 'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',

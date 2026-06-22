@@ -1,10 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Database, Landmark, RefreshCw, Send, Wifi, WifiOff, XCircle } from 'lucide-react'
+import { BarChart3, Database, Landmark, RefreshCw, Send, Wifi, WifiOff, XCircle } from 'lucide-react'
 
-import DataSourceGovernanceCard, { type DataSourceGovernanceItem } from '@/components/DataSourceGovernanceCard'
 import { usePolling } from '@/hooks/usePolling'
 import { api } from '@/services/api'
-import type { QmtBulkSellTask, VirtualWarehouseBackgroundRefresh, VirtualWarehouseDiagnosticsResponse, VirtualWarehouseOverviewResponse, VirtualWarehousePosition, VirtualWarehouseOrder, VirtualWarehouseTrade } from '@/types'
+import type { QmtBulkSellTask, QmtReturnCalendarDay, QmtReturnPeriodKey, QmtReturnStatsResponse, VirtualWarehouseBackgroundRefresh, VirtualWarehouseDiagnosticsResponse, VirtualWarehouseOverviewResponse, VirtualWarehousePosition, VirtualWarehouseOrder, VirtualWarehouseTrade } from '@/types'
+import { qmtAccountStatus, qmtBridgeStatus, qmtStatusBadgeClass, qmtStatusTextClass } from '@/utils/qmtStatus'
+
+type ReturnDisplayMode = 'amount' | 'rate'
+
+const RETURN_DISPLAY_MODE_STORAGE_KEY = 'qmt-return-display-mode'
+const RETURN_PERIOD_KEYS: QmtReturnPeriodKey[] = ['day', 'month', 'year']
+const RETURN_WEEKDAY_LABELS = ['一', '二', '三', '四', '五', '六', '日']
+
+function getInitialReturnDisplayMode(): ReturnDisplayMode {
+  if (typeof window === 'undefined') return 'amount'
+  return window.localStorage.getItem(RETURN_DISPLAY_MODE_STORAGE_KEY) === 'rate' ? 'rate' : 'amount'
+}
 
 function formatMoney(value?: number | null) {
   if (value == null || Number.isNaN(value)) return '--'
@@ -15,6 +26,11 @@ function formatPercent(value?: number | null) {
   if (value == null || Number.isNaN(value)) return '--'
   const sign = value > 0 ? '+' : ''
   return `${sign}${value.toFixed(2)}%`
+}
+
+function formatNumber(value?: number | null) {
+  if (value == null || Number.isNaN(value)) return '--'
+  return new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 }).format(value)
 }
 
 function formatDateTime(value?: string | null) {
@@ -32,11 +48,54 @@ function formatDateTime(value?: string | null) {
   }).format(date)
 }
 
+function formatDate(value?: string | null) {
+  if (!value) return '--'
+  return value.replace(/-/g, '/')
+}
+
 function tone(value?: number | null) {
   if (value == null) return 'text-slate-500'
   if (value > 0) return 'text-rose-600 dark:text-rose-400'
   if (value < 0) return 'text-emerald-600 dark:text-emerald-400'
   return 'text-slate-500'
+}
+
+function sideLabel(value?: string | null) {
+  const side = String(value || '').toLowerCase()
+  if (side === 'buy') return '买入'
+  if (side === 'sell') return '卖出'
+  return value || '--'
+}
+
+function calendarHeatStyle(day?: QmtReturnCalendarDay | null) {
+  if (!day?.has_snapshot) return {}
+  const alpha = 0.12 + Math.min(Math.max(day.intensity || 0, 0), 1) * 0.56
+  if (day.tone === 'gain') {
+    return {
+      backgroundColor: `rgba(225, 29, 72, ${alpha})`,
+      borderColor: `rgba(225, 29, 72, ${Math.min(alpha + 0.16, 0.82)})`,
+    }
+  }
+  if (day.tone === 'loss') {
+    return {
+      backgroundColor: `rgba(16, 185, 129, ${alpha})`,
+      borderColor: `rgba(16, 185, 129, ${Math.min(alpha + 0.16, 0.82)})`,
+    }
+  }
+  return {
+    backgroundColor: 'rgba(148, 163, 184, 0.14)',
+    borderColor: 'rgba(148, 163, 184, 0.28)',
+  }
+}
+
+function buildCalendarCells(days?: QmtReturnCalendarDay[] | null) {
+  const cells: Array<QmtReturnCalendarDay | null> = []
+  const first = days?.[0]
+  const leading = first ? first.weekday : 0
+  for (let index = 0; index < leading; index += 1) cells.push(null)
+  for (const day of days || []) cells.push(day)
+  while (cells.length % 7 !== 0) cells.push(null)
+  return cells
 }
 
 function normalizeTimeValue(value?: string | null) {
@@ -124,6 +183,207 @@ function MetricCard({
   )
 }
 
+function ReturnStatsCard({
+  stats,
+  loading,
+  error,
+  displayMode,
+  onDisplayModeChange,
+}: {
+  stats: QmtReturnStatsResponse | null
+  loading: boolean
+  error: string | null
+  displayMode: ReturnDisplayMode
+  onDisplayModeChange: (mode: ReturnDisplayMode) => void
+}) {
+  const periods = stats?.periods || null
+  const calendar = stats?.calendar || null
+  const calendarCells = buildCalendarCells(calendar?.days)
+  const tradedSecurities = stats?.traded_securities || []
+  return (
+    <section className="relative overflow-hidden rounded-3xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+      <div className="pointer-events-none absolute -right-20 -top-24 h-56 w-56 rounded-full bg-rose-500/10 blur-3xl dark:bg-rose-400/10" />
+      <div className="pointer-events-none absolute -bottom-24 left-8 h-48 w-48 rounded-full bg-emerald-500/10 blur-3xl dark:bg-emerald-400/10" />
+      <div className="relative flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div>
+          <div className="flex items-center gap-3">
+            <div className="rounded-2xl bg-slate-100 p-3 text-slate-700 dark:bg-slate-800 dark:text-slate-200">
+              <BarChart3 className="h-5 w-5" />
+            </div>
+            <div>
+              <h2 className="text-lg font-semibold text-slate-900 dark:text-white">收益统计</h2>
+              <p className="text-sm text-slate-500 dark:text-slate-400">
+                按账户每日净值快照沉淀，统计日 / 月 / 年收益。
+              </p>
+            </div>
+          </div>
+          <p className="mt-3 text-xs text-slate-400 dark:text-slate-500">
+            更新于 {formatDateTime(stats?.updated_at)} · {stats?.account_id ? `证券账号 ${stats.account_id}` : '等待账户快照'}
+          </p>
+        </div>
+        <div className="inline-flex w-fit rounded-2xl border border-slate-200 bg-slate-50 p-1 text-sm dark:border-slate-700 dark:bg-slate-800/80">
+          {(['amount', 'rate'] as ReturnDisplayMode[]).map(mode => {
+            const active = displayMode === mode
+            return (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => onDisplayModeChange(mode)}
+                className={`rounded-xl px-3 py-1.5 font-medium transition ${
+                  active
+                    ? 'bg-slate-900 text-white shadow-sm dark:bg-white dark:text-slate-900'
+                    : 'text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white'
+                }`}
+              >
+                {mode === 'amount' ? '收益金额' : '收益率'}
+              </button>
+            )
+          })}
+        </div>
+      </div>
+
+      <div className="relative mt-5 grid gap-3 md:grid-cols-3">
+        {RETURN_PERIOD_KEYS.map(key => {
+          const period = periods?.[key]
+          const metricValue = displayMode === 'amount' ? period?.amount : period?.rate
+          const displayValue = loading ? '加载中...' : displayMode === 'amount' ? formatMoney(period?.amount) : formatPercent(period?.rate)
+          const muted = !loading && (!period || period.coverage === 'empty' || metricValue == null)
+          return (
+            <div
+              key={key}
+              className="group rounded-2xl border border-slate-200 bg-slate-50/80 p-4 transition hover:-translate-y-0.5 hover:bg-white hover:shadow-md dark:border-slate-800 dark:bg-slate-950/40 dark:hover:bg-slate-900"
+            >
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-sm font-medium text-slate-500 dark:text-slate-400">{period?.label || (key === 'day' ? '日收益' : key === 'month' ? '月收益' : '年收益')}</p>
+                <span className={`rounded-full px-2 py-0.5 text-[11px] ${
+                  period?.coverage === 'full'
+                    ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300'
+                    : period?.coverage === 'fallback'
+                      ? 'bg-sky-50 text-sky-700 dark:bg-sky-500/10 dark:text-sky-300'
+                      : 'bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300'
+                }`}>
+                  {period?.coverage_label || '数据沉淀中'}
+                </span>
+              </div>
+              <p className={`mt-4 text-3xl font-semibold tracking-tight ${muted ? 'text-slate-400 dark:text-slate-500' : tone(metricValue)}`}>
+                {displayValue}
+              </p>
+              <div className="mt-4 space-y-1 text-xs text-slate-500 dark:text-slate-400">
+                <div>统计区间：{formatDate(period?.start_date)} - {formatDate(period?.end_date)}</div>
+                <div>基准资产：{formatMoney(period?.baseline_asset)}</div>
+                <div>当前资产：{formatMoney(period?.current_asset)}</div>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+
+      <div className="relative mt-5 grid gap-4 xl:grid-cols-[1.05fr_0.95fr]">
+        <div className="rounded-2xl border border-slate-200 bg-slate-50/70 p-4 dark:border-slate-800 dark:bg-slate-950/35">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <h3 className="text-base font-semibold text-slate-900 dark:text-white">日历式收益明细</h3>
+              <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+                {calendar?.month_label || '当前月份'} · 每格为当天收益，颜色越深代表波动越大。
+              </p>
+            </div>
+            <div className="flex items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
+              <span className="inline-flex items-center gap-1"><span className="h-2.5 w-2.5 rounded-sm bg-rose-500/60" />盈利</span>
+              <span className="inline-flex items-center gap-1"><span className="h-2.5 w-2.5 rounded-sm bg-emerald-500/60" />亏损</span>
+              <span>峰值 {formatMoney(calendar?.max_abs_amount)}</span>
+            </div>
+          </div>
+
+          <div className="mt-4 grid grid-cols-7 gap-2 text-center text-xs font-medium text-slate-400 dark:text-slate-500">
+            {RETURN_WEEKDAY_LABELS.map(label => <div key={label}>{label}</div>)}
+          </div>
+          <div className="mt-2 grid grid-cols-7 gap-2">
+            {calendarCells.map((day, index) => {
+              if (!day) return <div key={`blank-${index}`} className="min-h-[82px]" />
+              const metricValue = displayMode === 'amount' ? day.amount : day.rate
+              const displayValue = displayMode === 'amount' ? formatMoney(day.amount) : formatPercent(day.rate)
+              return (
+                <div
+                  key={day.date}
+                  style={calendarHeatStyle(day)}
+                  className={`min-h-[82px] rounded-2xl border p-2 text-left transition hover:-translate-y-0.5 hover:shadow-md ${
+                    day.has_snapshot
+                      ? 'border-slate-200 text-slate-900 dark:border-slate-700 dark:text-white'
+                      : 'border-slate-200/70 bg-white/60 text-slate-400 dark:border-slate-800 dark:bg-slate-900/40 dark:text-slate-600'
+                  }`}
+                  title={`${formatDate(day.date)} ${displayMode === 'amount' ? '收益' : '收益率'} ${displayValue}`}
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="text-sm font-semibold">{day.day}</span>
+                    {day.has_snapshot ? <span className="text-[10px] opacity-70">{day.coverage === 'fallback' ? '估' : '净'}</span> : null}
+                  </div>
+                  <div className={`mt-2 text-xs font-semibold ${day.has_snapshot ? tone(metricValue) : 'text-slate-400 dark:text-slate-600'}`}>
+                    {day.has_snapshot ? displayValue : '--'}
+                  </div>
+                  <div className="mt-1 truncate text-[10px] opacity-70">{day.coverage_label}</div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-slate-200 bg-slate-50/70 p-4 dark:border-slate-800 dark:bg-slate-950/35">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <h3 className="text-base font-semibold text-slate-900 dark:text-white">历史交易股票</h3>
+              <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">沉淀所有已成交股票，按最近成交时间排序。</p>
+            </div>
+            <span className="rounded-full bg-slate-900 px-3 py-1 text-xs text-white dark:bg-white dark:text-slate-900">
+              {tradedSecurities.length} 只
+            </span>
+          </div>
+          <div className="mt-4 max-h-[462px] overflow-auto pr-1">
+            {!tradedSecurities.length ? (
+              <div className="rounded-2xl border border-dashed border-slate-200 bg-white/70 p-5 text-sm text-slate-500 dark:border-slate-800 dark:bg-slate-900/40 dark:text-slate-400">
+                暂无历史成交沉淀。后续 QMT 成交快照同步后，这里会自动累计交易过的股票。
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {tradedSecurities.map(item => (
+                  <div key={item.symbol} className="rounded-2xl border border-slate-200 bg-white/80 p-4 dark:border-slate-800 dark:bg-slate-900/60">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="font-semibold text-slate-900 dark:text-white">{displaySecurityName(item.name, item.symbol)}</div>
+                        <div className="text-xs text-slate-500 dark:text-slate-400">{item.symbol} · {item.trade_count} 笔成交</div>
+                      </div>
+                      <div className={`text-right text-sm font-semibold ${tone(item.realized_pnl)}`}>
+                        {item.pnl_status === 'estimated' ? formatMoney(item.realized_pnl) : '--'}
+                        <div className="text-[11px] font-normal text-slate-400 dark:text-slate-500">已实现收益</div>
+                      </div>
+                    </div>
+                    <div className="mt-3 grid gap-2 text-xs text-slate-600 dark:text-slate-300 sm:grid-cols-2">
+                      <div>买入：{formatNumber(item.buy_quantity)} 股 / {formatMoney(item.buy_amount)}</div>
+                      <div>卖出：{formatNumber(item.sell_quantity)} 股 / {formatMoney(item.sell_amount)}</div>
+                      <div>净股数：{formatNumber(item.net_quantity)} 股</div>
+                      <div>收益率：{item.pnl_status === 'estimated' ? formatPercent(item.realized_pnl_pct) : '成本缺失'}</div>
+                      <div>最近：{sideLabel(item.latest_side)} {item.latest_price != null ? item.latest_price.toFixed(3) : '--'}</div>
+                      <div>净现金流：{formatMoney(item.net_cashflow)}</div>
+                    </div>
+                    <div className="mt-2 text-[11px] text-slate-400 dark:text-slate-500">
+                      首次 {formatDateTime(item.first_trade_time)} · 最近 {formatDateTime(item.latest_trade_time)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {error ? (
+        <div className="relative mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900/60 dark:bg-amber-500/10 dark:text-amber-200">
+          收益统计暂不可用：{error}
+        </div>
+      ) : null}
+    </section>
+  )
+}
+
 interface WarehousePageProps {
   roleFilter?: 'paper' | 'live'
   pageTitle?: string
@@ -151,76 +411,21 @@ function isBulkSellTaskActive(status?: string | null) {
   return ['pending', 'running'].includes(String(status || '').trim().toLowerCase())
 }
 
-function resolveQmtConnectionHealth(
-  payload: VirtualWarehouseOverviewResponse | null,
-  backgroundRefresh: VirtualWarehouseBackgroundRefresh | null,
-) {
-  const connection = payload?.connection
-  const status = String(connection?.health_status || '')
-  const hasSnapshot = Boolean(
-    payload?.last_synced_at
-    || payload?.account
-    || payload?.positions?.length
-    || payload?.orders?.length
-    || payload?.trades?.length
-  )
-  const baseDetail = connection?.health_message || connection?.message || ''
-
-  if (status === 'live' || (!payload?.is_stale && connection?.connected)) {
-    return {
-      label: connection?.health_label || '实时直连',
-      detail: baseDetail || '本次 QMT 快照查询成功。',
-      tone: 'good',
-      icon: 'wifi',
-      badgeClass: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300',
-    }
-  }
-  if (status === 'background_live' || connection?.effective_connected) {
-    return {
-      label: connection?.health_label || '后台在线',
-      detail: baseDetail || `后台同步最近成功于 ${formatDateTime(connection?.last_background_success_at)}。`,
-      tone: 'good',
-      icon: 'wifi',
-      badgeClass: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300',
-    }
-  }
-  if (status === 'snapshot_available' || hasSnapshot) {
-    return {
-      label: connection?.health_label || '快照可用',
-      detail: baseDetail || '页面当前展示最近一次成功同步的 QMT 快照。',
-      tone: 'warn',
-      icon: 'database',
-      badgeClass: 'bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300',
-    }
-  }
-  if (backgroundRefresh?.active) {
-    return {
-      label: '刷新中',
-      detail: `后台刷新中，开始于 ${formatDateTime(backgroundRefresh.started_at)}。`,
-      tone: 'info',
-      icon: 'database',
-      badgeClass: 'bg-sky-50 text-sky-700 dark:bg-sky-500/10 dark:text-sky-300',
-    }
-  }
-  return {
-    label: connection?.health_label || '未连接',
-    detail: baseDetail || '当前没有可用的 QMT 连接或本地快照。',
-    tone: 'bad',
-    icon: 'off',
-    badgeClass: 'bg-rose-50 text-rose-700 dark:bg-rose-500/10 dark:text-rose-300',
-  }
-}
-
 export function WarehousePage({
   roleFilter = 'paper',
   pageTitle = '虚拟仓',
   pageDescription = '对接 QMT 模拟账户，展示资产总览与实时持仓。',
 }: WarehousePageProps) {
   const [payload, setPayload] = useState<VirtualWarehouseOverviewResponse | null>(null)
+  const [statusPayload, setStatusPayload] = useState<VirtualWarehouseOverviewResponse | null>(null)
+  const [returnStats, setReturnStats] = useState<QmtReturnStatsResponse | null>(null)
   const [backgroundRefresh, setBackgroundRefresh] = useState<VirtualWarehouseBackgroundRefresh | null>(null)
   const [selectedAccountKey, setSelectedAccountKey] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
+  const [returnStatsLoading, setReturnStatsLoading] = useState(false)
+  const [returnStatsError, setReturnStatsError] = useState<string | null>(null)
+  const [returnDisplayMode, setReturnDisplayMode] = useState<ReturnDisplayMode>(getInitialReturnDisplayMode)
   const [triggeringRefresh, setTriggeringRefresh] = useState(false)
   const [diagnosing, setDiagnosing] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -325,20 +530,54 @@ export function WarehousePage({
 
   const activeAccountKey = payload?.active_account_key || selectedAccountKey || null
 
+  const handleReturnDisplayModeChange = useCallback((mode: ReturnDisplayMode) => {
+    setReturnDisplayMode(mode)
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem(RETURN_DISPLAY_MODE_STORAGE_KEY, mode)
+    }
+  }, [])
+
   const load = useCallback(async (silent = false, accountKey?: string | null) => {
     try {
       if (silent) setRefreshing(true)
       else setLoading(true)
+      setReturnStatsLoading(true)
+      setReturnStatsError(null)
       const response = await api.getQmtVirtualWarehouseOverview(accountKey || undefined, accountKey ? undefined : roleFilter, true)
       setPayload(response)
       setBackgroundRefresh(response.background_refresh || null)
       setSelectedAccountKey(response.active_account_key || accountKey || null)
+      try {
+        const statusResponse = await api.getQmtVirtualWarehouseOverview(
+          response.active_account_key || accountKey || undefined,
+          undefined,
+          false,
+          false,
+        )
+        setStatusPayload(statusResponse)
+      } catch {
+        setStatusPayload(null)
+      }
+      try {
+        const diagnosticsResponse = await api.getQmtVirtualWarehouseDiagnostics(undefined, false)
+        setDiagnostics(diagnosticsResponse)
+      } catch {
+        // 诊断只用于拆分 Bridge / 账户状态；失败时不影响持仓快照展示。
+      }
+      try {
+        const statsResponse = await api.getQmtReturnStats(response.active_account_key || accountKey || undefined, undefined)
+        setReturnStats(statsResponse)
+      } catch (statsErr) {
+        setReturnStats(null)
+        setReturnStatsError(statsErr instanceof Error ? statsErr.message : '收益统计加载失败')
+      }
       setError(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : `${pageTitle}加载失败`)
     } finally {
       setLoading(false)
       setRefreshing(false)
+      setReturnStatsLoading(false)
     }
   }, [pageTitle, roleFilter])
 
@@ -488,10 +727,6 @@ export function WarehousePage({
   }, [load, payload?.active_account_key, roleFilter, selectedAccountKey])
 
   const handleSubmitOrder = useCallback(async () => {
-    if (roleFilter !== 'paper') {
-      setError('实盘仓已只读锁定：禁止从本系统提交 QMT 委托，请切换到虚拟仓。')
-      return
-    }
     setSubmittingOrder(true)
     setActionMessage(null)
     try {
@@ -519,13 +754,9 @@ export function WarehousePage({
     } finally {
       setSubmittingOrder(false)
     }
-  }, [load, orderForm, payload?.active_account_key, roleFilter, selectedAccountKey])
+  }, [load, orderForm, payload?.active_account_key, selectedAccountKey])
 
   const handleCancelOrder = useCallback(async (orderId: string) => {
-    if (roleFilter !== 'paper') {
-      setError('实盘仓已只读锁定：禁止从本系统撤销 QMT 委托，请切换到虚拟仓。')
-      return
-    }
     setCancellingOrderId(orderId)
     setActionMessage(null)
     try {
@@ -539,7 +770,7 @@ export function WarehousePage({
     } finally {
       setCancellingOrderId(null)
     }
-  }, [payload?.active_account_key, roleFilter, selectedAccountKey])
+  }, [payload?.active_account_key, selectedAccountKey])
 
   const sellablePositions = useMemo(
     () => positions.filter(item => normalizeOrderQuantity(item.available_position || item.current_position) > 0),
@@ -547,10 +778,6 @@ export function WarehousePage({
   )
 
   const handleSellAllPositions = useCallback(async () => {
-    if (roleFilter !== 'paper') {
-      setError('实盘仓已只读锁定：禁止从本系统提交 QMT 委托，请切换到虚拟仓。')
-      return
-    }
     if (!sellablePositions.length) {
       setError('当前没有可卖出的持仓。')
       return
@@ -580,9 +807,25 @@ export function WarehousePage({
       setBulkSelling(false)
       setError(err instanceof Error ? err.message : '一键卖出任务启动失败')
     }
-  }, [bulkSellStorageKey, connectBulkSellStream, orderForm.strategyName, payload?.active_account_key, roleFilter, selectedAccountKey, sellablePositions])
+  }, [bulkSellStorageKey, connectBulkSellStream, orderForm.strategyName, payload?.active_account_key, selectedAccountKey, sellablePositions])
 
   const accountCards = useMemo(() => (payload?.accounts || []).filter(item => item.role === roleFilter), [payload?.accounts, roleFilter])
+  const statusAccountsByKey = useMemo(
+    () => new Map((statusPayload?.accounts || []).map(item => [item.account_key, item])),
+    [statusPayload?.accounts],
+  )
+  const diagnosticsByAccountKey = useMemo(
+    () => new Map((diagnostics?.items || []).map(item => [item.account_key, item])),
+    [diagnostics?.items],
+  )
+  const activeDiagnostics = activeAccountKey ? diagnosticsByAccountKey.get(activeAccountKey) : undefined
+  const activeAccount = accountCards.find(item => item.account_key === activeAccountKey) || null
+  const activeStatusAccount = activeAccountKey ? statusAccountsByKey.get(activeAccountKey) : undefined
+  const statusConnection = activeStatusAccount?.connection || activeAccount?.connection || connection
+  const bridgeStatus = qmtBridgeStatus(activeDiagnostics, statusConnection)
+  const accountStatus = qmtAccountStatus(activeStatusAccount || activeAccount, undefined, activeDiagnostics)
+  const accountStatusDetail = accountStatus.message || statusConnection?.health_message || statusConnection?.message || ''
+  const bridgeStatusDetail = bridgeStatus.message || statusConnection?.health_message || statusConnection?.message || ''
   const lastQuoteTime = useMemo(() => {
     const quoteTime = positions.find(item => item.quote_time)?.quote_time
     return quoteTime || payload?.fetched_at || null
@@ -603,59 +846,6 @@ export function WarehousePage({
     }
     return '页面默认优先展示本地快照，后台会异步补最新数据'
   }, [backgroundRefresh])
-  const backendGovernance = payload?.data_governance || null
-  const connectionHealth = useMemo(
-    () => resolveQmtConnectionHealth(payload, backgroundRefresh),
-    [backgroundRefresh, payload],
-  )
-  const governanceWarnings = useMemo(() => {
-    if (backendGovernance?.warnings?.length) {
-      const merged = [...backendGovernance.warnings]
-      if (error && !merged.includes(error)) merged.push(error)
-      return merged
-    }
-    const warnings: string[] = []
-    if (connectionHealth.tone !== 'good' && connectionHealth.detail) warnings.push(connectionHealth.detail)
-    if (backgroundRefresh?.last_error) warnings.push(`后台刷新异常：${backgroundRefresh.last_error}`)
-    if (error) warnings.push(error)
-    return warnings
-  }, [backgroundRefresh?.last_error, backendGovernance?.warnings, connectionHealth.detail, connectionHealth.tone, error])
-  const governanceItems = useMemo<DataSourceGovernanceItem[]>(() => {
-    if (backendGovernance?.items?.length) return backendGovernance.items
-    return ([
-    {
-      label: 'QMT 链路状态',
-      value: connectionHealth.label,
-      detail: connectionHealth.detail,
-      tone: connectionHealth.tone as DataSourceGovernanceItem['tone'],
-    },
-    {
-      label: '账户数据源',
-      value: payload?.data_source || connection?.provider || '--',
-      detail: connectionHealth.detail,
-      tone: payload?.is_stale ? 'warn' : connectionHealth.tone as DataSourceGovernanceItem['tone'],
-    },
-    {
-      label: '页面状态',
-      value: payload?.is_stale ? '缓存快照' : '最新同步',
-      detail: payload?.is_stale ? '当前显示最近一次成功同步的本地快照' : '当前显示最近一次成功实时查询结果',
-      tone: payload?.is_stale ? 'warn' : 'good',
-    },
-    {
-      label: '最近同步',
-      value: formatDateTime(lastSyncTime || payload?.fetched_at),
-      detail: payload?.fetched_at ? `页面读取时间 ${formatDateTime(payload.fetched_at)}` : '等待下一次刷新',
-      tone: 'info',
-    },
-    {
-      label: '后台刷新',
-      value: backgroundRefresh?.active ? '刷新中' : backgroundRefresh?.last_error ? '最近失败' : backgroundRefresh?.last_success_at ? '最近成功' : '等待任务',
-      detail: backgroundRefreshLabel,
-      tone: backgroundRefresh?.active ? 'info' : backgroundRefresh?.last_error ? 'bad' : backgroundRefresh?.last_success_at ? 'good' : 'neutral',
-    },
-  ])
-  }, [backgroundRefresh?.active, backgroundRefresh?.last_error, backgroundRefresh?.last_success_at, backgroundRefreshLabel, backendGovernance?.items, connection?.provider, connectionHealth.detail, connectionHealth.label, connectionHealth.tone, lastSyncTime, payload?.data_source, payload?.fetched_at, payload?.is_stale])
-
   if (loading) {
     return <div className="rounded-2xl border border-slate-200 bg-white p-8 text-slate-500 shadow-sm dark:border-slate-800 dark:bg-slate-900">{pageTitle}加载中...</div>
   }
@@ -675,9 +865,13 @@ export function WarehousePage({
               </div>
             </div>
             <div className="flex flex-wrap items-center gap-3 text-sm">
-              <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 ${connectionHealth.badgeClass}`}>
-                {connectionHealth.icon === 'wifi' ? <Wifi className="h-4 w-4" /> : connectionHealth.icon === 'database' ? <Database className="h-4 w-4" /> : <WifiOff className="h-4 w-4" />}
-                {connectionHealth.label}
+              <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 ${qmtStatusBadgeClass(bridgeStatus.tone)}`}>
+                {bridgeStatus.connected ? <Wifi className="h-4 w-4" /> : <WifiOff className="h-4 w-4" />}
+                QMT：{bridgeStatus.label}
+              </span>
+              <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 ${qmtStatusBadgeClass(accountStatus.tone)}`}>
+                {accountStatus.connected ? <Wifi className="h-4 w-4" /> : <WifiOff className="h-4 w-4" />}
+                账户：{accountStatus.label}
               </span>
               <span className="rounded-full bg-slate-100 px-3 py-1 text-slate-600 dark:bg-slate-800 dark:text-slate-300">
                 地址 {connection?.host}:{connection?.port}
@@ -719,8 +913,11 @@ export function WarehousePage({
                 })}
               </div>
             ) : null}
-            {connectionHealth.detail ? (
-              <p className={`text-sm ${connectionHealth.tone === 'bad' ? 'text-rose-600 dark:text-rose-300' : connectionHealth.tone === 'warn' ? 'text-amber-600 dark:text-amber-300' : 'text-slate-500 dark:text-slate-400'}`}>{connectionHealth.detail}</p>
+            {(bridgeStatusDetail || accountStatusDetail) ? (
+              <div className="space-y-1 text-sm">
+                {bridgeStatusDetail ? <p className={qmtStatusTextClass(bridgeStatus.tone)}>QMT连接：{bridgeStatusDetail}</p> : null}
+                {accountStatusDetail ? <p className={qmtStatusTextClass(accountStatus.tone)}>账户状态：{accountStatusDetail}</p> : null}
+              </div>
             ) : null}
             <p className={`text-sm ${backgroundRefresh?.last_error ? 'text-rose-600 dark:text-rose-300' : 'text-slate-500 dark:text-slate-400'}`}>
               {backgroundRefreshLabel}
@@ -783,11 +980,12 @@ export function WarehousePage({
         </div>
       </section>
 
-      <DataSourceGovernanceCard
-        title="数据源治理"
-        description={backendGovernance?.description || '明确区分当前页是实时 QMT 返回、缓存快照回退，还是后台刷新中的中间状态。'}
-        items={governanceItems}
-        warnings={governanceWarnings}
+      <ReturnStatsCard
+        stats={returnStats}
+        loading={returnStatsLoading}
+        error={returnStatsError}
+        displayMode={returnDisplayMode}
+        onDisplayModeChange={handleReturnDisplayModeChange}
       />
 
       <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
@@ -829,16 +1027,15 @@ export function WarehousePage({
         ) : (
         <div className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900">
           <h2 className="text-lg font-semibold text-slate-900 dark:text-white">实盘账户说明</h2>
-          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">实盘仓只负责映射 QMT 实盘资产与交易，不会改写跟踪看板。跟踪看板继续按原逻辑独立维护。</p>
+          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">实盘仓映射 QMT 实盘资产与交易，不会改写跟踪看板。跟踪看板继续按原逻辑独立维护。</p>
           <div className="mt-4 space-y-2 text-sm text-slate-600 dark:text-slate-300">
-            <div>推荐用途：核对 QMT 实盘资产、持仓、委托、成交</div>
+            <div>推荐用途：核对 QMT 实盘资产、持仓、委托、成交并提交交易指令</div>
             <div>桥接方式：单独 bridge 进程 + 单独端口</div>
-            <div>当前页面支持：实时查询、委托/成交查看</div>
-            <div className="text-amber-600 dark:text-amber-300">安全锁：实盘仓只读，页面与后端均禁止下单和撤单</div>
+            <div>当前页面支持：实时查询、下单、撤单、委托/成交查看</div>
+            <div className="text-amber-600 dark:text-amber-300">实盘交易会直接发送到 QMT 实盘账户，请核对账号、方向、数量和价格。</div>
           </div>
         </div>
         )}
-        {roleFilter === 'paper' ? (
         <div className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900">
           <h2 className="text-lg font-semibold text-slate-900 dark:text-white">QMT 交易控制台</h2>
           <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">直接向当前 QMT 账户提交买卖委托，支持提交后立即回显到最近委托。点击上方持仓行可自动带入股票、数量和价格模式。</p>
@@ -939,57 +1136,53 @@ export function WarehousePage({
             </div>
           </div>
         </div>
-        ) : (
-        <div className="rounded-3xl border border-amber-200 bg-amber-50 p-6 shadow-sm dark:border-amber-900/60 dark:bg-amber-950/20">
-          <h2 className="text-lg font-semibold text-amber-900 dark:text-amber-100">实盘交易已锁定</h2>
-          <p className="mt-1 text-sm text-amber-700 dark:text-amber-200">
-            实盘仓仅用于资产、持仓、委托和成交核对。为避免开盘期间误操作，本页面不提供实盘下单或撤单入口。
-          </p>
-          <div className="mt-4 space-y-2 text-sm text-amber-700 dark:text-amber-200">
-            <div>允许：刷新资产、查看持仓、查看最近委托、查看最近成交</div>
-            <div>禁止：提交委托、撤单、策略自动交易</div>
-            <div>如需联调交易，请切换到虚拟仓模拟账户。</div>
-          </div>
-        </div>
-        )}
       </section>
 
       {accountCards.length > 0 ? (
         <section className="grid gap-4 lg:grid-cols-2">
-          {accountCards.map(item => (
-            <button
-              key={item.account_key}
-              type="button"
-              onClick={() => {
-                void load(true, item.account_key)
-              }}
-              className={`rounded-2xl border p-4 text-left shadow-sm transition ${
-                activeAccountKey === item.account_key
-                  ? 'border-slate-900 bg-slate-900 text-white dark:border-slate-100 dark:bg-slate-100 dark:text-slate-900'
-                  : 'border-slate-200 bg-white text-slate-800 hover:border-slate-300 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100'
-              }`}
-            >
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <div className="text-base font-semibold">{item.account?.account_name || item.connection.account_name}</div>
-                  <div className="mt-1 text-xs opacity-80">Key: {item.account_key} · {item.role === 'paper' ? '模拟仓' : '实盘仓'}</div>
+          {accountCards.map(item => {
+            const statusAccount = statusAccountsByKey.get(item.account_key)
+            const itemDiagnostics = diagnosticsByAccountKey.get(item.account_key)
+            const itemBridgeStatus = qmtBridgeStatus(itemDiagnostics, statusAccount?.connection || item.connection)
+            const itemAccountStatus = qmtAccountStatus(statusAccount || item, undefined, itemDiagnostics)
+            return (
+              <button
+                key={item.account_key}
+                type="button"
+                onClick={() => {
+                  void load(true, item.account_key)
+                }}
+                className={`rounded-2xl border p-4 text-left shadow-sm transition ${
+                  activeAccountKey === item.account_key
+                    ? 'border-slate-900 bg-slate-900 text-white dark:border-slate-100 dark:bg-slate-100 dark:text-slate-900'
+                    : 'border-slate-200 bg-white text-slate-800 hover:border-slate-300 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100'
+                }`}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="text-base font-semibold">{item.account?.account_name || item.connection.account_name}</div>
+                    <div className="mt-1 text-xs opacity-80">Key: {item.account_key} · {item.role === 'paper' ? '模拟仓' : '实盘仓'}</div>
+                  </div>
+                  <div className="flex shrink-0 flex-col items-end gap-1">
+                    <span className={`rounded-full px-2 py-1 text-xs ${qmtStatusBadgeClass(itemBridgeStatus.tone)}`}>
+                      QMT：{itemBridgeStatus.label}
+                    </span>
+                    <span className={`rounded-full px-2 py-1 text-xs ${qmtStatusBadgeClass(itemAccountStatus.tone)}`}>
+                      账户：{itemAccountStatus.label}
+                    </span>
+                  </div>
                 </div>
-                <span className={`rounded-full px-2 py-1 text-xs ${
-                  item.connection.connected
-                    ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-300'
-                    : 'bg-amber-500/15 text-amber-600 dark:text-amber-300'
-                }`}>
-                  {item.connection.connected ? '在线' : '未连通'}
-                </span>
-              </div>
-              <div className="mt-3 grid gap-2 text-sm md:grid-cols-2">
-                <div>账号：{item.connection.account_id || '--'}</div>
-                <div>总资产：{formatMoney(item.summary.total_asset)}</div>
-                <div className={tone(item.summary.total_pnl)}>总盈亏：{formatMoney(item.summary.total_pnl)}</div>
-                <div className={tone(item.summary.today_pnl)}>当日盈亏：{formatMoney(item.summary.today_pnl)}</div>
-              </div>
-            </button>
-          ))}
+                <div className="mt-3 grid gap-2 text-sm md:grid-cols-2">
+                  <div>账号：{item.connection.account_id || '--'}</div>
+                  <div>数据：{item.is_stale ? '缓存快照' : '实时数据'}</div>
+                  <div>总资产：{formatMoney(item.summary.total_asset)}</div>
+                  <div className={tone(item.summary.total_pnl)}>总盈亏：{formatMoney(item.summary.total_pnl)}</div>
+                  <div className={tone(item.summary.today_pnl)}>当日盈亏：{formatMoney(item.summary.today_pnl)}</div>
+                  <div>同步：{formatDateTime(item.last_synced_at)}</div>
+                </div>
+              </button>
+            )
+          })}
         </section>
       ) : null}
 
@@ -1002,44 +1195,49 @@ export function WarehousePage({
             </p>
           </div>
           <div className="space-y-4 p-6">
-            {diagnostics.items.map(item => (
-              <div key={item.account_key} className="rounded-2xl border border-slate-200 p-4 dark:border-slate-800">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div>
-                    <div className="text-base font-semibold text-slate-900 dark:text-white">
-                      {item.account_name} <span className="text-xs text-slate-400">({item.account_key})</span>
+            {diagnostics.items.map(item => {
+              const overviewAccount = accountCards.find(accountItem => accountItem.account_key === item.account_key)
+              const statusAccount = statusAccountsByKey.get(item.account_key)
+              const itemBridgeStatus = qmtBridgeStatus(item, statusAccount?.connection || overviewAccount?.connection)
+              const itemAccountStatus = qmtAccountStatus(statusAccount || overviewAccount, undefined, item)
+              return (
+                <div key={item.account_key} className="rounded-2xl border border-slate-200 p-4 dark:border-slate-800">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <div className="text-base font-semibold text-slate-900 dark:text-white">
+                        {item.account_name} <span className="text-xs text-slate-400">({item.account_key})</span>
+                      </div>
+                      <div className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+                        {item.role === 'paper' ? '模拟仓' : '实盘仓'} · {item.host}:{item.port} · 账号 {item.account_id || '--'}
+                      </div>
                     </div>
-                    <div className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-                      {item.role === 'paper' ? '模拟仓' : '实盘仓'} · {item.host}:{item.port} · 账号 {item.account_id || '--'}
+                    <div className="flex shrink-0 flex-col items-end gap-1">
+                      <span className={`rounded-full px-3 py-1 text-xs ${qmtStatusBadgeClass(itemBridgeStatus.tone)}`}>
+                        QMT：{itemBridgeStatus.label}
+                      </span>
+                      <span className={`rounded-full px-3 py-1 text-xs ${qmtStatusBadgeClass(itemAccountStatus.tone)}`}>
+                        账户：{itemAccountStatus.label}
+                      </span>
                     </div>
                   </div>
-                  <span className={`rounded-full px-3 py-1 text-xs ${
-                    item.connect_test.connected
-                      ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300'
-                      : item.ready
-                        ? 'bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300'
-                        : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'
-                  }`}>
-                    {item.connect_test.connected ? '已连通' : item.ready ? '可测试' : '待配置'}
-                  </span>
+                  <div className="mt-3 grid gap-2 text-sm md:grid-cols-2 xl:grid-cols-3">
+                    <div>启用：{item.checks.enabled ? '是' : '否'}</div>
+                    <div>账号配置：{item.checks.account_id_configured ? '已配置' : '缺失'}</div>
+                    <div>目录配置：{item.checks.userdata_path_configured ? '已配置' : '缺失'}</div>
+                    <div>目录存在：{item.checks.userdata_path_exists ? '是' : '否'}</div>
+                    <div>xtquant：{item.checks.xtquant_installed ? '已安装' : '未安装'}</div>
+                    <div>端口探测：{item.tcp_probe.message}</div>
+                    <div>桥接探测：{item.bridge_probe.message}</div>
+                    <div>账户测试：{item.connect_test.message}</div>
+                  </div>
+                  <div className="mt-3 text-xs text-slate-500 dark:text-slate-400">
+                    <div>userdata：{item.userdata_path || '--'}</div>
+                    <div>{item.xtquant_message}</div>
+                    {item.warnings.length ? <div className="mt-1 text-amber-600 dark:text-amber-300">告警：{item.warnings.join('；')}</div> : null}
+                  </div>
                 </div>
-                <div className="mt-3 grid gap-2 text-sm md:grid-cols-2 xl:grid-cols-3">
-                  <div>启用：{item.checks.enabled ? '是' : '否'}</div>
-                  <div>账号配置：{item.checks.account_id_configured ? '已配置' : '缺失'}</div>
-                  <div>目录配置：{item.checks.userdata_path_configured ? '已配置' : '缺失'}</div>
-                  <div>目录存在：{item.checks.userdata_path_exists ? '是' : '否'}</div>
-                  <div>xtquant：{item.checks.xtquant_installed ? '已安装' : '未安装'}</div>
-                  <div>端口探测：{item.tcp_probe.message}</div>
-                  <div>桥接探测：{item.bridge_probe.message}</div>
-                  <div>连接测试：{item.connect_test.message}</div>
-                </div>
-                <div className="mt-3 text-xs text-slate-500 dark:text-slate-400">
-                  <div>userdata：{item.userdata_path || '--'}</div>
-                  <div>{item.xtquant_message}</div>
-                  {item.warnings.length ? <div className="mt-1 text-amber-600 dark:text-amber-300">告警：{item.warnings.join('；')}</div> : null}
-                </div>
-              </div>
-            ))}
+              )
+            })}
           </div>
         </section>
       ) : null}
@@ -1051,17 +1249,15 @@ export function WarehousePage({
               <p className="text-sm text-slate-500 dark:text-slate-400">展示 QMT 仓位快照，持股天数按首次同步时间持续跟踪。</p>
           </div>
           <div className="flex items-center gap-3">
-            {roleFilter === 'paper' ? (
-              <button
-                type="button"
-                onClick={() => void handleSellAllPositions()}
-                disabled={bulkSelling || !sellablePositions.length}
-                className="inline-flex items-center gap-2 rounded-xl border border-rose-200 px-3 py-2 text-xs font-medium text-rose-600 disabled:opacity-50 dark:border-rose-900 dark:text-rose-300"
-              >
-                <Send className="h-3.5 w-3.5" />
-                {bulkSelling ? '清仓提交中...' : '一键卖出全部持仓'}
-              </button>
-            ) : null}
+            <button
+              type="button"
+              onClick={() => void handleSellAllPositions()}
+              disabled={bulkSelling || !sellablePositions.length}
+              className="inline-flex items-center gap-2 rounded-xl border border-rose-200 px-3 py-2 text-xs font-medium text-rose-600 disabled:opacity-50 dark:border-rose-900 dark:text-rose-300"
+            >
+              <Send className="h-3.5 w-3.5" />
+              {bulkSelling ? '清仓提交中...' : '一键卖出全部持仓'}
+            </button>
             <span className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500 dark:bg-slate-800 dark:text-slate-300">
               共 {positions.length} 只
             </span>
@@ -1088,11 +1284,9 @@ export function WarehousePage({
                 {positions.map((item: VirtualWarehousePosition) => (
                   <tr
                     key={item.symbol}
-                    className={`border-t border-slate-100 dark:border-slate-800 ${
-                      roleFilter === 'paper' ? 'cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-950/50' : ''
-                    } ${selectedPositionSymbol === item.symbol ? 'bg-slate-50 dark:bg-slate-950/50' : ''}`}
-                    onClick={roleFilter === 'paper' ? () => handleFillOrderFromPosition(item) : undefined}
-                    title={roleFilter === 'paper' ? '点击带入交易控制台' : undefined}
+                    className={`cursor-pointer border-t border-slate-100 hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-slate-950/50 ${selectedPositionSymbol === item.symbol ? 'bg-slate-50 dark:bg-slate-950/50' : ''}`}
+                    onClick={() => handleFillOrderFromPosition(item)}
+                    title="点击带入交易控制台"
                   >
                     <td className="px-4 py-3">
                       <div className="font-medium text-slate-900 dark:text-white">{displaySecurityName(item.name, item.symbol)}</div>
@@ -1147,9 +1341,9 @@ export function WarehousePage({
                 {orders.map((item: VirtualWarehouseOrder) => (
                   <div
                     key={`${item.order_id}-${item.symbol}`}
-                    className={`rounded-2xl border border-slate-100 p-4 dark:border-slate-800 ${roleFilter === 'paper' ? 'cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-950/50' : ''} ${selectedOrderId === item.order_id ? 'bg-slate-50 dark:bg-slate-950/50' : ''}`}
-                    onClick={roleFilter === 'paper' ? () => handleFillOrderFromRecentOrder(item) : undefined}
-                    title={roleFilter === 'paper' ? '点击带入交易控制台' : undefined}
+                    className={`cursor-pointer rounded-2xl border border-slate-100 p-4 hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-slate-950/50 ${selectedOrderId === item.order_id ? 'bg-slate-50 dark:bg-slate-950/50' : ''}`}
+                    onClick={() => handleFillOrderFromRecentOrder(item)}
+                    title="点击带入交易控制台"
                   >
                     <div className="flex items-center justify-between gap-3">
                       <div>
@@ -1157,7 +1351,7 @@ export function WarehousePage({
                         <div className="text-xs text-slate-500 dark:text-slate-400">{item.symbol} · 委托号 {item.order_id || '--'}</div>
                       </div>
                       <div className="flex items-center gap-2">
-                        {roleFilter === 'paper' && item.can_cancel ? (
+                        {item.can_cancel ? (
                           <button
                             type="button"
                             onClick={event => {
@@ -1205,9 +1399,9 @@ export function WarehousePage({
                 {trades.map((item: VirtualWarehouseTrade) => (
                   <div
                     key={`${item.trade_id}-${item.symbol}`}
-                    className={`rounded-2xl border border-slate-100 p-4 dark:border-slate-800 ${roleFilter === 'paper' ? 'cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-950/50' : ''} ${selectedTradeId === item.trade_id ? 'bg-slate-50 dark:bg-slate-950/50' : ''}`}
-                    onClick={roleFilter === 'paper' ? () => handleFillOrderFromTrade(item) : undefined}
-                    title={roleFilter === 'paper' ? '点击切换到该股票' : undefined}
+                    className={`cursor-pointer rounded-2xl border border-slate-100 p-4 hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-slate-950/50 ${selectedTradeId === item.trade_id ? 'bg-slate-50 dark:bg-slate-950/50' : ''}`}
+                    onClick={() => handleFillOrderFromTrade(item)}
+                    title="点击切换到该股票"
                   >
                     <div className="flex items-center justify-between gap-3">
                       <div>

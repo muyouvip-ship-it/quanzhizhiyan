@@ -68,11 +68,14 @@ async def stop_background_worker() -> None:
 
 
 async def _run_loop() -> None:
-    """Main loop: run the gap fill once on startup, then poll periodically."""
+    """Main loop: poll periodically and run only when the watermark allows it."""
     logger.info("[minute-gap-filler] loop starting")
-    # 启动后先尝试跑一次（仅当在合适时间段内）
+    # 启动时也必须走窗口和水位判断，避免后端重启就反复拉起多进程补齐任务。
     try:
-        await asyncio.to_thread(_fill_minute_gaps_once)
+        if _can_run_now():
+            await asyncio.to_thread(_fill_minute_gaps_once)
+        else:
+            logger.info("[minute-gap-filler] initial run skipped by schedule/watermark")
     except Exception:
         logger.exception("[minute-gap-filler] initial run failed")
 

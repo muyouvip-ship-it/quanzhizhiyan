@@ -9,6 +9,31 @@ from typing import Dict, Any
 logger = logging.getLogger(__name__)
 
 
+def _normalize_index_symbol(symbol: str) -> str:
+    text = str(symbol or "").strip().upper()
+    index_symbol_by_code = {
+        "000001": "000001.SH",
+        "399001": "399001.SZ",
+        "399006": "399006.SZ",
+        "000300": "000300.SH",
+        "000905": "000905.SH",
+        "000852": "000852.SH",
+        "000688": "000688.SH",
+        "899050": "899050.BJ",
+    }
+    if text in index_symbol_by_code.values():
+        return text
+    if text.startswith(("SH", "SZ", "BJ")) and len(text) >= 8:
+        code = text[2:]
+        candidate = index_symbol_by_code.get(code)
+        if candidate and candidate.endswith(f".{text[:2]}"):
+            return candidate
+        return f"{code}.{text[:2]}"
+    if "." in text:
+        return text
+    return index_symbol_by_code.get(text, text)
+
+
 def import_generic_data(db_session, csv_file_path: str, data_type: str) -> dict:
     """
     通用数据导入函数
@@ -137,11 +162,13 @@ def _import_index_daily(db_session, df: pd.DataFrame) -> dict:
                 elif symbol.startswith('sz'):
                     symbol = symbol[2:]
                 
+                symbol = _normalize_index_symbol(symbol)
+
                 # 插入数据库
                 insert_query = text("""
-                    INSERT INTO index_daily_data 
-                    (symbol, trade_date, open, high, low, close, volume, amount)
-                    VALUES (:symbol, :trade_date, :open, :high, :low, :close, :volume, :amount)
+                    INSERT INTO index_daily_kline
+                    (symbol, trade_date, open, high, low, close, volume, amount, source)
+                    VALUES (:symbol, :trade_date, :open, :high, :low, :close, :volume, :amount, :source)
                     ON CONFLICT (symbol, trade_date) DO UPDATE SET
                         open = EXCLUDED.open,
                         high = EXCLUDED.high,
@@ -149,6 +176,7 @@ def _import_index_daily(db_session, df: pd.DataFrame) -> dict:
                         close = EXCLUDED.close,
                         volume = EXCLUDED.volume,
                         amount = EXCLUDED.amount,
+                        source = EXCLUDED.source,
                         updated_at = NOW()
                 """)
                 
@@ -160,7 +188,8 @@ def _import_index_daily(db_session, df: pd.DataFrame) -> dict:
                     "low": float(row.get('最低价', row.get('最低'))) if pd.notna(row.get('最低价', row.get('最低'))) else None,
                     "close": float(row.get('收盘价', row.get('收盘'))) if pd.notna(row.get('收盘价', row.get('收盘'))) else None,
                     "volume": int(row.get('成交量', 0)) if pd.notna(row.get('成交量')) else None,
-                    "amount": float(row.get('成交额', 0)) if pd.notna(row.get('成交额')) else None
+                    "amount": float(row.get('成交额', 0)) if pd.notna(row.get('成交额')) else None,
+                    "source": "quantclass",
                 })
                 
                 records_imported += 1

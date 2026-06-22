@@ -381,7 +381,7 @@ def _load_kline_rows(db: Session, code: str, start_date: str, end_date: str, *, 
         else:
             symbol_candidates.append(f"{code}.SZ")
     if prefer_index:
-        symbol_candidates = [code, f"sh{code}", f"sz{code}", f"{code}.SH", f"{code}.SZ"]
+        symbol_candidates = [code, f"sh{code}", f"sz{code}", f"bj{code}", f"{code}.SH", f"{code}.SZ", f"{code}.BJ"]
     placeholders = ", ".join(f":symbol_{index}" for index, _ in enumerate(symbol_candidates))
     params = {
         "start_date": start_date,
@@ -773,7 +773,7 @@ def _intraday_symbol_candidates(symbol: str, *, is_index: bool) -> list[str]:
     code = normalized.split(".", 1)[0]
     candidates = {normalized, code}
     if is_index and code:
-        candidates.update({f"sh{code}", f"sz{code}", f"{code}.SH", f"{code}.SZ"})
+        candidates.update({f"sh{code}", f"sz{code}", f"bj{code}", f"{code}.SH", f"{code}.SZ", f"{code}.BJ"})
     return sorted(item for item in candidates if item)
 
 
@@ -878,7 +878,7 @@ def _load_latest_stock_changes(db: Session, symbols: list[str]) -> dict[str, dic
 
 
 def _load_latest_index_item(db: Session, code: str, trade_date: str | None = None) -> dict[str, Any]:
-    symbol_candidates = [code, f"sh{code}", f"sz{code}", f"{code}.SH", f"{code}.SZ"]
+    symbol_candidates = [code, f"sh{code}", f"sz{code}", f"bj{code}", f"{code}.SH", f"{code}.SZ", f"{code}.BJ"]
     placeholders = ", ".join(f":symbol_{index}" for index, _ in enumerate(symbol_candidates))
     params = {f"symbol_{index}": value for index, value in enumerate(symbol_candidates)}
     date_clause = "AND trade_date <= :trade_date" if trade_date else ""

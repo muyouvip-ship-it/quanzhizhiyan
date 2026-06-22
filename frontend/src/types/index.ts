@@ -446,6 +446,49 @@ export interface NewsDataSourceLink {
     key: string
     name: string
     url: string
+    tier?: string
+    role?: string
+}
+
+export interface SystemDataUpdateMetric {
+    label: string
+    value: string
+    detail?: string | null
+    tone?: ApiDataSourceTone | string
+}
+
+export interface SystemDataUpdateSource {
+    key?: string
+    label?: string
+    url?: string
+    row_count?: number
+    last_updated_at?: string | null
+}
+
+export interface SystemDataUpdateCard {
+    id: string
+    title: string
+    category: string
+    source_label: string
+    status_label: string
+    status_tone: ApiDataSourceTone | string
+    schedule: string
+    mechanism: string
+    tables: string[]
+    last_run_at?: string | null
+    last_success_at?: string | null
+    last_updated_at?: string | null
+    watermark?: string | null
+    metrics: SystemDataUpdateMetric[]
+    sources: SystemDataUpdateSource[]
+    notes: string[]
+}
+
+export interface SystemWorkerStatus {
+    key: string
+    label: string
+    enabled: boolean
+    value?: string | null
 }
 
 export interface ApiDataSourceGovernancePayload {
@@ -462,6 +505,8 @@ export interface SystemDataSourceRegistryResponse {
     updated_at: string
     sources: ApiDataSourceDescriptor[]
     news_sources?: NewsDataSourceLink[]
+    update_cards?: SystemDataUpdateCard[]
+    workers?: SystemWorkerStatus[]
     surfaces: Array<{
         id: string
         name: string
@@ -1545,6 +1590,74 @@ export interface StrategyListResponseV2 {
     strategies: StrategyDefinition[]
 }
 
+export type SelectionCenterMode = 'strategy' | 'catalyst' | 'hybrid'
+export type SelectionCenterStatus = 'running' | 'completed' | 'failed'
+
+export interface SelectionCenterFilterConfig {
+    exclude_st: boolean
+    exclude_suspended: boolean
+    trend_up: boolean
+    trend_ma?: number
+    volume_up: boolean
+    amount_enabled: boolean
+    min_amount?: string | number | null
+    market_cap_enabled: boolean
+    min_market_cap?: string | number | null
+    max_market_cap?: string | number | null
+    event_heat_enabled: boolean
+    min_event_heat?: string | number | null
+}
+
+export interface SelectionCenterTaskCreateRequest {
+    name: string
+    mode: SelectionCenterMode
+    include_boards: string[]
+    strategy_id?: string | null
+    strategy_name?: string | null
+    signal_id?: string | null
+    signal_name?: string | null
+    signal_side?: string | null
+    period?: string
+    catalyst_rule?: string | null
+    filter_config: SelectionCenterFilterConfig
+}
+
+export interface SelectionCenterCandidate {
+    symbol: string
+    name: string
+    score: number
+    source: string
+    rule: string
+    reason: string
+    tags: string[]
+    metrics?: Record<string, unknown>
+}
+
+export interface SelectionCenterTask {
+    id: string
+    user_id?: string
+    name: string
+    mode: SelectionCenterMode
+    status: SelectionCenterStatus
+    progress: number
+    universe: string
+    rule: string
+    filters: string[]
+    config: Record<string, unknown>
+    candidate_count?: number
+    candidates: SelectionCenterCandidate[]
+    error_message?: string | null
+    created_at?: string | null
+    started_at?: string | null
+    completed_at?: string | null
+    updated_at?: string | null
+}
+
+export interface SelectionCenterTaskListResponse {
+    total: number
+    items: SelectionCenterTask[]
+}
+
 export type StrategyTier = 'aggressive' | 'stable' | 'defensive'
 
 export interface OfficialStrategyPackItem {
@@ -1848,6 +1961,8 @@ export interface BacktestDataConfigItem {
     schedule_time?: string | null
     timezone?: string | null
     only_trading_day: boolean
+    daily_kline_policy?: Record<string, unknown> | null
+    minute_kline_policy?: Record<string, unknown> | null
     last_run_at?: string | null
     last_success_at?: string | null
     last_updated_at?: string | null
@@ -2045,6 +2160,82 @@ export interface VirtualWarehouseAccount {
     market_value: number
     available_cash: number
     position_count: number
+}
+
+export type QmtReturnPeriodKey = 'day' | 'month' | 'year'
+
+export type QmtReturnCoverage = 'full' | 'partial' | 'fallback' | 'empty'
+
+export interface QmtReturnPeriod {
+    key: QmtReturnPeriodKey
+    label: string
+    amount?: number | null
+    rate?: number | null
+    baseline_asset?: number | null
+    current_asset?: number | null
+    start_date?: string | null
+    end_date?: string | null
+    coverage: QmtReturnCoverage
+    coverage_label?: string | null
+}
+
+export interface QmtReturnCalendarDay {
+    date: string
+    day: number
+    weekday: number
+    amount?: number | null
+    rate?: number | null
+    baseline_asset?: number | null
+    current_asset?: number | null
+    coverage: QmtReturnCoverage
+    coverage_label?: string | null
+    has_snapshot: boolean
+    fetched_at?: string | null
+    intensity: number
+    tone: 'gain' | 'loss' | 'flat' | 'empty'
+}
+
+export interface QmtReturnCalendar {
+    year: number
+    month: number
+    month_label: string
+    start_date: string
+    end_date: string
+    max_abs_amount: number
+    days: QmtReturnCalendarDay[]
+}
+
+export interface QmtTradedSecuritySummary {
+    symbol: string
+    name: string
+    trade_count: number
+    buy_quantity: number
+    sell_quantity: number
+    buy_amount: number
+    sell_amount: number
+    net_quantity: number
+    net_cashflow: number
+    realized_cost_basis: number
+    realized_pnl: number
+    realized_pnl_pct?: number | null
+    pnl_status?: string | null
+    latest_side?: string | null
+    latest_price?: number | null
+    latest_trade_time?: string | null
+    first_trade_time?: string | null
+}
+
+export interface QmtReturnStatsResponse {
+    account_key: string
+    role?: string | null
+    account_id?: string | null
+    currency: 'CNY'
+    display_mode_default: 'amount' | 'rate'
+    periods: Record<QmtReturnPeriodKey, QmtReturnPeriod>
+    calendar?: QmtReturnCalendar | null
+    traded_securities?: QmtTradedSecuritySummary[]
+    updated_at?: string | null
+    snapshot_date?: string | null
 }
 
 export interface VirtualWarehousePosition {
@@ -2294,6 +2485,19 @@ export interface RealtimeMonitorCreateRequest {
     risk_config?: Record<string, unknown>
 }
 
+export interface RealtimeMonitorUpdateRequest {
+    name?: string
+    account_key?: string
+    strategy_id?: string
+    strategy_version_id?: string | null
+    execution_mode?: RealtimeExecutionMode
+    live_trading_enabled?: boolean
+    live_confirmed?: boolean
+    monitor_pool?: Record<string, unknown>
+    config?: Record<string, unknown>
+    risk_config?: Record<string, unknown>
+}
+
 export interface RealtimeMonitor {
     id: string
     user_id: string
@@ -2338,6 +2542,11 @@ export interface RealtimeMonitor {
     fused_reason?: string | null
     manual_symbols?: string[]
     resolved_symbols?: string[]
+    display_symbol_items?: Array<{
+        symbol: string
+        name?: string | null
+        recognized?: boolean
+    }>
     manual_symbol_count?: number
     resolved_symbol_count?: number
     display_symbols?: string[]
@@ -2368,23 +2577,6 @@ export interface RealtimeEvent {
     created_at?: string | null
 }
 
-export interface RealtimeApprovalTask {
-    id: string
-    monitor_id: string
-    user_id: string
-    account_key: string
-    strategy_id?: string | null
-    symbol?: string | null
-    side?: string | null
-    status: 'pending' | 'approved' | 'rejected' | 'executed'
-    reason?: string | null
-    order_intent: Record<string, unknown>
-    decision: Record<string, unknown>
-    created_at?: string | null
-    updated_at?: string | null
-    decided_at?: string | null
-}
-
 export interface RealtimeMonitorPositionsResponse {
     monitor_id: string
     account_key: string
@@ -2392,5 +2584,73 @@ export interface RealtimeMonitorPositionsResponse {
     account?: VirtualWarehouseAccount | null
     connection?: VirtualWarehouseConnection | null
     fetched_at?: string | null
+    data_source?: string | null
+    is_stale?: boolean | null
     data_governance?: ApiDataSourceGovernancePayload | null
+}
+
+export interface RealtimePerformanceMetric {
+    total_asset: number
+    pnl: number
+    return_pct: number
+    available_cash?: number
+    market_value?: number
+    cash?: number
+}
+
+export interface RealtimePerformanceTrade {
+    event_id?: string | null
+    trade_id?: string | null
+    trade_time?: string | null
+    side?: string | null
+    quantity: number
+    price: number
+    amount: number
+    reference_cost?: number | null
+    current_price?: number | null
+    realized_pnl: number
+    excess_pnl: number
+}
+
+export interface RealtimePerformanceSymbolRow {
+    symbol: string
+    name: string
+    baseline_quantity: number
+    strategy_quantity: number
+    baseline_price: number
+    current_price: number
+    baseline_market_value: number
+    hold_market_value: number
+    strategy_market_value: number
+    strategy_pnl: number
+    hold_pnl: number
+    excess_pnl: number
+    trade_buy_amount: number
+    trade_sell_amount: number
+    realized_pnl: number
+    trades: RealtimePerformanceTrade[]
+    strategy_position_pnl: number
+    position_delta: number
+}
+
+export interface RealtimeMonitorPerformanceResponse {
+    monitor_id: string
+    account_key: string
+    currency: 'CNY' | string
+    baseline_captured_at?: string | null
+    trade_date?: string | null
+    performance_mode?: string | null
+    calculated_at?: string | null
+    fetched_at?: string | null
+    data_source?: string | null
+    is_stale?: boolean
+    start_total_asset: number
+    start_cash: number
+    strategy: RealtimePerformanceMetric
+    hold_baseline: RealtimePerformanceMetric
+    excess: {
+        pnl: number
+        return_pct: number
+    }
+    symbols: RealtimePerformanceSymbolRow[]
 }

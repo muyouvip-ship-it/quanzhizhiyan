@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -32,8 +32,17 @@ class RealtimeMonitorCreateRequest(BaseModel):
     risk_config: dict[str, Any] = Field(default_factory=dict)
 
 
-class RealtimeApprovalDecisionRequest(BaseModel):
-    decision: dict[str, Any] = Field(default_factory=dict)
+class RealtimeMonitorUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=200)
+    account_key: str | None = Field(default=None, min_length=1)
+    strategy_id: str | None = Field(default=None, min_length=1)
+    strategy_version_id: str | None = None
+    execution_mode: Literal["auto", "monitor_only"] | None = None
+    live_trading_enabled: bool | None = None
+    live_confirmed: bool | None = None
+    monitor_pool: dict[str, Any] | None = None
+    config: dict[str, Any] | None = None
+    risk_config: dict[str, Any] | None = None
 
 
 def _as_http_error(exc: Exception) -> HTTPException:
@@ -76,6 +85,26 @@ def get_realtime_monitor(
 ):
     try:
         return realtime_monitor_service.get_monitor(strategy_db, current_user.id, monitor_id)
+    except Exception as exc:
+        raise _as_http_error(exc) from exc
+
+
+@router.put("/v1/realtime/monitors/{monitor_id}")
+def update_realtime_monitor(
+    monitor_id: str,
+    body: RealtimeMonitorUpdateRequest,
+    current_user=Depends(require_api_user),
+    strategy_db: Session = Depends(get_strategy_db),
+    db: Session = Depends(get_db),
+):
+    try:
+        return realtime_monitor_service.update_monitor(
+            strategy_db,
+            db,
+            current_user.id,
+            monitor_id,
+            body.model_dump(exclude_unset=True),
+        )
     except Exception as exc:
         raise _as_http_error(exc) from exc
 
@@ -171,6 +200,7 @@ def get_realtime_monitor_events(
     limit: int = Query(default=200, ge=1, le=50000),
     after_id: str | None = Query(default=None),
     since_started: bool = Query(default=False),
+    activity_only: bool = Query(default=False),
     current_user=Depends(require_api_user),
     strategy_db: Session = Depends(get_strategy_db),
 ):
@@ -183,6 +213,7 @@ def get_realtime_monitor_events(
                 limit=limit,
                 after_id=after_id,
                 since_started=since_started,
+                activity_only=activity_only,
             )
         }
     except Exception as exc:
@@ -324,55 +355,15 @@ def get_realtime_monitor_positions(
         raise _as_http_error(exc) from exc
 
 
-@router.get("/v1/realtime/approvals")
-def list_realtime_approvals(
-    status: str | None = Query(default=None),
-    monitor_id: str | None = Query(default=None),
-    current_user=Depends(require_api_user),
-    strategy_db: Session = Depends(get_strategy_db),
-):
-    try:
-        items = realtime_monitor_service.list_approvals(strategy_db, current_user.id, status=status)
-        if monitor_id:
-            items = [item for item in items if item.get("monitor_id") == monitor_id]
-        return {"items": items}
-    except Exception as exc:
-        raise _as_http_error(exc) from exc
-
-
-@router.post("/v1/realtime/approvals/{approval_id}/approve")
-def approve_realtime_approval(
-    approval_id: str,
-    body: RealtimeApprovalDecisionRequest | None = Body(default=None),
+@router.get("/v1/realtime/monitors/{monitor_id}/performance")
+def get_realtime_monitor_performance(
+    monitor_id: str,
     current_user=Depends(require_api_user),
     strategy_db: Session = Depends(get_strategy_db),
     db: Session = Depends(get_db),
 ):
     try:
-        return realtime_monitor_service.approve_task(
-            strategy_db,
-            db,
-            current_user.id,
-            approval_id,
-            decision=(body.decision if body else {}),
-        )
+        return realtime_monitor_service.get_performance(strategy_db, db, current_user.id, monitor_id)
     except Exception as exc:
         raise _as_http_error(exc) from exc
 
-
-@router.post("/v1/realtime/approvals/{approval_id}/reject")
-def reject_realtime_approval(
-    approval_id: str,
-    body: RealtimeApprovalDecisionRequest | None = Body(default=None),
-    current_user=Depends(require_api_user),
-    strategy_db: Session = Depends(get_strategy_db),
-):
-    try:
-        return realtime_monitor_service.reject_task(
-            strategy_db,
-            current_user.id,
-            approval_id,
-            decision=(body.decision if body else {}),
-        )
-    except Exception as exc:
-        raise _as_http_error(exc) from exc

@@ -98,6 +98,37 @@ def test_theme_card_uses_dominant_tier_and_keeps_top_policy_tier(db, monkeypatch
     assert "含S级政策催化" in ai["summary"]
 
 
+def test_official_notice_tier_beats_fast_news_reposts(db, monkeypatch):
+    items = [
+        {
+            "content": "公告｜中科曙光(603019.SH)｜日常经营｜关于签订算力中心建设合同的公告",
+            "published_at": "2026-05-10T09:00:00",
+            "source": "巨潮资讯公告",
+            "url": "https://static.cninfo.com.cn/finalpage/notice.pdf",
+            "seed_symbols": ["603019.SH"],
+        }
+    ]
+    items.extend(
+        {
+            "content": f"市场快讯称人工智能方向走强，第{i}条",
+            "published_at": f"2026-05-10T09:{i + 1:02d}:00",
+            "source": "新浪7x24",
+            "url": f"https://example.com/flash-{i}",
+        }
+        for i in range(6)
+    )
+    _seed_news(db, monkeypatch, items)
+
+    ranking = _ranking(db)
+
+    compute = next(item for item in ranking if item["theme"] == "算力")
+    ai = next(item for item in ranking if item["theme"] == "人工智能")
+    assert compute["source_tier"] == "S"
+    assert compute["policy_boost"] is True
+    assert compute["score"] > ai["score"]
+    assert compute["evidence_items"][0]["source"] == "巨潮资讯公告"
+
+
 def test_theme_aliases_are_normalized_to_standard_catalog(db, monkeypatch):
     _seed_news(
         db,

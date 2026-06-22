@@ -33,7 +33,7 @@
 3. 默认监听端口：`8710`。
 4. 对应账户：`39027628`。
 5. 对应页面：虚拟仓。
-6. 默认 `QMT_BRIDGE_ROLE=paper`、`QMT_BRIDGE_ALLOW_TRADING=1`，允许模拟仓交易联调。
+6. 默认 `QMT_BRIDGE_ROLE=paper`、`QMT_BRIDGE_ACCOUNT_KEY=paper_sim`、`QMT_BRIDGE_ALLOW_TRADING=1`，允许模拟仓交易联调。
 
 ### 实盘
 
@@ -42,12 +42,12 @@
 3. 默认监听端口：`8711`。
 4. 对应账户：`8886186680`。
 5. 对应页面：实盘仓。
-6. 默认 `QMT_BRIDGE_ROLE=live`、`QMT_BRIDGE_ALLOW_TRADING=0`，只读锁定，拒绝下单和撤单。
+6. 默认 `QMT_BRIDGE_ROLE=live`、`QMT_BRIDGE_ACCOUNT_KEY=live_real`、`QMT_BRIDGE_ALLOW_TRADING=1`，允许实盘仓下单和撤单。
 
 ## 三仓隔离关系
 
 - 虚拟仓：只读取模拟盘 QMT，不写入跟踪看板。
-- 实盘仓：只读取实盘 QMT，不写入跟踪看板，且交易接口锁定为只读。
+- 实盘仓：读取实盘 QMT，不写入跟踪看板，交易指令直接发送到实盘 QMT。
 - 跟踪看板：保持原有独立逻辑，不读取模拟盘/实盘 QMT 仓位。
 - 回测分钟线下载：固定使用模拟仓 `paper_sim/8710`，不调用实盘 `live_real/8711`。
 

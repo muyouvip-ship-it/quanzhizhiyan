@@ -40,6 +40,7 @@ def get_qmt_virtual_warehouse(
     account_key: str | None = Query(default=None),
     preferred_role: str | None = Query(default=None),
     prefer_cache: bool = Query(default=False),
+    allow_cache_fallback: bool = Query(default=True),
     current_user=Depends(require_api_user),
     db: Session = Depends(get_db),
 ):
@@ -49,6 +50,22 @@ def get_qmt_virtual_warehouse(
         account_key=account_key,
         preferred_role=preferred_role,
         prefer_cache=prefer_cache,
+        allow_cache_fallback=allow_cache_fallback,
+    )
+
+
+@router.get("/qmt/return-stats")
+def get_qmt_return_stats(
+    account_key: str | None = Query(default=None),
+    preferred_role: str | None = Query(default=None),
+    current_user=Depends(require_api_user),
+    db: Session = Depends(get_db),
+):
+    return qmt_virtual_account_service.get_qmt_return_stats(
+        db,
+        current_user.id,
+        account_key=account_key,
+        preferred_role=preferred_role,
     )
 
 

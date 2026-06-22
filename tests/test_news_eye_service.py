@@ -61,6 +61,59 @@ def test_refresh_news_cache_persists_items_and_sync_state(db, monkeypatch):
     assert result["event_driven_selection"]["skipped"] is True
 
 
+def test_prune_old_news_items_deletes_week_old_news_and_indexes(db):
+    news_eye_service.ensure_news_tables(db)
+    rows = [
+        {
+            "digest": "old-news",
+            "dedupe_key": "old-news",
+            "content": "一周前旧资讯",
+            "published_at": datetime(2026, 5, 2, 8, 0, 0),
+            "source": "测试源",
+            "fetched_at": datetime(2026, 5, 2, 8, 1, 0),
+        },
+        {
+            "digest": "fresh-news",
+            "dedupe_key": "fresh-news",
+            "content": "近一周资讯",
+            "published_at": datetime(2026, 5, 4, 8, 0, 0),
+            "source": "测试源",
+            "fetched_at": datetime(2026, 5, 4, 8, 1, 0),
+        },
+    ]
+    db.execute(
+        text(
+            """
+            INSERT INTO market_news_items (digest, dedupe_key, content, published_at, source, fetched_at)
+            VALUES (:digest, :dedupe_key, :content, :published_at, :source, :fetched_at)
+            """
+        ),
+        rows,
+    )
+    db.execute(
+        text(
+            """
+            INSERT INTO market_news_item_symbols (digest, symbol, name, tag_group)
+            VALUES
+                ('old-news', '300750.SZ', '宁德时代', 'related'),
+                ('fresh-news', '000001.SZ', '平安银行', 'related')
+            """
+        )
+    )
+
+    result = news_eye_service.prune_old_news_items(
+        db,
+        reference_time=datetime(2026, 5, 10, 9, 0, 0),
+        retention_days=7,
+    )
+
+    assert result["deleted"] == 1
+    remaining_items = db.execute(text("SELECT digest FROM market_news_items ORDER BY digest")).scalars().all()
+    remaining_symbols = db.execute(text("SELECT digest FROM market_news_item_symbols ORDER BY digest")).scalars().all()
+    assert remaining_items == ["fresh-news"]
+    assert remaining_symbols == ["fresh-news"]
+
+
 def test_refresh_news_cache_triggers_event_driven_selection(db, monkeypatch):
     monkeypatch.setattr(
         news_eye_service,
@@ -453,6 +506,19 @@ def test_fetch_external_news_collects_general_and_symbol_sources(monkeypatch):
     monkeypatch.setattr(ak, "stock_info_global_sina", lambda: pd.DataFrame())
     monkeypatch.setattr(ak, "stock_info_global_futu", lambda: pd.DataFrame())
     monkeypatch.setattr(ak, "stock_info_cjzc_em", lambda: pd.DataFrame())
+    monkeypatch.setattr(news_eye_service, "NOTICE_SOURCE_SPECS", ())
+    monkeypatch.setattr(
+        news_eye_service,
+        "SYMBOL_SOURCE_SPECS",
+        (
+            news_eye_service.NewsSourceSpec(
+                "东方财富个股新闻",
+                "stock_news_em",
+                symbol_param="symbol",
+                symbol_transform=lambda symbol: str(symbol).split(".", 1)[0],
+            ),
+        ),
+    )
     monkeypatch.setattr(
         ak,
         "stock_news_em",
@@ -468,6 +534,197 @@ def test_fetch_external_news_collects_general_and_symbol_sources(monkeypatch):
     assert "东方财富全球快讯" in active_sources
     assert any(source.startswith("东方财富个股新闻:300750.SZ") for source in active_sources)
     assert not any("拉取失败" in warning for warning in warnings)
+
+
+def test_fetch_external_news_collects_notice_sources(monkeypatch):
+    import pandas as pd
+    import akshare as ak
+
+    monkeypatch.setattr(ak, "stock_info_global_cls", lambda symbol="全部": pd.DataFrame())
+    monkeypatch.setattr(ak, "stock_info_global_em", lambda: pd.DataFrame())
+    monkeypatch.setattr(ak, "stock_info_cjzc_em", lambda: pd.DataFrame())
+    monkeypatch.setattr(ak, "stock_info_global_sina", lambda: pd.DataFrame())
+    monkeypatch.setattr(ak, "stock_info_global_futu", lambda: pd.DataFrame())
+    monkeypatch.setattr(ak, "stock_info_global_ths", lambda: pd.DataFrame())
+    monkeypatch.setattr(ak, "stock_news_em", lambda symbol="300750": pd.DataFrame())
+    monkeypatch.setattr(
+        ak,
+        "stock_notice_report",
+        lambda symbol="重大事项", date="20260430": pd.DataFrame(
+            [
+                {
+                    "代码": "300750",
+                    "名称": "宁德时代",
+                    "公告标题": "宁德时代:关于签订储能合作协议的公告",
+                    "公告类型": "重大事项",
+                    "公告日期": "2026-04-30",
+                    "网址": "https://example.com/notice",
+                }
+            ]
+        ),
+    )
+
+    items, active_sources, warnings = news_eye_service._fetch_external_news(20, symbols=[])
+
+    assert "东方财富公告:重大事项" in active_sources
+    assert any("宁德时代:关于签订储能合作协议的公告" in item["content"] for item in items)
+    assert any(item.get("seed_symbols") == ["300750.SZ"] for item in items)
+    assert not any("东方财富公告" in warning and "拉取失败" in warning for warning in warnings)
+
+
+def test_fetch_external_news_collects_official_notice_sources(monkeypatch):
+    import pandas as pd
+    import akshare as ak
+
+    monkeypatch.setattr(news_eye_service, "GENERAL_SOURCE_SPECS", ())
+    monkeypatch.setattr(news_eye_service, "NOTICE_SOURCE_SPECS", ())
+    monkeypatch.setattr(news_eye_service, "SYMBOL_SOURCE_SPECS", ())
+    def fake_cninfo(symbol="", market="沪深京", keyword="", category="", start_date="20260429", end_date="20260430"):
+        rows_by_symbol = {
+            "300750": [
+                {
+                    "证券代码": "300750",
+                    "证券简称": "宁德时代",
+                    "公告标题": "关于签订储能合作协议的公告",
+                    "公告类型": "日常经营",
+                    "公告时间": "2026-04-30",
+                    "公告链接": "finalpage/2026-04-30/notice-cninfo.PDF",
+                }
+            ],
+            "600519": [
+                {
+                    "证券代码": "600519",
+                    "证券简称": "贵州茅台",
+                    "公告标题": "2026年第一季度报告",
+                    "公告日期": "2026-04-30",
+                    "链接": "https://www.sse.com.cn/disclosure/listedinfo/announcement/c/new.pdf",
+                }
+            ],
+            "000001": [
+                {
+                    "股票代码": "000001",
+                    "股票简称": "平安银行",
+                    "标题": "关于召开股东大会的公告",
+                    "发布日期": "2026-04-30",
+                    "URL": "https://www.szse.cn/disclosure/listed/bulletinDetail/index.html",
+                }
+            ],
+        }
+        return pd.DataFrame(rows_by_symbol.get(str(symbol), []))
+
+    monkeypatch.setattr(ak, "stock_zh_a_disclosure_report_cninfo", fake_cninfo)
+
+    items, active_sources, warnings = news_eye_service._fetch_external_news(20, symbols=["300750.SZ", "600519.SH", "000001.SZ"])
+
+    assert "巨潮资讯公告" in active_sources
+    assert "上交所公告" in active_sources
+    assert "深交所公告" in active_sources
+    assert any(item["source"] == "巨潮资讯公告" and item["seed_symbols"] == ["300750.SZ"] for item in items)
+    assert any("贵州茅台" in item["content"] for item in items)
+    assert any("平安银行" in item["content"] for item in items)
+    assert not any("官方公告" in warning and "拉取失败" in warning for warning in warnings)
+
+
+def test_load_user_focus_symbols_includes_positions_and_recent_selection_results(db):
+    now = datetime.now(timezone.utc)
+    db.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS selection_center_tasks (
+                id VARCHAR(36) PRIMARY KEY,
+                user_id VARCHAR(64) NOT NULL,
+                name VARCHAR(200) NOT NULL,
+                mode VARCHAR(20) NOT NULL,
+                status VARCHAR(20) NOT NULL,
+                universe VARCHAR(200),
+                config_json JSON,
+                candidates_json JSON,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )
+            """
+        )
+    )
+    db.execute(
+        text(
+            """
+            INSERT INTO imported_portfolio_positions (
+                id, user_id, source, symbol, security_name, current_position, trade_points_count,
+                last_imported_at, created_at, updated_at
+            )
+            VALUES (
+                'position-focus-1', 'focus-user', 'manual', '600519.SH', '贵州茅台', 100, 0,
+                :now, :now, :now
+            )
+            """
+        ),
+        {"now": now},
+    )
+    db.execute(
+        text(
+            """
+            INSERT INTO selection_center_tasks (
+                id, user_id, name, mode, status, universe, config_json, candidates_json, created_at, updated_at
+            )
+            VALUES (
+                'selection-focus-1', 'focus-user', '首日波段', 'strategy', 'completed', '主板', '{}',
+                '[{"symbol":"300750.SZ","name":"宁德时代"},{"code":"000001.SZ","name":"平安银行"}]',
+                :now, :now
+            )
+            """
+        ),
+        {"now": now},
+    )
+    db.commit()
+
+    symbols = news_eye_service.load_user_focus_symbols(db, "focus-user", limit=10)
+
+    assert "600519.SH" in symbols
+    assert "300750.SZ" in symbols
+    assert "000001.SZ" in symbols
+
+
+def test_normalize_a_share_symbol_treats_920_prefix_as_beijing_exchange():
+    assert news_eye_service._normalize_a_share_symbol("920161") == "920161.BJ"
+
+
+def test_fetch_external_news_collects_research_reports_for_focus_symbols(monkeypatch):
+    import pandas as pd
+    import akshare as ak
+
+    monkeypatch.setattr(ak, "stock_info_global_cls", lambda symbol="全部": pd.DataFrame())
+    monkeypatch.setattr(ak, "stock_info_global_em", lambda: pd.DataFrame())
+    monkeypatch.setattr(ak, "stock_info_cjzc_em", lambda: pd.DataFrame())
+    monkeypatch.setattr(ak, "stock_info_global_sina", lambda: pd.DataFrame())
+    monkeypatch.setattr(ak, "stock_info_global_futu", lambda: pd.DataFrame())
+    monkeypatch.setattr(ak, "stock_info_global_ths", lambda: pd.DataFrame())
+    monkeypatch.setattr(ak, "stock_news_em", lambda symbol="300750": pd.DataFrame())
+    monkeypatch.setattr(ak, "stock_notice_report", lambda symbol="重大事项", date="20260430": pd.DataFrame())
+    monkeypatch.setattr(
+        ak,
+        "stock_research_report_em",
+        lambda symbol="300750": pd.DataFrame(
+            [
+                {
+                    "股票代码": "300750",
+                    "股票简称": "宁德时代",
+                    "报告名称": "技术创新夯实龙头领先优势",
+                    "东财评级": "买入",
+                    "机构": "国信证券",
+                    "行业": "电池",
+                    "日期": "2026-04-30",
+                    "报告PDF链接": "https://example.com/research.pdf",
+                }
+            ]
+        ),
+    )
+
+    items, active_sources, warnings = news_eye_service._fetch_external_news(20, symbols=["300750.SZ"])
+
+    assert any(source.startswith("东方财富研报:300750.SZ") for source in active_sources)
+    assert any("国信证券" in item["content"] and "买入" in item["content"] for item in items)
+    assert any(item.get("url") == "https://example.com/research.pdf" for item in items)
+    assert not any("东方财富研报" in warning and "拉取失败" in warning for warning in warnings)
 
 
 def test_fetch_external_news_times_out_slow_source_without_blocking_other_sources(monkeypatch):
@@ -496,6 +753,7 @@ def test_fetch_external_news_times_out_slow_source_without_blocking_other_source
         ),
     )
     monkeypatch.setattr(news_eye_service, "SYMBOL_SOURCE_SPECS", ())
+    monkeypatch.setattr(news_eye_service, "NOTICE_SOURCE_SPECS", ())
     monkeypatch.setattr(news_eye_service, "_SOURCE_TIMEOUT_SECONDS", 0.05)
 
     started = time.monotonic()
@@ -543,6 +801,8 @@ def test_fetch_external_news_uses_extra_general_sources_and_dedupes(monkeypatch)
             [{"标题": "龙虎榜活跃", "内容": "龙虎榜显示机器人板块资金活跃", "发布时间": "2026-04-30 20:12:00"}]
         ),
     )
+    monkeypatch.setattr(news_eye_service, "NOTICE_SOURCE_SPECS", ())
+    monkeypatch.setattr(news_eye_service, "SYMBOL_SOURCE_SPECS", ())
 
     items, active_sources, warnings = news_eye_service._fetch_external_news(20, symbols=[])
 

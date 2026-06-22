@@ -29,3 +29,7 @@ def test_resolve_watchlist_identifier_recovers_wrong_suffix_when_code_is_unique(
 
 def test_search_cn_stock_by_name_recovers_wrong_suffix_when_code_is_unique():
     assert search_cn_stock_by_name("000001.SH") == "000001.SZ"
+
+
+def test_search_cn_stock_by_name_rejects_unknown_plain_text():
+    assert search_cn_stock_by_name("海力士") is None

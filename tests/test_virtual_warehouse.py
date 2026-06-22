@@ -1,11 +1,11 @@
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from fastapi.testclient import TestClient
 from types import SimpleNamespace
 from uuid import uuid4
 
-from api.database import ImportedPortfolioPositionDB, QmtAccountSnapshotDB, QmtSyncProfileDB, get_db_ctx
+from api.database import ImportedPortfolioPositionDB, QmtAccountEquitySnapshotDB, QmtAccountSnapshotDB, QmtAccountTradeHistoryDB, QmtSyncProfileDB, get_db_ctx
 from api.data_downloader import DataDownloader
 from api.services import auth_service
 from api.services import qmt_virtual_account_service
@@ -77,6 +77,120 @@ def test_qmt_bridge_error_calls_out_local_backend_address():
 
     assert "当前后端本机地址" in message
     assert "Windows bridge" in message
+
+
+def test_qmt_order_bridge_accepts_legacy_string_metadata(monkeypatch):
+    config = QmtRuntimeConfig(
+        key="paper_bridge",
+        enabled=True,
+        host="127.0.0.1",
+        port=58610,
+        account_id="39027628",
+        account_type="STOCK",
+        account_name="QMT 模拟账户",
+        userdata_path="",
+        role="paper",
+        bridge_base_url="http://127.0.0.1:8710",
+        bridge_token="bridge-token",
+        refresh_interval_seconds=10,
+    )
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "success": True,
+                "order_id": "O9001",
+                "role": "paper",
+                "account_key": "paper_bridge",
+                "bridge": "legacy-bridge",
+            }
+
+    def fake_post(url, json, headers, timeout):
+        captured.update({"url": url, "json": json, "headers": headers, "timeout": timeout})
+        return FakeResponse()
+
+    monkeypatch.setattr(qmt_virtual_account_service.requests, "post", fake_post)
+
+    result = qmt_virtual_account_service._submit_qmt_order_via_bridge(
+        config,
+        symbol="000001.SZ",
+        side="buy",
+        quantity=1000,
+        price=12.4,
+        price_type="limit",
+        strategy_name="test",
+        order_remark="legacy bridge metadata",
+    )
+
+    assert result["order_id"] == "O9001"
+    assert result["bridge"]["role"] == "paper"
+    assert result["bridge"]["account_key"] == "paper_bridge"
+    assert result["bridge"]["raw_bridge"] == "legacy-bridge"
+    assert captured["url"] == "http://127.0.0.1:8710/orders"
+    assert captured["headers"]["Authorization"] == "Bearer bridge-token"
+
+
+def test_qmt_overview_route_forwards_cache_fallback_flag(monkeypatch):
+    client = _get_client()
+    monkeypatch.setenv("TA_DEV_ACCESS_TOKEN", "dev-test-token-001")
+    headers = {"Authorization": "Bearer dev-test-token-001"}
+    captured: dict[str, object] = {}
+
+    def fake_overview(db, user_id, **kwargs):
+        captured.update(kwargs)
+        return {
+            "connection": {
+                "account_key": kwargs.get("account_key"),
+                "enabled": True,
+                "provider": "xtquant",
+                "host": "192.168.31.220",
+                "port": 58610,
+                "account_id": "8886186680",
+                "account_type": "STOCK",
+                "account_name": "QMT 实盘仓",
+                "connected": True,
+                "message": "已连接 QMT 实盘账户",
+                "effective_connected": True,
+                "health_status": "live",
+                "health_label": "实时直连",
+            },
+            "account": None,
+            "positions": [],
+            "orders": [],
+            "trades": [],
+            "summary": {
+                "total_asset": 0,
+                "total_pnl": 0,
+                "today_pnl": 0,
+                "market_value": 0,
+                "available_cash": 0,
+                "position_count": 0,
+            },
+            "refresh_interval_seconds": 10,
+            "fetched_at": "2026-06-22T12:00:00+00:00",
+            "active_account_key": kwargs.get("account_key"),
+            "accounts": [],
+            "data_source": "live",
+            "is_stale": False,
+        }
+
+    monkeypatch.setattr(
+        "api.routes.virtual_warehouse.qmt_virtual_account_service.get_qmt_virtual_account_overview",
+        fake_overview,
+    )
+
+    response = client.get(
+        "/v1/virtual-warehouse/qmt/overview?account_key=live_real&allow_cache_fallback=false",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert captured["account_key"] == "live_real"
+    assert captured["allow_cache_fallback"] is False
 
 
 def test_qmt_virtual_warehouse_overview(monkeypatch):
@@ -159,6 +273,439 @@ def test_qmt_virtual_warehouse_overview(monkeypatch):
         )
         assert row is not None
         assert row.positions_json
+
+
+def test_qmt_return_stats_calculates_full_periods(monkeypatch):
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._runtime_configs",
+        lambda: [
+            QmtRuntimeConfig(
+                key="paper_returns_full",
+                enabled=True,
+                host="192.168.10.1",
+                port=58610,
+                account_id="demo123",
+                account_type="STOCK",
+                account_name="QMT 模拟收益仓",
+                userdata_path="",
+                role="paper",
+                bridge_base_url="http://127.0.0.1:8710",
+                bridge_token="",
+                refresh_interval_seconds=10,
+            )
+        ],
+    )
+
+    user_id = "return-stats-full-user"
+    with get_db_ctx() as db:
+        qmt_virtual_account_service._ensure_qmt_equity_snapshot_schema(db)
+        db.query(QmtAccountEquitySnapshotDB).filter(
+            QmtAccountEquitySnapshotDB.user_id == user_id,
+            QmtAccountEquitySnapshotDB.account_key == "paper_returns_full",
+        ).delete(synchronize_session=False)
+        for snapshot_date, total_asset in [
+            (date(2025, 12, 31), 950000.0),
+            (date(2026, 3, 31), 1000000.0),
+            (date(2026, 4, 21), 1020000.0),
+            (date(2026, 4, 22), 1050000.0),
+        ]:
+            db.add(
+                QmtAccountEquitySnapshotDB(
+                    id=uuid4().hex,
+                    user_id=user_id,
+                    account_key="paper_returns_full",
+                    role="paper",
+                    account_id="demo123",
+                    snapshot_date=snapshot_date,
+                    total_asset=total_asset,
+                    market_value=500000.0,
+                    available_cash=total_asset - 500000.0,
+                    total_pnl=50000.0,
+                    today_pnl=12000.0,
+                    fetched_at=datetime(snapshot_date.year, snapshot_date.month, snapshot_date.day, 7, 0, tzinfo=timezone.utc),
+                )
+            )
+        db.commit()
+
+        payload = qmt_virtual_account_service.get_qmt_return_stats(db, user_id, account_key="paper_returns_full")
+
+    assert payload["account_key"] == "paper_returns_full"
+    assert payload["periods"]["day"]["amount"] == 30000.0
+    assert payload["periods"]["day"]["rate"] == 2.94
+    assert payload["periods"]["month"]["amount"] == 50000.0
+    assert payload["periods"]["month"]["rate"] == 5.0
+    assert payload["periods"]["year"]["amount"] == 100000.0
+    assert payload["periods"]["year"]["rate"] == 10.53
+    assert payload["periods"]["day"]["coverage"] == "full"
+
+
+def test_qmt_return_stats_falls_back_when_history_is_missing(monkeypatch):
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._runtime_configs",
+        lambda: [
+            QmtRuntimeConfig(
+                key="paper_returns_partial",
+                enabled=True,
+                host="192.168.10.1",
+                port=58610,
+                account_id="demo123",
+                account_type="STOCK",
+                account_name="QMT 模拟收益仓",
+                userdata_path="",
+                role="paper",
+                bridge_base_url="http://127.0.0.1:8710",
+                bridge_token="",
+                refresh_interval_seconds=10,
+            )
+        ],
+    )
+
+    user_id = "return-stats-partial-user"
+    with get_db_ctx() as db:
+        qmt_virtual_account_service._ensure_qmt_equity_snapshot_schema(db)
+        db.query(QmtAccountEquitySnapshotDB).filter(
+            QmtAccountEquitySnapshotDB.user_id == user_id,
+            QmtAccountEquitySnapshotDB.account_key == "paper_returns_partial",
+        ).delete(synchronize_session=False)
+        db.add(
+            QmtAccountEquitySnapshotDB(
+                id=uuid4().hex,
+                user_id=user_id,
+                account_key="paper_returns_partial",
+                role="paper",
+                account_id="demo123",
+                snapshot_date=date(2026, 4, 22),
+                total_asset=100000.0,
+                market_value=30000.0,
+                available_cash=70000.0,
+                total_pnl=5000.0,
+                today_pnl=1500.0,
+                fetched_at=datetime(2026, 4, 22, 7, 0, tzinfo=timezone.utc),
+            )
+        )
+        db.commit()
+
+        payload = qmt_virtual_account_service.get_qmt_return_stats(db, user_id, account_key="paper_returns_partial")
+
+    assert payload["periods"]["day"]["amount"] == 1500.0
+    assert payload["periods"]["day"]["coverage"] == "fallback"
+    assert payload["periods"]["month"]["amount"] == 0.0
+    assert payload["periods"]["month"]["coverage"] == "partial"
+    assert payload["periods"]["year"]["coverage"] == "partial"
+
+
+def test_qmt_return_stats_includes_calendar_heatmap(monkeypatch):
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._runtime_configs",
+        lambda: [
+            QmtRuntimeConfig(
+                key="paper_returns_calendar",
+                enabled=True,
+                host="192.168.10.1",
+                port=58610,
+                account_id="demo123",
+                account_type="STOCK",
+                account_name="QMT 模拟收益仓",
+                userdata_path="",
+                role="paper",
+                bridge_base_url="http://127.0.0.1:8710",
+                bridge_token="",
+                refresh_interval_seconds=10,
+            )
+        ],
+    )
+
+    user_id = "return-stats-calendar-user"
+    with get_db_ctx() as db:
+        qmt_virtual_account_service._ensure_qmt_equity_snapshot_schema(db)
+        db.query(QmtAccountEquitySnapshotDB).filter(
+            QmtAccountEquitySnapshotDB.user_id == user_id,
+            QmtAccountEquitySnapshotDB.account_key == "paper_returns_calendar",
+        ).delete(synchronize_session=False)
+        for snapshot_date, total_asset, today_pnl in [
+            (date(2026, 3, 31), 100000.0, 0.0),
+            (date(2026, 4, 1), 101000.0, 1000.0),
+            (date(2026, 4, 2), 100500.0, -500.0),
+        ]:
+            db.add(
+                QmtAccountEquitySnapshotDB(
+                    id=uuid4().hex,
+                    user_id=user_id,
+                    account_key="paper_returns_calendar",
+                    role="paper",
+                    account_id="demo123",
+                    snapshot_date=snapshot_date,
+                    total_asset=total_asset,
+                    market_value=0.0,
+                    available_cash=total_asset,
+                    total_pnl=0.0,
+                    today_pnl=today_pnl,
+                    fetched_at=datetime(snapshot_date.year, snapshot_date.month, snapshot_date.day, 7, 0, tzinfo=timezone.utc),
+                )
+            )
+        db.commit()
+
+        payload = qmt_virtual_account_service.get_qmt_return_stats(db, user_id, account_key="paper_returns_calendar")
+
+    calendar_payload = payload["calendar"]
+    by_date = {item["date"]: item for item in calendar_payload["days"]}
+    assert calendar_payload["month_label"] == "2026年04月"
+    assert len(calendar_payload["days"]) == 30
+    assert calendar_payload["max_abs_amount"] == 1000.0
+    assert by_date["2026-04-01"]["amount"] == 1000.0
+    assert by_date["2026-04-01"]["tone"] == "gain"
+    assert by_date["2026-04-02"]["amount"] == -500.0
+    assert by_date["2026-04-02"]["tone"] == "loss"
+    assert by_date["2026-04-03"]["has_snapshot"] is False
+
+
+def test_qmt_return_stats_summarizes_traded_securities(monkeypatch):
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._runtime_configs",
+        lambda: [
+            QmtRuntimeConfig(
+                key="paper_trade_history",
+                enabled=True,
+                host="192.168.10.1",
+                port=58610,
+                account_id="demo123",
+                account_type="STOCK",
+                account_name="QMT 模拟收益仓",
+                userdata_path="",
+                role="paper",
+                bridge_base_url="http://127.0.0.1:8710",
+                bridge_token="",
+                refresh_interval_seconds=10,
+            )
+        ],
+    )
+
+    user_id = "return-stats-trades-user"
+    with get_db_ctx() as db:
+        qmt_virtual_account_service._ensure_qmt_equity_snapshot_schema(db)
+        db.query(QmtAccountEquitySnapshotDB).filter(
+            QmtAccountEquitySnapshotDB.user_id == user_id,
+            QmtAccountEquitySnapshotDB.account_key == "paper_trade_history",
+        ).delete(synchronize_session=False)
+        db.query(QmtAccountTradeHistoryDB).filter(
+            QmtAccountTradeHistoryDB.user_id == user_id,
+            QmtAccountTradeHistoryDB.account_key == "paper_trade_history",
+        ).delete(synchronize_session=False)
+        db.add(
+            QmtAccountEquitySnapshotDB(
+                id=uuid4().hex,
+                user_id=user_id,
+                account_key="paper_trade_history",
+                role="paper",
+                account_id="demo123",
+                snapshot_date=date(2026, 4, 22),
+                total_asset=100000.0,
+                market_value=0.0,
+                available_cash=100000.0,
+                total_pnl=0.0,
+                today_pnl=0.0,
+                fetched_at=datetime(2026, 4, 22, 7, 0, tzinfo=timezone.utc),
+            )
+        )
+        for trade_id, side, quantity, amount, trade_time in [
+            ("T1", "buy", 1000.0, 12000.0, datetime(2026, 4, 20, 2, 0, tzinfo=timezone.utc)),
+            ("T2", "sell", 500.0, 6500.0, datetime(2026, 4, 22, 2, 0, tzinfo=timezone.utc)),
+        ]:
+            db.add(
+                QmtAccountTradeHistoryDB(
+                    id=uuid4().hex,
+                    user_id=user_id,
+                    account_key="paper_trade_history",
+                    role="paper",
+                    account_id="demo123",
+                    trade_uid=f"id:{trade_id}",
+                    trade_id=trade_id,
+                    symbol="000001.SZ",
+                    name="平安银行",
+                    side=side,
+                    price=12.0,
+                    quantity=quantity,
+                    amount=amount,
+                    cost_price=12.0 if side == "sell" else None,
+                    cost_basis=6000.0 if side == "sell" else None,
+                    realized_pnl=500.0 if side == "sell" else 0.0,
+                    realized_pnl_pct=8.33 if side == "sell" else 0.0,
+                    pnl_status="estimated" if side == "sell" else "buy_open",
+                    trade_time=trade_time,
+                    trade_date=trade_time.date(),
+                    fetched_at=trade_time,
+                )
+            )
+        db.commit()
+
+        payload = qmt_virtual_account_service.get_qmt_return_stats(db, user_id, account_key="paper_trade_history")
+
+    item = payload["traded_securities"][0]
+    assert item["symbol"] == "000001.SZ"
+    assert item["trade_count"] == 2
+    assert item["buy_quantity"] == 1000.0
+    assert item["sell_quantity"] == 500.0
+    assert item["net_quantity"] == 500.0
+    assert item["net_cashflow"] == -5500.0
+    assert item["realized_pnl"] == 500.0
+    assert item["realized_pnl_pct"] == 8.33
+
+
+def test_qmt_trade_history_calculates_sell_realized_pnl(monkeypatch):
+    config = QmtRuntimeConfig(
+        key="paper_sell_pnl",
+        enabled=True,
+        host="192.168.10.1",
+        port=58610,
+        account_id="demo123",
+        account_type="STOCK",
+        account_name="QMT 模拟收益仓",
+        userdata_path="",
+        role="paper",
+        bridge_base_url="http://127.0.0.1:8710",
+        bridge_token="",
+        refresh_interval_seconds=10,
+    )
+    user_id = "return-stats-sell-pnl-user"
+    with get_db_ctx() as db:
+        qmt_virtual_account_service._ensure_qmt_equity_snapshot_schema(db)
+        db.query(QmtAccountTradeHistoryDB).filter(
+            QmtAccountTradeHistoryDB.user_id == user_id,
+            QmtAccountTradeHistoryDB.account_key == "paper_sell_pnl",
+        ).delete(synchronize_session=False)
+        payload = {
+            "positions": [
+                {
+                    "symbol": "000001.SZ",
+                    "name": "平安银行",
+                    "current_position": 500.0,
+                    "average_cost": 10.0,
+                }
+            ],
+            "trades": [
+                {
+                    "trade_id": "SELL001",
+                    "symbol": "000001.SZ",
+                    "name": "平安银行",
+                    "side": "sell",
+                    "price": 12.0,
+                    "quantity": 100.0,
+                    "amount": 1200.0,
+                    "trade_time": "2026-04-22T10:00:00+08:00",
+                }
+            ],
+        }
+
+        qmt_virtual_account_service._persist_qmt_trade_history(
+            db,
+            user_id,
+            config,
+            payload,
+            fetched_at=datetime(2026, 4, 22, 2, 0, tzinfo=timezone.utc),
+        )
+        db.commit()
+
+        row = db.query(QmtAccountTradeHistoryDB).filter(
+            QmtAccountTradeHistoryDB.user_id == user_id,
+            QmtAccountTradeHistoryDB.account_key == "paper_sell_pnl",
+            QmtAccountTradeHistoryDB.trade_id == "SELL001",
+        ).first()
+
+    assert row is not None
+    assert row.cost_price == 10.0
+    assert row.cost_basis == 1000.0
+    assert row.realized_pnl == 200.0
+    assert row.realized_pnl_pct == 20.0
+    assert row.pnl_status == "estimated"
+
+
+def test_qmt_return_stats_separates_paper_and_live(monkeypatch):
+    user_id = "return-stats-role-user"
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._runtime_configs",
+        lambda: [
+            QmtRuntimeConfig(
+                key="paper_returns_route",
+                enabled=True,
+                host="192.168.10.1",
+                port=58610,
+                account_id="paper123",
+                account_type="STOCK",
+                account_name="QMT 模拟收益仓",
+                userdata_path="",
+                role="paper",
+                bridge_base_url="http://127.0.0.1:8710",
+                bridge_token="",
+                refresh_interval_seconds=10,
+            ),
+            QmtRuntimeConfig(
+                key="live_returns_route",
+                enabled=True,
+                host="192.168.10.1",
+                port=58610,
+                account_id="live123",
+                account_type="STOCK",
+                account_name="QMT 实盘收益仓",
+                userdata_path="",
+                role="live",
+                bridge_base_url="http://127.0.0.1:8711",
+                bridge_token="",
+                refresh_interval_seconds=10,
+            ),
+        ],
+    )
+
+    with get_db_ctx() as db:
+        qmt_virtual_account_service._ensure_qmt_equity_snapshot_schema(db)
+        db.query(QmtAccountEquitySnapshotDB).filter(
+            QmtAccountEquitySnapshotDB.user_id == user_id,
+            QmtAccountEquitySnapshotDB.account_key.in_(["paper_returns_route", "live_returns_route"]),
+        ).delete(synchronize_session=False)
+        for account_key, role, account_id, previous_asset, current_asset in [
+            ("paper_returns_route", "paper", "paper123", 10000.0, 10100.0),
+            ("live_returns_route", "live", "live123", 20000.0, 20300.0),
+        ]:
+            db.add(
+                QmtAccountEquitySnapshotDB(
+                    id=uuid4().hex,
+                    user_id=user_id,
+                    account_key=account_key,
+                    role=role,
+                    account_id=account_id,
+                    snapshot_date=date(2026, 4, 21),
+                    total_asset=previous_asset,
+                    market_value=0.0,
+                    available_cash=previous_asset,
+                    total_pnl=0.0,
+                    today_pnl=0.0,
+                    fetched_at=datetime(2026, 4, 21, 7, 0, tzinfo=timezone.utc),
+                )
+            )
+            db.add(
+                QmtAccountEquitySnapshotDB(
+                    id=uuid4().hex,
+                    user_id=user_id,
+                    account_key=account_key,
+                    role=role,
+                    account_id=account_id,
+                    snapshot_date=date(2026, 4, 22),
+                    total_asset=current_asset,
+                    market_value=0.0,
+                    available_cash=current_asset,
+                    total_pnl=0.0,
+                    today_pnl=current_asset - previous_asset,
+                    fetched_at=datetime(2026, 4, 22, 7, 0, tzinfo=timezone.utc),
+                )
+            )
+        db.commit()
+
+        live_payload = qmt_virtual_account_service.get_qmt_return_stats(db, user_id, preferred_role="live")
+        paper_payload = qmt_virtual_account_service.get_qmt_return_stats(db, user_id, preferred_role="paper")
+
+    assert live_payload["account_key"] == "live_returns_route"
+    assert live_payload["periods"]["day"]["amount"] == 300.0
+    assert paper_payload["account_key"] == "paper_returns_route"
+    assert paper_payload["periods"]["day"]["amount"] == 100.0
 
 
 def test_qmt_virtual_warehouse_sync_does_not_write_tracking_board(monkeypatch):
@@ -457,6 +1004,78 @@ def test_qmt_virtual_warehouse_normalizes_xtquant_order_trade_fields(monkeypatch
     assert trade["price"] == 37.35
     assert trade["amount"] == 186750.0
     assert datetime.fromisoformat(trade["trade_time"]).date().isoformat() == "2026-05-07"
+
+
+def test_qmt_live_position_uses_quote_change_for_today_metrics(monkeypatch):
+    client = _get_client()
+    token = _auth(client)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._runtime_configs",
+        lambda: [
+            QmtRuntimeConfig(
+                key="live_real",
+                enabled=True,
+                host="192.168.10.1",
+                port=58610,
+                account_id="8886186680",
+                account_type="STOCK",
+                account_name="QMT 实盘仓",
+                userdata_path="",
+                role="live",
+                bridge_base_url="http://127.0.0.1:8711",
+                bridge_token="bridge-token",
+                refresh_interval_seconds=10,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._query_qmt_snapshot_via_bridge",
+        lambda config: {
+            "fund": {"assetBalance": 161357.27, "marketValue": 18720.0, "enableBalance": 513.27},
+            "positions": [
+                {
+                    "stock_code": "601136.SH",
+                    "stockName": "首创证券",
+                    "volume": 1300,
+                    "can_use_volume": 1300,
+                    "avg_price": 22.885961538461537,
+                    "market_value": 18720.0,
+                    "yesterday_volume": 1300,
+                }
+            ],
+            "orders": [],
+            "trades": [],
+            "asset": {"cash": 513.27},
+            "bridge": {"mode": "http_bridge", "role": "live", "account_key": "live_real", "account_id": "8886186680"},
+        },
+    )
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._fetch_live_quotes",
+        lambda symbols, **kwargs: {
+            "601136.SH": {
+                "price": 14.5,
+                "previous_close": 14.4,
+                "change": 0.1,
+                "change_pct": 0.6944,
+                "quote_time": "2026-06-16 10:41:47",
+                "source": "qmt_bridge",
+            }
+        },
+    )
+
+    response = client.get("/v1/virtual-warehouse/qmt/overview?account_key=live_real", headers=headers)
+    assert response.status_code == 200
+    payload = response.json()
+    position = payload["positions"][0]
+
+    assert position["current_price"] == 14.4
+    assert position["price_source"] == "qmt_position_market_value"
+    assert position["previous_close"] == 14.4
+    assert position["today_pnl"] == 130.0
+    assert position["today_pnl_pct"] == 0.6944
+    assert payload["summary"]["today_pnl"] == 130.0
 
 
 def test_qmt_virtual_warehouse_name_fallback_from_cached_map(monkeypatch):
@@ -895,6 +1514,10 @@ def test_qmt_submit_order_route(monkeypatch):
         },
     )
     monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._fetch_qmt_bridge_health",
+        lambda config, timeout=2.0: {"role": "paper", "account_key": "paper_bridge", "trading_allowed": True},
+    )
+    monkeypatch.setattr(
         "api.services.qmt_virtual_account_service._query_qmt_snapshot",
         lambda config: {
             "fund": {"assetBalance": 800000.0, "marketValue": 300000.0, "enableBalance": 500000.0},
@@ -937,7 +1560,7 @@ def test_qmt_submit_order_route(monkeypatch):
     assert payload["overview"]["orders"][0]["order_id"] == "O9001"
 
 
-def test_qmt_submit_order_rejects_live_account(monkeypatch):
+def test_qmt_submit_order_allows_live_account(monkeypatch):
     client = _get_client()
     token = _auth(client)
     headers = {"Authorization": f"Bearer {token}"}
@@ -965,7 +1588,88 @@ def test_qmt_submit_order_rejects_live_account(monkeypatch):
 
     def fake_submit(*args, **kwargs):
         called["submit"] = True
-        return {"success": True}
+        return {"success": True, "order_id": "L9001"}
+
+    monkeypatch.setattr("api.services.qmt_virtual_account_service._submit_qmt_order", fake_submit)
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._fetch_qmt_bridge_health",
+        lambda config, timeout=2.0: {"role": "live", "account_key": "live_real", "trading_allowed": True},
+    )
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._query_qmt_snapshot",
+        lambda config: {
+            "fund": {"assetBalance": 800000.0, "marketValue": 300000.0, "enableBalance": 500000.0},
+            "positions": [],
+            "orders": [
+                {
+                    "orderId": "L9001",
+                    "stockCode": "000001",
+                    "stockName": "平安银行",
+                    "orderType": "buy",
+                    "orderStatus": "submitted",
+                    "orderPrice": 12.4,
+                    "orderVolume": 100,
+                    "tradedVolume": 0,
+                    "orderTime": "2026-04-22 10:00:00",
+                }
+            ],
+            "trades": [],
+            "asset": {"cash": 500000.0},
+        },
+    )
+    monkeypatch.setattr("api.services.qmt_virtual_account_service._fetch_live_quotes", lambda symbols, **kwargs: {})
+    response = client.post(
+        "/v1/virtual-warehouse/qmt/orders",
+        headers=headers,
+        json={
+            "account_key": "live_real",
+            "symbol": "000001.SZ",
+            "side": "buy",
+            "quantity": 100,
+            "price": 12.4,
+            "price_type": "limit",
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["order_result"]["order_id"] == "L9001"
+    assert payload["overview"]["orders"][0]["order_id"] == "L9001"
+    assert called["submit"] is True
+
+
+def test_qmt_submit_order_rejects_readonly_bridge(monkeypatch):
+    client = _get_client()
+    token = _auth(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    called = {"submit": False}
+
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._runtime_configs",
+        lambda: [
+            QmtRuntimeConfig(
+                key="live_real",
+                enabled=True,
+                host="192.168.10.1",
+                port=58610,
+                account_id="8886186680",
+                account_type="STOCK",
+                account_name="QMT 实盘仓",
+                userdata_path="",
+                role="live",
+                bridge_base_url="http://127.0.0.1:8711",
+                bridge_token="bridge-token",
+                refresh_interval_seconds=10,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._fetch_qmt_bridge_health",
+        lambda config, timeout=2.0: {"role": "live", "account_key": "live_real", "trading_allowed": False},
+    )
+
+    def fake_submit(*args, **kwargs):
+        called["submit"] = True
+        return {"success": True, "order_id": "L9001"}
 
     monkeypatch.setattr("api.services.qmt_virtual_account_service._submit_qmt_order", fake_submit)
     response = client.post(
@@ -981,7 +1685,7 @@ def test_qmt_submit_order_rejects_live_account(monkeypatch):
         },
     )
     assert response.status_code == 400
-    assert "实盘仓已启用只读锁定" in response.json()["detail"]
+    assert "bridge 当前为只读状态" in response.json()["detail"]
     assert called["submit"] is False
 
 
@@ -1018,6 +1722,10 @@ def test_qmt_cancel_order_route(monkeypatch):
         },
     )
     monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._fetch_qmt_bridge_health",
+        lambda config, timeout=2.0: {"role": "paper", "account_key": "paper_bridge", "trading_allowed": True},
+    )
+    monkeypatch.setattr(
         "api.services.qmt_virtual_account_service._query_qmt_snapshot",
         lambda config: {
             "fund": {"assetBalance": 800000.0, "marketValue": 300000.0, "enableBalance": 500000.0},
@@ -1051,7 +1759,7 @@ def test_qmt_cancel_order_route(monkeypatch):
     assert payload["overview"]["orders"][0]["status"] == "cancelled"
 
 
-def test_qmt_cancel_order_rejects_live_account(monkeypatch):
+def test_qmt_cancel_order_allows_live_account(monkeypatch):
     client = _get_client()
     token = _auth(client)
     headers = {"Authorization": f"Bearer {token}"}
@@ -1079,16 +1787,45 @@ def test_qmt_cancel_order_rejects_live_account(monkeypatch):
 
     def fake_cancel(*args, **kwargs):
         called["cancel"] = True
-        return {"success": True}
+        return {"success": True, "order_id": kwargs["order_id"]}
 
     monkeypatch.setattr("api.services.qmt_virtual_account_service._cancel_qmt_order", fake_cancel)
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._fetch_qmt_bridge_health",
+        lambda config, timeout=2.0: {"role": "live", "account_key": "live_real", "trading_allowed": True},
+    )
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._query_qmt_snapshot",
+        lambda config: {
+            "fund": {"assetBalance": 800000.0, "marketValue": 300000.0, "enableBalance": 500000.0},
+            "positions": [],
+            "orders": [
+                {
+                    "orderId": "O9001",
+                    "stockCode": "000001",
+                    "stockName": "平安银行",
+                    "orderType": "buy",
+                    "orderStatus": "cancelled",
+                    "orderPrice": 12.4,
+                    "orderVolume": 1000,
+                    "tradedVolume": 0,
+                    "orderTime": "2026-04-22 10:00:00",
+                }
+            ],
+            "trades": [],
+            "asset": {"cash": 500000.0},
+        },
+    )
+    monkeypatch.setattr("api.services.qmt_virtual_account_service._fetch_live_quotes", lambda symbols, **kwargs: {})
     response = client.post(
         "/v1/virtual-warehouse/qmt/orders/O9001/cancel?account_key=live_real",
         headers=headers,
     )
-    assert response.status_code == 400
-    assert "实盘仓已启用只读锁定" in response.json()["detail"]
-    assert called["cancel"] is False
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["cancel_result"]["order_id"] == "O9001"
+    assert payload["overview"]["orders"][0]["status"] == "cancelled"
+    assert called["cancel"] is True
 
 
 def test_qmt_history_bridge_uses_paper_account_key(monkeypatch):

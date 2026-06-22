@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-FRONTEND_PORT="${FRONTEND_PORT:-5174}"
+FRONTEND_PORT="${FRONTEND_PORT:-5173}"
 BACKEND_PORT="${BACKEND_PORT:-8500}"
 
 cd "$ROOT"

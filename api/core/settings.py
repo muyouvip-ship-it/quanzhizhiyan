@@ -19,6 +19,10 @@ class Settings:
     allow_server_llm_fallback: bool = os.getenv("ALLOW_SERVER_LLM_FALLBACK", "1").lower() in {"1", "true", "yes", "on"}
     ta_job_timeout: int = int(os.getenv("TA_JOB_TIMEOUT", "600"))
     ta_app_secret_key: str = os.getenv("TA_APP_SECRET_KEY", "")
+
+    def __post_init__(self):
+        if self.env == "prod" and not self.ta_app_secret_key:
+            raise RuntimeError("TA_APP_SECRET_KEY must be set in production")
     database_url: str = os.getenv("DATABASE_URL", "")
     strategy_database_url: str = os.getenv("STRATEGY_DATABASE_URL", os.getenv("DATABASE_URL", ""))
     qmt_enabled: bool = os.getenv("QMT_ENABLED", "0").lower() in {"1", "true", "yes", "on"}

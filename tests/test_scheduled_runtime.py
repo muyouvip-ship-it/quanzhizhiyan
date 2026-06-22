@@ -50,6 +50,63 @@ def test_run_job_delegates_to_background_analysis(monkeypatch):
     }
 
 
+def test_background_analysis_does_not_silently_use_lightweight_fallback(monkeypatch):
+    from api.core.progress_tracker import AgentProgressTracker
+    from api.routes.chat import _run_analysis_with_fallback
+
+    async def fail_deep_pipeline(**kwargs):
+        raise RuntimeError("missing api key")
+
+    monkeypatch.setattr("api.routes.chat._run_deep_analysis_pipeline", fail_deep_pipeline)
+
+    tracker = AgentProgressTracker(emit_events=False)
+    try:
+        asyncio.run(
+            _run_analysis_with_fallback(
+                symbol="300750.SZ",
+                trade_date="2026-04-30",
+                query="定时分析 300750.SZ",
+                user_id="user-1",
+                selected_analysts=["market", "fundamentals"],
+                tracker=tracker,
+                job_id="job-no-fallback",
+                allow_lightweight_fallback=False,
+            )
+        )
+    except RuntimeError as exc:
+        assert "missing api key" in str(exc)
+    else:
+        raise AssertionError("background analysis should fail instead of creating a lightweight report")
+
+
+def test_stream_analysis_can_still_use_lightweight_fallback(monkeypatch):
+    from api.core.progress_tracker import AgentProgressTracker
+    from api.routes.chat import _run_analysis_with_fallback
+
+    async def fail_deep_pipeline(**kwargs):
+        raise RuntimeError("temporary llm failure")
+
+    monkeypatch.setattr("api.routes.chat._run_deep_analysis_pipeline", fail_deep_pipeline)
+
+    result_payload, risk_items, key_metrics, decision = asyncio.run(
+        _run_analysis_with_fallback(
+            symbol="300750.SZ",
+            trade_date="2026-04-30",
+            query="分析 300750.SZ",
+            user_id="user-1",
+            selected_analysts=["market", "fundamentals"],
+            tracker=AgentProgressTracker(emit_events=False),
+            job_id="job-fallback",
+            allow_lightweight_fallback=True,
+        )
+    )
+
+    assert result_payload["symbol"] == "300750.SZ"
+    assert decision in {"BUY", "HOLD", "WATCH"}
+    assert risk_items
+    assert key_metrics
+
+
 def test_resolve_scheduled_trade_date_uses_previous_day_before_open(monkeypatch):
     monkeypatch.setattr("tradingagents.dataflows.trade_calendar.is_cn_trading_day", lambda date: True)
     monkeypatch.setattr("tradingagents.dataflows.trade_calendar.previous_cn_trading_day", lambda date: "2026-05-06")

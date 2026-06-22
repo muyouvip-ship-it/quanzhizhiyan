@@ -254,6 +254,9 @@ class StrategyUpdateRequest(BaseModel):
     dsl: StrategyDsl
     source: StrategySource | None = None
     status: StrategyStatus | None = None
+    template_id: str | None = None
+    template_name: str | None = None
+    template_parameters: dict[str, Any] | None = None
 
 
 class StrategyCompilePreviewRequest(BaseModel):
@@ -2011,6 +2014,10 @@ async def update_strategy_platform(strategy_id: str, request: StrategyUpdateRequ
     strategy.version = next_version
     strategy.current_version_id = version.id
     strategy.current_version = version
+    strategy.template_id = request.template_id if request.template_id is not None else strategy.template_id
+    strategy.template_name = request.template_name if request.template_name is not None else strategy.template_name
+    if request.template_parameters is not None:
+        strategy.template_parameters = request.template_parameters
     strategy.updated_at = now
 
     saved_payload = strategy.model_dump()

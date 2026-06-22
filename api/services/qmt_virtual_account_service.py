@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import copy
 import asyncio
+import hashlib
 import ipaddress
+import calendar
 import logging
 import math
 import os
@@ -10,18 +12,19 @@ import socket
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
 
 import httpx
 import requests
+from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
 from api.core.stock_map import get_reverse_stock_map_cached_only
 from api.core.settings import settings
-from api.database import ImportedPortfolioPositionDB, QmtAccountSnapshotDB, QmtSyncProfileDB, VirtualPositionStateDB
+from api.database import ImportedPortfolioPositionDB, QmtAccountEquitySnapshotDB, QmtAccountSnapshotDB, QmtAccountTradeHistoryDB, QmtSyncProfileDB, VirtualPositionStateDB
 from api.services import auth_service, portfolio_import_service
 from api.services.data_source_governance import build_virtual_warehouse_governance
 from api.core.utils import run_async
@@ -41,6 +44,7 @@ _QMT_RECENT_FAILURES: dict[str, dict[str, Any]] = {}
 _QMT_FETCH_LOCKS: dict[str, threading.Lock] = {}
 _QMT_BACKGROUND_REFRESH_STATE: dict[str, dict[str, Any]] = {}
 _QMT_FETCH_STATE_LOCK = threading.RLock()
+_QMT_EQUITY_SCHEMA_READY_FOR: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -68,7 +72,7 @@ def create_qmt_bulk_sell_task(
 ) -> dict[str, Any]:
     config = _resolve_runtime_config(account_key, db=db, user_id=user_id)
     request_id = uuid4().hex
-    _ensure_paper_trading_allowed(config, request_id=request_id, action="bulk_sell")
+    _ensure_qmt_trading_allowed(config, request_id=request_id, action="bulk_sell")
     overview = get_qmt_virtual_account_overview(db, user_id, account_key=config.key)
     positions = overview.get("positions") or []
     sellable_positions = [
@@ -109,6 +113,12 @@ def create_qmt_bulk_sell_task(
     }
     with _BULK_SELL_TASKS_LOCK:
         _cleanup_expired_bulk_sell_tasks()
+        existing = _find_active_bulk_sell_task_locked(user_id, config.key)
+        if existing is not None:
+            raise RuntimeError(
+                f"当前账户已有一键卖出任务运行中：{existing.get('id')}，"
+                "请等待任务完成后再发起新的清仓。"
+            )
         _BULK_SELL_TASKS[task_id] = snapshot
 
     worker = threading.Thread(
@@ -192,6 +202,66 @@ def get_qmt_virtual_account_overview(
     }
     response_payload["data_governance"] = build_virtual_warehouse_governance(response_payload)
     return response_payload
+
+
+def get_qmt_return_stats(
+    db: Session,
+    user_id: str,
+    *,
+    account_key: str | None = None,
+    preferred_role: str | None = None,
+) -> dict[str, Any]:
+    _ensure_qmt_equity_snapshot_schema(db)
+    configs = _load_runtime_configs(db=db, user_id=user_id)
+    active_key = _resolve_active_key(configs, account_key, preferred_role=preferred_role)
+    config = _pick_active_config(configs, active_key)
+    _ensure_equity_snapshot_from_latest_cache(db, user_id, config)
+    current = _latest_equity_snapshot(db, user_id, config.key)
+    fetched_at = current.fetched_at if current else None
+    current_date = current.snapshot_date if current else datetime.now(CN_TZ).date()
+
+    periods = {
+        "day": _build_return_period(
+            db,
+            user_id,
+            config.key,
+            current,
+            key="day",
+            label="日收益",
+            period_start=current_date,
+            allow_today_pnl_fallback=True,
+        ),
+        "month": _build_return_period(
+            db,
+            user_id,
+            config.key,
+            current,
+            key="month",
+            label="月收益",
+            period_start=current_date.replace(day=1),
+        ),
+        "year": _build_return_period(
+            db,
+            user_id,
+            config.key,
+            current,
+            key="year",
+            label="年收益",
+            period_start=current_date.replace(month=1, day=1),
+        ),
+    }
+    return {
+        "account_key": config.key,
+        "role": config.role,
+        "account_id": config.account_id,
+        "currency": "CNY",
+        "display_mode_default": "amount",
+        "periods": periods,
+        "calendar": _build_return_calendar(db, user_id, config.key, current_date=current_date),
+        "traded_securities": _build_traded_security_summaries(db, user_id, config.key),
+        "updated_at": fetched_at.isoformat() if fetched_at else None,
+        "snapshot_date": current_date.isoformat(),
+    }
 
 
 def trigger_qmt_background_refresh(
@@ -376,7 +446,7 @@ def submit_qmt_order(
     if not config.enabled:
         _audit_qmt_action("submit_order.reject", config, request_id, status="disabled")
         raise RuntimeError("当前 QMT 账户未启用")
-    _ensure_paper_trading_allowed(config, request_id=request_id, action="submit_order")
+    _ensure_qmt_trading_allowed(config, request_id=request_id, action="submit_order")
     if quantity <= 0:
         _audit_qmt_action("submit_order.reject", config, request_id, status="invalid_quantity", quantity=quantity)
         raise RuntimeError("委托数量必须大于 0")
@@ -402,6 +472,10 @@ def submit_qmt_order(
             "请刷新委托/成交确认是否已被 QMT 接收；如未出现委托，说明本次未成功提交。"
         )
         _audit_qmt_action("submit_order.error", config, request_id, status="timeout", error=str(exc))
+        raise RuntimeError(message) from exc
+    except requests.exceptions.HTTPError as exc:
+        message = _bridge_http_error_message("QMT 委托提交失败", exc)
+        _audit_qmt_action("submit_order.error", config, request_id, status="bridge_http_error", error=message)
         raise RuntimeError(message) from exc
     except requests.exceptions.RequestException as exc:
         message = f"QMT 委托提交失败：bridge 通信异常（{exc}）"
@@ -442,7 +516,7 @@ def cancel_qmt_order(
     if not config.enabled:
         _audit_qmt_action("cancel_order.reject", config, request_id, status="disabled")
         raise RuntimeError("当前 QMT 账户未启用")
-    _ensure_paper_trading_allowed(config, request_id=request_id, action="cancel_order")
+    _ensure_qmt_trading_allowed(config, request_id=request_id, action="cancel_order")
     if not str(order_id or "").strip():
         _audit_qmt_action("cancel_order.reject", config, request_id, status="missing_order_id")
         raise RuntimeError("缺少 order_id")
@@ -450,9 +524,24 @@ def cancel_qmt_order(
     try:
         result = _cancel_qmt_order(config, order_id=order_id)
         _audit_qmt_action("cancel_order.success", config, request_id, status="success", order_id=result.get("order_id"))
+    except requests.exceptions.Timeout as exc:
+        message = (
+            "QMT 撤单请求超时：bridge 在 20 秒内未返回结果。"
+            "请刷新委托/成交确认是否已被 QMT 接收。"
+        )
+        _audit_qmt_action("cancel_order.error", config, request_id, status="timeout", order_id=order_id, error=str(exc))
+        raise RuntimeError(message) from exc
+    except requests.exceptions.HTTPError as exc:
+        message = _bridge_http_error_message("QMT 撤单失败", exc)
+        _audit_qmt_action("cancel_order.error", config, request_id, status="bridge_http_error", order_id=order_id, error=message)
+        raise RuntimeError(message) from exc
+    except requests.exceptions.RequestException as exc:
+        message = f"QMT 撤单失败：bridge 通信异常（{exc}）"
+        _audit_qmt_action("cancel_order.error", config, request_id, status="request_error", order_id=order_id, error=str(exc))
+        raise RuntimeError(message) from exc
     except Exception as exc:
         _audit_qmt_action("cancel_order.error", config, request_id, status="error", order_id=order_id, error=str(exc))
-        raise
+        raise RuntimeError(f"QMT 撤单失败：{exc}") from exc
     overview = get_qmt_virtual_account_overview(db, user_id, account_key=config.key)
     return {
         "message": "QMT 撤单请求已提交",
@@ -593,6 +682,15 @@ def _public_bulk_sell_task(task: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _find_active_bulk_sell_task_locked(user_id: str, account_key: str) -> dict[str, Any] | None:
+    for task in _BULK_SELL_TASKS.values():
+        if task.get("user_id") != user_id or task.get("account_key") != account_key:
+            continue
+        if str(task.get("status") or "") in {"pending", "running"}:
+            return task
+    return None
+
+
 def _update_bulk_sell_task(task_id: str, **updates: Any) -> None:
     with _BULK_SELL_TASKS_LOCK:
         task = _BULK_SELL_TASKS.get(task_id)
@@ -648,12 +746,26 @@ def _cleanup_expired_bulk_sell_tasks() -> None:
             _BULK_SELL_TASKS.pop(task_id, None)
 
 
-def _ensure_paper_trading_allowed(config: QmtRuntimeConfig, *, request_id: str, action: str) -> None:
-    role = str(config.role or "").strip().lower()
-    if role == "paper":
-        return
-    _audit_qmt_action(action + ".reject", config, request_id, status="live_readonly_locked")
-    raise RuntimeError("实盘仓已启用只读锁定：禁止通过本系统提交 QMT 下单或撤单，请切换到虚拟仓模拟账户。")
+def _ensure_qmt_trading_allowed(config: QmtRuntimeConfig, *, request_id: str, action: str) -> None:
+    if not str(config.account_id or "").strip():
+        _audit_qmt_action(action + ".reject", config, request_id, status="missing_account_id")
+        raise RuntimeError("缺少 QMT account_id，无法提交交易指令。")
+    if config.bridge_base_url:
+        try:
+            health = _fetch_qmt_bridge_health(config, timeout=2.5)
+        except Exception as exc:
+            message = _compact_qmt_snapshot_error(exc, config)
+            _audit_qmt_action(action + ".reject", config, request_id, status="bridge_health_failed", error=message)
+            raise RuntimeError(f"QMT 交易通道预检失败：{message}") from exc
+        _validate_qmt_bridge_metadata(config, health, request_id=request_id, action=action, source="health")
+        if not _truthy(health.get("trading_allowed")):
+            _audit_qmt_action(action + ".reject", config, request_id, status="bridge_readonly")
+            role_label = "实盘" if str(config.role or "").strip().lower() == "live" else "模拟"
+            raise RuntimeError(
+                f"QMT {role_label} bridge 当前为只读状态，交易接口不可用。"
+                "请在 Windows bridge 启动环境确认 QMT_BRIDGE_ALLOW_TRADING=1，并重启对应 bridge。"
+            )
+    _audit_qmt_action(action + ".allow", config, request_id, status="trading_allowed")
 
 
 def _audit_qmt_action(action: str, config: QmtRuntimeConfig, request_id: str, **fields: Any) -> None:
@@ -667,6 +779,103 @@ def _audit_qmt_action(action: str, config: QmtRuntimeConfig, request_id: str, **
         config.bridge_base_url,
         " ".join(f"{key}={value}" for key, value in fields.items() if value is not None),
     )
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "allow", "allowed"}
+
+
+def _qmt_bridge_headers(config: QmtRuntimeConfig) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if config.bridge_token:
+        headers["Authorization"] = f"Bearer {config.bridge_token}"
+    return headers
+
+
+def _fetch_qmt_bridge_health(config: QmtRuntimeConfig, *, timeout: float = 2.0) -> dict[str, Any]:
+    base_url = str(config.bridge_base_url or "").strip().rstrip("/")
+    if not base_url:
+        raise RuntimeError("未配置 bridge_base_url")
+    response = requests.get(f"{base_url}/health", headers=_qmt_bridge_headers(config), timeout=timeout)
+    response.raise_for_status()
+    payload = response.json()
+    return payload if isinstance(payload, dict) else {}
+
+
+def _bridge_metadata_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    bridge = payload.get("bridge")
+    if isinstance(bridge, dict):
+        return dict(bridge)
+    keys = ("role", "account_key", "account_id", "account_type", "trading_allowed")
+    metadata = {key: payload.get(key) for key in keys if payload.get(key) not in (None, "")}
+    if bridge not in (None, ""):
+        metadata["raw_bridge"] = str(bridge)
+    return metadata
+
+
+def _validate_qmt_bridge_metadata(
+    config: QmtRuntimeConfig,
+    payload: dict[str, Any],
+    *,
+    request_id: str | None = None,
+    action: str = "bridge",
+    source: str = "bridge",
+) -> None:
+    bridge = _bridge_metadata_payload(payload)
+    bridge_role = str(bridge.get("role") or "").strip().lower()
+    expected_role = str(config.role or "").strip().lower()
+    if bridge_role and expected_role and bridge_role != expected_role:
+        if request_id:
+            _audit_qmt_action(action + ".reject", config, request_id, status="bridge_role_mismatch", bridge_role=bridge_role)
+        raise RuntimeError(f"QMT bridge 角色不匹配：配置为 {expected_role}，{source} 返回 {bridge_role}。")
+
+    bridge_account_key = str(bridge.get("account_key") or "").strip()
+    if bridge_account_key and bridge_account_key != config.key:
+        if request_id:
+            _audit_qmt_action(action + ".reject", config, request_id, status="bridge_account_key_mismatch", bridge_account_key=bridge_account_key)
+        raise RuntimeError(f"QMT bridge account_key 不匹配：配置为 {config.key}，{source} 返回 {bridge_account_key}。")
+
+    bridge_account_id = str(bridge.get("account_id") or "").strip()
+    if bridge_account_id and config.account_id and bridge_account_id != config.account_id:
+        if request_id:
+            _audit_qmt_action(action + ".reject", config, request_id, status="bridge_account_id_mismatch", bridge_account_id=bridge_account_id)
+        raise RuntimeError(f"QMT bridge account_id 不匹配：配置为 {config.account_id}，{source} 返回 {bridge_account_id}。")
+
+
+def _validate_qmt_snapshot_identity(config: QmtRuntimeConfig, payload: dict[str, Any]) -> None:
+    _validate_qmt_bridge_metadata(config, _bridge_metadata_payload(payload), source="snapshot")
+    asset = dict(payload.get("asset") or {})
+    asset_account_id = str(
+        asset.get("account_id")
+        or asset.get("m_strAccountID")
+        or asset.get("m_strAccountId")
+        or ""
+    ).strip()
+    if asset_account_id and config.account_id and asset_account_id != config.account_id:
+        raise RuntimeError(f"QMT 资产快照账号不匹配：配置为 {config.account_id}，快照返回 {asset_account_id}。")
+
+
+def _bridge_http_error_message(prefix: str, exc: requests.exceptions.RequestException) -> str:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return f"{prefix}：bridge 通信异常（{exc}）"
+    detail = ""
+    try:
+        payload = response.json()
+        detail = str(payload.get("detail") or payload.get("message") or payload.get("error") or "").strip()
+    except Exception:
+        detail = str(getattr(response, "text", "") or "").strip()
+    status_code = getattr(response, "status_code", "")
+    suffix = f"HTTP {status_code}"
+    if detail:
+        suffix = f"{suffix}，{detail}"
+    return f"{prefix}：bridge 返回 {suffix}"
 
 
 def diagnose_qmt_accounts(db: Session | None = None, user_id: str | None = None, account_key: str | None = None, run_connect_test: bool = False) -> dict[str, Any]:
@@ -979,7 +1188,294 @@ def _persist_account_snapshot(
     row.trades_json = list(payload.get("trades") or [])
     row.summary_json = dict(payload.get("summary") or {})
     row.fetched_at = fetched_at
+    _persist_account_equity_snapshot(db, user_id, config, payload, fetched_at=fetched_at)
+    _persist_qmt_trade_history(db, user_id, config, payload, fetched_at=fetched_at)
     db.commit()
+
+
+def _persist_account_equity_snapshot(
+    db: Session,
+    user_id: str,
+    config: QmtRuntimeConfig,
+    payload: dict[str, Any],
+    *,
+    fetched_at: datetime | None,
+) -> None:
+    _ensure_qmt_equity_snapshot_schema(db)
+    account = dict(payload.get("account") or {})
+    summary = dict(payload.get("summary") or {})
+    if not account and not summary:
+        return
+    snapshot_date = _qmt_snapshot_cn_date(fetched_at)
+    row = (
+        db.query(QmtAccountEquitySnapshotDB)
+        .filter(
+            QmtAccountEquitySnapshotDB.user_id == user_id,
+            QmtAccountEquitySnapshotDB.account_key == config.key,
+            QmtAccountEquitySnapshotDB.snapshot_date == snapshot_date,
+        )
+        .first()
+    )
+    if row is None:
+        row = QmtAccountEquitySnapshotDB(
+            id=uuid4().hex,
+            user_id=user_id,
+            account_key=config.key,
+            snapshot_date=snapshot_date,
+        )
+        db.add(row)
+    row.role = str(account.get("role") or config.role or "").strip() or None
+    row.account_id = str(account.get("account_id") or config.account_id or "").strip() or None
+    row.total_asset = round(float(_to_float(account.get("total_asset"), summary.get("total_asset"), 0.0) or 0.0), 2)
+    row.market_value = round(float(_to_float(account.get("market_value"), summary.get("market_value"), 0.0) or 0.0), 2)
+    row.available_cash = round(float(_to_float(account.get("available_cash"), summary.get("available_cash"), 0.0) or 0.0), 2)
+    row.total_pnl = round(float(_to_float(account.get("total_pnl"), summary.get("total_pnl"), 0.0) or 0.0), 2)
+    row.total_pnl_pct = _to_float(account.get("total_pnl_pct"), summary.get("total_pnl_pct"))
+    row.today_pnl = round(float(_to_float(account.get("today_pnl"), summary.get("today_pnl"), 0.0) or 0.0), 2)
+    row.summary_json = summary
+    row.fetched_at = fetched_at
+
+
+def _ensure_equity_snapshot_from_latest_cache(
+    db: Session,
+    user_id: str,
+    config: QmtRuntimeConfig,
+) -> None:
+    _ensure_qmt_equity_snapshot_schema(db)
+    cached = (
+        db.query(QmtAccountSnapshotDB)
+        .filter(
+            QmtAccountSnapshotDB.user_id == user_id,
+            QmtAccountSnapshotDB.account_key == config.key,
+        )
+        .first()
+    )
+    if cached is None or not (cached.account_json or cached.summary_json):
+        return
+    payload = {
+        "account": dict(cached.account_json or {}),
+        "summary": dict(cached.summary_json or {}),
+        "trades": list(cached.trades_json or []),
+    }
+    _persist_account_equity_snapshot(db, user_id, config, payload, fetched_at=cached.fetched_at)
+    _persist_qmt_trade_history(db, user_id, config, payload, fetched_at=cached.fetched_at)
+    db.commit()
+
+
+def _ensure_qmt_equity_snapshot_schema(db: Session) -> None:
+    bind = db.get_bind()
+    bind_key = str(bind.url)
+    if bind_key in _QMT_EQUITY_SCHEMA_READY_FOR:
+        return
+    QmtAccountEquitySnapshotDB.__table__.create(bind=bind, checkfirst=True)
+    QmtAccountTradeHistoryDB.__table__.create(bind=bind, checkfirst=True)
+    inspector = inspect(bind)
+    columns = {column["name"] for column in inspector.get_columns(QmtAccountTradeHistoryDB.__tablename__)}
+    for column_name, ddl in (
+        ("cost_price", "ALTER TABLE qmt_account_trade_history ADD COLUMN cost_price DOUBLE PRECISION"),
+        ("cost_basis", "ALTER TABLE qmt_account_trade_history ADD COLUMN cost_basis DOUBLE PRECISION"),
+        ("realized_pnl", "ALTER TABLE qmt_account_trade_history ADD COLUMN realized_pnl DOUBLE PRECISION"),
+        ("realized_pnl_pct", "ALTER TABLE qmt_account_trade_history ADD COLUMN realized_pnl_pct DOUBLE PRECISION"),
+        ("pnl_status", "ALTER TABLE qmt_account_trade_history ADD COLUMN pnl_status VARCHAR(32)"),
+    ):
+        if column_name not in columns:
+            db.execute(text(ddl))
+    _QMT_EQUITY_SCHEMA_READY_FOR.add(bind_key)
+
+
+def _persist_qmt_trade_history(
+    db: Session,
+    user_id: str,
+    config: QmtRuntimeConfig,
+    payload: dict[str, Any],
+    *,
+    fetched_at: datetime | None,
+) -> None:
+    _ensure_qmt_equity_snapshot_schema(db)
+    trades = list(payload.get("trades") or [])
+    if not trades:
+        return
+    positions_by_symbol = {
+        str(item.get("symbol") or "").strip().upper(): item
+        for item in list(payload.get("positions") or [])
+        if isinstance(item, dict) and item.get("symbol")
+    }
+    for trade in trades:
+        if not isinstance(trade, dict):
+            continue
+        symbol = str(trade.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        trade_uid = _qmt_trade_uid(config, trade)
+        trade_time = _parse_iso_datetime(trade.get("trade_time"))
+        trade_date = _qmt_snapshot_cn_date(trade_time or fetched_at)
+        row = (
+            db.query(QmtAccountTradeHistoryDB)
+            .filter(
+                QmtAccountTradeHistoryDB.user_id == user_id,
+                QmtAccountTradeHistoryDB.account_key == config.key,
+                QmtAccountTradeHistoryDB.trade_uid == trade_uid,
+            )
+            .first()
+        )
+        if row is None:
+            row = QmtAccountTradeHistoryDB(
+                id=uuid4().hex,
+                user_id=user_id,
+                account_key=config.key,
+                trade_uid=trade_uid,
+            )
+            db.add(row)
+        row.role = config.role
+        row.account_id = config.account_id
+        row.trade_id = str(trade.get("trade_id") or "").strip() or None
+        row.order_id = str(trade.get("order_id") or "").strip() or None
+        row.symbol = symbol
+        row.name = str(trade.get("name") or "").strip() or None
+        row.side = str(trade.get("side") or "").strip().lower() or None
+        row.price = _to_float(trade.get("price"))
+        row.quantity = _to_float(trade.get("quantity"))
+        row.amount = _to_float(trade.get("amount"))
+        pnl_context = _calculate_trade_realized_pnl(
+            db,
+            user_id,
+            config,
+            trade,
+            positions_by_symbol=positions_by_symbol,
+        )
+        row.cost_price = pnl_context.get("cost_price")
+        row.cost_basis = pnl_context.get("cost_basis")
+        row.realized_pnl = pnl_context.get("realized_pnl")
+        row.realized_pnl_pct = pnl_context.get("realized_pnl_pct")
+        row.pnl_status = pnl_context.get("pnl_status")
+        row.trade_time = trade_time
+        row.trade_date = trade_date
+        row.raw_json = dict(trade.get("raw") or trade)
+        row.fetched_at = fetched_at
+
+
+def _qmt_trade_uid(config: QmtRuntimeConfig, trade: dict[str, Any]) -> str:
+    trade_id = str(trade.get("trade_id") or "").strip()
+    if trade_id:
+        return f"id:{trade_id}"[:96]
+    fingerprint = "|".join(
+        str(value or "").strip()
+        for value in (
+            config.key,
+            trade.get("order_id"),
+            trade.get("symbol"),
+            trade.get("side"),
+            trade.get("trade_time"),
+            trade.get("price"),
+            trade.get("quantity"),
+            trade.get("amount"),
+        )
+    )
+    return f"hash:{hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:48]}"
+
+
+def _calculate_trade_realized_pnl(
+    db: Session,
+    user_id: str,
+    config: QmtRuntimeConfig,
+    trade: dict[str, Any],
+    *,
+    positions_by_symbol: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    side = str(trade.get("side") or "").strip().lower()
+    quantity = _to_float(trade.get("quantity"))
+    price = _to_float(trade.get("price"))
+    amount = _to_float(trade.get("amount"))
+    if amount is None and price is not None and quantity is not None:
+        amount = round(float(price) * float(quantity), 2)
+    if side == "buy":
+        return {
+            "cost_price": price,
+            "cost_basis": amount,
+            "realized_pnl": 0.0,
+            "realized_pnl_pct": 0.0,
+            "pnl_status": "buy_open",
+        }
+    if side != "sell" or quantity in (None, 0) or amount is None:
+        return {
+            "cost_price": None,
+            "cost_basis": None,
+            "realized_pnl": None,
+            "realized_pnl_pct": None,
+            "pnl_status": "unsupported",
+        }
+
+    cost_price = _resolve_trade_cost_price(db, user_id, config, trade, positions_by_symbol=positions_by_symbol)
+    if cost_price is None or cost_price <= 0:
+        return {
+            "cost_price": None,
+            "cost_basis": None,
+            "realized_pnl": None,
+            "realized_pnl_pct": None,
+            "pnl_status": "cost_missing",
+        }
+    cost_basis = round(float(cost_price) * float(quantity), 2)
+    realized_pnl = round(float(amount) - cost_basis, 2)
+    realized_pnl_pct = round((realized_pnl / cost_basis) * 100, 2) if cost_basis > 0 else None
+    return {
+        "cost_price": round(float(cost_price), 4),
+        "cost_basis": cost_basis,
+        "realized_pnl": realized_pnl,
+        "realized_pnl_pct": realized_pnl_pct,
+        "pnl_status": "estimated",
+    }
+
+
+def _resolve_trade_cost_price(
+    db: Session,
+    user_id: str,
+    config: QmtRuntimeConfig,
+    trade: dict[str, Any],
+    *,
+    positions_by_symbol: dict[str, dict[str, Any]],
+) -> float | None:
+    symbol = str(trade.get("symbol") or "").strip().upper()
+    position = positions_by_symbol.get(symbol) or {}
+    cost_price = _to_float(position.get("average_cost"), position.get("cost_price"), position.get("costPrice"))
+    if cost_price is not None and cost_price > 0:
+        return cost_price
+
+    state = (
+        db.query(VirtualPositionStateDB)
+        .filter(
+            VirtualPositionStateDB.user_id == user_id,
+            VirtualPositionStateDB.broker == "qmt",
+            VirtualPositionStateDB.account_id == config.account_id,
+            VirtualPositionStateDB.symbol == symbol,
+        )
+        .first()
+    )
+    state_payload = dict(state.last_payload_json or {}) if state and isinstance(state.last_payload_json, dict) else {}
+    cost_price = _to_float(
+        state_payload.get("average_cost"),
+        state_payload.get("cost_price"),
+        state_payload.get("costPrice"),
+        state_payload.get("cost_price_avg"),
+        state_payload.get("open_price"),
+    )
+    if cost_price is not None and cost_price > 0:
+        return cost_price
+
+    buy_rows = (
+        db.query(QmtAccountTradeHistoryDB)
+        .filter(
+            QmtAccountTradeHistoryDB.user_id == user_id,
+            QmtAccountTradeHistoryDB.account_key == config.key,
+            QmtAccountTradeHistoryDB.symbol == symbol,
+            QmtAccountTradeHistoryDB.side == "buy",
+        )
+        .all()
+    )
+    buy_quantity = sum(float(row.quantity or 0.0) for row in buy_rows)
+    buy_amount = sum(float(row.amount or 0.0) for row in buy_rows)
+    if buy_quantity > 0 and buy_amount > 0:
+        return round(buy_amount / buy_quantity, 4)
+    return None
 
 
 def _load_cached_payload(
@@ -1149,7 +1645,11 @@ def _materialize_qmt_snapshot_payload(
     security_name_map = _security_name_map_from_cache()
     positions = _build_position_items(db, user_id, config, snapshot.get("positions") or [], security_name_map)
     quote_map = _fetch_live_quotes([item["symbol"] for item in positions], account_key=config.key, db=db, user_id=user_id)
-    positions = _apply_quote_metrics(positions, quote_map)
+    positions = _apply_quote_metrics(
+        positions,
+        quote_map,
+        prefer_position_market_value=str(config.role or "").strip().lower() == "live",
+    )
     _sync_position_state(db, user_id, config.account_id, positions)
     if sync_to_imports:
         _sync_qmt_positions_to_imports(db, user_id, config.key, positions)
@@ -1264,7 +1764,12 @@ def _diagnose_single_account(config: QmtRuntimeConfig, *, run_connect_test: bool
     userdata_path_exists = bool(config.userdata_path) and os.path.exists(config.userdata_path)
     xtquant_installed, xtquant_message = _check_xtquant_available()
     tcp_reachable, tcp_message = _probe_tcp_port(config.host, config.port)
-    bridge_reachable, bridge_message = _probe_bridge(config)
+    bridge_reachable, bridge_message, bridge_health = _probe_bridge_health(config)
+    bridge_role = str(bridge_health.get("role") or "").strip().lower()
+    bridge_account_key = str(bridge_health.get("account_key") or "").strip()
+    bridge_trading_allowed = _truthy(bridge_health.get("trading_allowed")) if bridge_health else False
+    bridge_role_matches = bool(not bridge_role or bridge_role == str(config.role or "").strip().lower())
+    bridge_account_key_matches = bool(not bridge_account_key or bridge_account_key == config.key)
     qmt_host_is_local = _host_points_to_local_machine(config.host)
     bridge_host = _bridge_url_host(config.bridge_base_url)
     bridge_host_is_local = _host_points_to_local_machine(bridge_host)
@@ -1277,6 +1782,9 @@ def _diagnose_single_account(config: QmtRuntimeConfig, *, run_connect_test: bool
         "tcp_port_reachable": tcp_reachable,
         "bridge_configured": bool(config.bridge_base_url),
         "bridge_reachable": bridge_reachable,
+        "bridge_trading_allowed": bridge_trading_allowed,
+        "bridge_role_matches": bridge_role_matches,
+        "bridge_account_key_matches": bridge_account_key_matches,
         "qmt_host_is_local_machine": qmt_host_is_local,
         "bridge_host_is_local_machine": bridge_host_is_local,
     }
@@ -1293,6 +1801,12 @@ def _diagnose_single_account(config: QmtRuntimeConfig, *, run_connect_test: bool
         warnings.append("QMT 端口不可达")
     if config.enabled and config.bridge_base_url and not bridge_reachable:
         warnings.append("QMT bridge 不可达")
+    if config.enabled and config.bridge_base_url and bridge_reachable and not bridge_role_matches:
+        warnings.append(f"QMT bridge 角色不匹配：配置 {config.role}，实际 {bridge_role or 'unknown'}")
+    if config.enabled and config.bridge_base_url and bridge_reachable and not bridge_account_key_matches:
+        warnings.append(f"QMT bridge account_key 不匹配：配置 {config.key}，实际 {bridge_account_key}")
+    if config.enabled and config.bridge_base_url and bridge_reachable and not bridge_trading_allowed:
+        warnings.append("QMT bridge 当前只读，交易接口不可用")
     if config.enabled and qmt_host_is_local and not tcp_reachable:
         warnings.append(f"QMT host {config.host} 是当前后端机器本机地址，请改成 Windows QMT/bridge 的实际 IP")
     if config.enabled and config.bridge_base_url and bridge_host_is_local and not bridge_reachable:
@@ -1344,6 +1858,20 @@ def _diagnose_single_account(config: QmtRuntimeConfig, *, run_connect_test: bool
             "configured": bool(config.bridge_base_url),
             "reachable": bridge_reachable,
             "message": bridge_message,
+            "health": bridge_health,
+        },
+        "trading_probe": {
+            "configured": bool(config.bridge_base_url),
+            "allowed": bridge_trading_allowed if config.bridge_base_url else True,
+            "role": bridge_role or None,
+            "account_key": bridge_account_key or None,
+            "role_matches": bridge_role_matches,
+            "account_key_matches": bridge_account_key_matches,
+            "message": (
+                "交易通道可用"
+                if (not config.bridge_base_url or (bridge_reachable and bridge_trading_allowed and bridge_role_matches and bridge_account_key_matches))
+                else "交易通道不可用，请检查 Windows bridge 角色、account_key 与 QMT_BRIDGE_ALLOW_TRADING"
+            ),
         },
         "connect_test": connect_test,
     }
@@ -1442,19 +1970,24 @@ def _ipv4_address_belongs_to_local_machine(address: str) -> bool:
             pass
 
 
-def _probe_bridge(config: QmtRuntimeConfig, timeout: float = 2.0) -> tuple[bool, str]:
+def _probe_bridge_health(config: QmtRuntimeConfig, timeout: float = 2.0) -> tuple[bool, str, dict[str, Any]]:
     base_url = str(config.bridge_base_url or "").strip().rstrip("/")
     if not base_url:
-        return False, "未配置 bridge_base_url"
-    headers = {}
-    if config.bridge_token:
-        headers["Authorization"] = f"Bearer {config.bridge_token}"
+        return False, "未配置 bridge_base_url", {}
     try:
-        response = requests.get(f"{base_url}/health", headers=headers, timeout=timeout)
-        response.raise_for_status()
-        return True, f"{base_url}/health 可达"
+        payload = _fetch_qmt_bridge_health(config, timeout=timeout)
+        role = str(payload.get("role") or "").strip() or "unknown"
+        trading_allowed = _truthy(payload.get("trading_allowed"))
+        account_key = str(payload.get("account_key") or "").strip()
+        account_label = f" account_key={account_key}" if account_key else ""
+        return True, f"{base_url}/health 可达 role={role} trading_allowed={trading_allowed}{account_label}", payload
     except Exception as exc:
-        return False, str(exc)
+        return False, str(exc), {}
+
+
+def _probe_bridge(config: QmtRuntimeConfig, timeout: float = 2.0) -> tuple[bool, str]:
+    reachable, message, _payload = _probe_bridge_health(config, timeout=timeout)
+    return reachable, message
 
 
 def _query_qmt_snapshot(config: QmtRuntimeConfig) -> dict[str, Any]:
@@ -1507,24 +2040,24 @@ def _query_qmt_snapshot_via_bridge(config: QmtRuntimeConfig) -> dict[str, Any]:
     base_url = str(config.bridge_base_url or "").rstrip("/")
     if not base_url:
         raise RuntimeError("bridge_base_url 为空")
-    headers = {}
-    if config.bridge_token:
-        headers["Authorization"] = f"Bearer {config.bridge_token}"
     response = requests.get(
         f"{base_url}/snapshot",
         params={"account_id": config.account_id, "account_type": config.account_type, "account_key": config.key},
-        headers=headers,
+        headers=_qmt_bridge_headers(config),
         timeout=_QMT_SNAPSHOT_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
     payload = response.json()
+    payload = payload if isinstance(payload, dict) else {"raw": payload}
+    bridge = _bridge_metadata_payload(payload)
+    _validate_qmt_snapshot_identity(config, payload)
     return {
         "fund": payload.get("fund") or {},
         "positions": payload.get("positions") or [],
         "asset": payload.get("asset") or {},
         "orders": payload.get("orders") or [],
         "trades": payload.get("trades") or [],
-        "bridge": payload.get("bridge") or {},
+        "bridge": bridge,
     }
 
 
@@ -1532,24 +2065,24 @@ async def _query_qmt_snapshot_via_bridge_async(config: QmtRuntimeConfig) -> dict
     base_url = str(config.bridge_base_url or "").rstrip("/")
     if not base_url:
         raise RuntimeError("bridge_base_url 为空")
-    headers = {}
-    if config.bridge_token:
-        headers["Authorization"] = f"Bearer {config.bridge_token}"
     async with httpx.AsyncClient(timeout=_QMT_SNAPSHOT_TIMEOUT_SECONDS) as client:
         response = await client.get(
             f"{base_url}/snapshot",
             params={"account_id": config.account_id, "account_type": config.account_type, "account_key": config.key},
-            headers=headers,
+            headers=_qmt_bridge_headers(config),
         )
         response.raise_for_status()
         payload = response.json()
+    payload = payload if isinstance(payload, dict) else {"raw": payload}
+    bridge = _bridge_metadata_payload(payload)
+    _validate_qmt_snapshot_identity(config, payload)
     return {
         "fund": payload.get("fund") or {},
         "positions": payload.get("positions") or [],
         "asset": payload.get("asset") or {},
         "orders": payload.get("orders") or [],
         "trades": payload.get("trades") or [],
-        "bridge": payload.get("bridge") or {},
+        "bridge": bridge,
     }
 
 
@@ -1567,9 +2100,6 @@ def _submit_qmt_order_via_bridge(
     base_url = str(config.bridge_base_url or "").rstrip("/")
     if not base_url:
         raise RuntimeError("bridge_base_url 为空")
-    headers = {}
-    if config.bridge_token:
-        headers["Authorization"] = f"Bearer {config.bridge_token}"
     response = requests.post(
         f"{base_url}/orders",
         json={
@@ -1584,17 +2114,20 @@ def _submit_qmt_order_via_bridge(
             "strategy_name": strategy_name,
             "order_remark": order_remark,
         },
-        headers=headers,
+        headers=_qmt_bridge_headers(config),
         timeout=20,
     )
     response.raise_for_status()
     payload = response.json()
+    payload = payload if isinstance(payload, dict) else {"raw": payload}
+    bridge = _bridge_metadata_payload(payload)
+    _validate_qmt_bridge_metadata(config, bridge, source="order_response")
     return {
         "success": bool(payload.get("success", True)),
         "order_id": str(payload.get("order_id") or ""),
         "result": payload.get("result"),
         "request": payload.get("request") or {},
-        "bridge": payload.get("bridge") or {},
+        "bridge": bridge,
         "raw": payload,
     }
 
@@ -1603,22 +2136,22 @@ def _cancel_qmt_order_via_bridge(config: QmtRuntimeConfig, *, order_id: str) -> 
     base_url = str(config.bridge_base_url or "").rstrip("/")
     if not base_url:
         raise RuntimeError("bridge_base_url 为空")
-    headers = {}
-    if config.bridge_token:
-        headers["Authorization"] = f"Bearer {config.bridge_token}"
     response = requests.post(
         f"{base_url}/orders/{order_id}/cancel",
         params={"account_id": config.account_id, "account_type": config.account_type, "account_key": config.key},
-        headers=headers,
+        headers=_qmt_bridge_headers(config),
         timeout=20,
     )
     response.raise_for_status()
     payload = response.json()
+    payload = payload if isinstance(payload, dict) else {"raw": payload}
+    bridge = _bridge_metadata_payload(payload)
+    _validate_qmt_bridge_metadata(config, bridge, source="cancel_response")
     return {
         "success": bool(payload.get("success", True)),
         "order_id": str(payload.get("order_id") or order_id),
         "result": payload.get("result"),
-        "bridge": payload.get("bridge") or {},
+        "bridge": bridge,
         "raw": payload,
     }
 
@@ -1820,12 +2353,22 @@ def _build_position_items(
             if not symbol or quantity in (None, 0):
                 continue
             available = _to_float(payload.get("enableAmount"), payload.get("can_use_volume"))
-            current_price = _to_float(payload.get("lastPrice"))
-            avg_price = _to_float(payload.get("costPrice"), payload.get("avg_price"), payload.get("open_price"))
-            market_value = _to_float(payload.get("marketValue"), payload.get("market_value"))
+            current_price = _to_float(payload.get("lastPrice"), payload.get("last_price"), payload.get("price"))
+            avg_price = _to_float(
+                payload.get("costPrice"),
+                payload.get("avg_price"),
+                payload.get("open_price"),
+                payload.get("m_dAvgPrice"),
+                payload.get("m_dOpenPrice"),
+            )
+            market_value = _to_float(payload.get("marketValue"), payload.get("market_value"), payload.get("m_dMarketValue"))
+            price_source = "qmt_position_price" if current_price is not None else None
+            if current_price is None and market_value is not None and quantity not in (None, 0):
+                current_price = round(float(market_value) / float(quantity), 4)
+                price_source = "qmt_position_market_value"
             if market_value is None and current_price is not None and quantity is not None:
                 market_value = round(current_price * quantity, 2)
-            total_pnl = _to_float(payload.get("income"))
+            total_pnl = _to_float(payload.get("income"), payload.get("position_profit"), payload.get("floating_pnl"))
             if total_pnl is None and current_price is not None and avg_price is not None:
                 total_pnl = round((current_price - avg_price) * quantity, 2)
             total_pnl_pct = None
@@ -1837,6 +2380,7 @@ def _build_position_items(
             break_even_rise_pct = 0.0
             if current_price not in (None, 0) and avg_price and current_price < avg_price:
                 break_even_rise_pct = round(((avg_price / current_price) - 1) * 100, 2)
+            yesterday_position = _to_float(payload.get("yesterday_volume"), payload.get("m_nYesterdayVolume"))
             items.append(
                 {
                     "symbol": symbol,
@@ -1844,8 +2388,10 @@ def _build_position_items(
                     "account_id": config.account_id,
                     "current_position": round(float(quantity), 2),
                     "available_position": round(float(available or 0.0), 2),
+                    "yesterday_position": round(float(yesterday_position), 2) if yesterday_position is not None else None,
                     "average_cost": round(float(avg_price or 0.0), 4),
                     "current_price": round(float(current_price or 0.0), 4) if current_price is not None else None,
+                    "price_source": price_source,
                     "market_value": round(float(market_value or 0.0), 2),
                     "total_pnl": round(float(total_pnl or 0.0), 2),
                     "total_pnl_pct": total_pnl_pct,
@@ -1966,19 +2512,31 @@ def _is_order_cancelable(
 def _apply_quote_metrics(
     items: list[dict[str, Any]],
     quote_map: dict[str, dict[str, Any]],
+    *,
+    prefer_position_market_value: bool = False,
 ) -> list[dict[str, Any]]:
     enriched: list[dict[str, Any]] = []
     for item in items:
         try:
             quote = quote_map.get(item["symbol"]) or {}
             resolved_name = _resolve_security_name(quote, item["symbol"], _security_name_map_from_cache())
-            current_price = _to_float(quote.get("price"), item.get("current_price"))
+            quote_price = _to_float(quote.get("price"))
+            position_price = _to_float(item.get("current_price"))
+            current_price = (
+                _to_float(position_price, quote_price)
+                if prefer_position_market_value
+                else _to_float(quote_price, position_price)
+            )
             previous_close = _to_float(quote.get("previous_close"))
+            change_price = _to_float(quote_price, current_price)
             price_change = _to_float(quote.get("change"))
-            if price_change is None and current_price is not None and previous_close not in (None, 0):
-                price_change = round(current_price - previous_close, 4)
-            today_pnl = round(float(price_change or 0.0) * float(item.get("current_position") or 0.0), 2) if price_change is not None else None
+            if price_change is None and change_price is not None and previous_close not in (None, 0):
+                price_change = round(change_price - previous_close, 4)
+            pnl_quantity = _to_float(item.get("yesterday_position"), item.get("current_position"), 0.0)
+            today_pnl = round(float(price_change or 0.0) * float(pnl_quantity or 0.0), 2) if price_change is not None else None
             today_pnl_pct = _to_float(quote.get("change_pct"))
+            if today_pnl_pct is None and price_change is not None and previous_close not in (None, 0):
+                today_pnl_pct = round((float(price_change) / float(previous_close)) * 100, 4)
             total_pnl = item.get("total_pnl")
             total_pnl_pct = _to_float(item.get("total_pnl_pct"))
             avg_price = _to_float(item.get("average_cost"))
@@ -1987,13 +2545,14 @@ def _apply_quote_metrics(
                 total_pnl_pct = round(((current_price - avg_price) / avg_price) * 100, 2)
                 item["break_even_rise_pct"] = round(max((avg_price / current_price) - 1, 0) * 100, 2) if current_price > 0 else None
             market_value = item.get("market_value")
-            if current_price is not None:
+            if current_price is not None and (not prefer_position_market_value or market_value in (None, 0)):
                 market_value = round(current_price * float(item.get("current_position") or 0.0), 2)
             enriched.append(
                 {
                     **item,
                     "name": resolved_name if resolved_name and not _looks_like_symbol(resolved_name) else item.get("name"),
                     "current_price": round(float(current_price), 4) if current_price is not None else item.get("current_price"),
+                    "price_source": item.get("price_source") if prefer_position_market_value and item.get("price_source") else quote.get("source"),
                     "market_value": market_value,
                     "total_pnl": total_pnl,
                     "total_pnl_pct": total_pnl_pct,
@@ -2083,7 +2642,7 @@ def _sync_position_state(
         row.last_quantity = float(item.get("current_position") or 0.0)
         row.last_price = _to_float(item.get("current_price"))
         row.last_market_value = _to_float(item.get("market_value"))
-        row.last_payload_json = item.get("raw")
+        row.last_payload_json = dict(item)
 
     for row in rows:
         if row.symbol in active_symbols:
@@ -2363,6 +2922,14 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _qmt_snapshot_cn_date(value: datetime | None) -> date:
+    if value is None:
+        return datetime.now(CN_TZ).date()
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(CN_TZ).date()
+
+
 def _parse_iso_datetime(value: Any) -> datetime | None:
     text = str(value or "").strip()
     if not text:
@@ -2374,3 +2941,351 @@ def _parse_iso_datetime(value: Any) -> datetime | None:
         return parsed.astimezone(timezone.utc)
     except Exception:
         return None
+
+
+def _latest_equity_snapshot(
+    db: Session,
+    user_id: str,
+    account_key: str,
+) -> QmtAccountEquitySnapshotDB | None:
+    return (
+        db.query(QmtAccountEquitySnapshotDB)
+        .filter(
+            QmtAccountEquitySnapshotDB.user_id == user_id,
+            QmtAccountEquitySnapshotDB.account_key == account_key,
+        )
+        .order_by(
+            QmtAccountEquitySnapshotDB.snapshot_date.desc(),
+            QmtAccountEquitySnapshotDB.fetched_at.desc(),
+            QmtAccountEquitySnapshotDB.updated_at.desc(),
+        )
+        .first()
+    )
+
+
+def _previous_equity_snapshot(
+    db: Session,
+    user_id: str,
+    account_key: str,
+    snapshot_date: date,
+) -> QmtAccountEquitySnapshotDB | None:
+    return (
+        db.query(QmtAccountEquitySnapshotDB)
+        .filter(
+            QmtAccountEquitySnapshotDB.user_id == user_id,
+            QmtAccountEquitySnapshotDB.account_key == account_key,
+            QmtAccountEquitySnapshotDB.snapshot_date < snapshot_date,
+        )
+        .order_by(
+            QmtAccountEquitySnapshotDB.snapshot_date.desc(),
+            QmtAccountEquitySnapshotDB.fetched_at.desc(),
+        )
+        .first()
+    )
+
+
+def _period_baseline_equity_snapshot(
+    db: Session,
+    user_id: str,
+    account_key: str,
+    *,
+    period_start: date,
+    current_date: date,
+) -> tuple[QmtAccountEquitySnapshotDB | None, bool]:
+    previous = (
+        db.query(QmtAccountEquitySnapshotDB)
+        .filter(
+            QmtAccountEquitySnapshotDB.user_id == user_id,
+            QmtAccountEquitySnapshotDB.account_key == account_key,
+            QmtAccountEquitySnapshotDB.snapshot_date < period_start,
+        )
+        .order_by(
+            QmtAccountEquitySnapshotDB.snapshot_date.desc(),
+            QmtAccountEquitySnapshotDB.fetched_at.desc(),
+        )
+        .first()
+    )
+    if previous is not None:
+        return previous, True
+    earliest = (
+        db.query(QmtAccountEquitySnapshotDB)
+        .filter(
+            QmtAccountEquitySnapshotDB.user_id == user_id,
+            QmtAccountEquitySnapshotDB.account_key == account_key,
+            QmtAccountEquitySnapshotDB.snapshot_date >= period_start,
+            QmtAccountEquitySnapshotDB.snapshot_date <= current_date,
+        )
+        .order_by(
+            QmtAccountEquitySnapshotDB.snapshot_date.asc(),
+            QmtAccountEquitySnapshotDB.fetched_at.asc(),
+        )
+        .first()
+    )
+    return earliest, False
+
+
+def _build_return_period(
+    db: Session,
+    user_id: str,
+    account_key: str,
+    current: QmtAccountEquitySnapshotDB | None,
+    *,
+    key: str,
+    label: str,
+    period_start: date,
+    allow_today_pnl_fallback: bool = False,
+) -> dict[str, Any]:
+    if current is None:
+        return {
+            "key": key,
+            "label": label,
+            "amount": None,
+            "rate": None,
+            "baseline_asset": None,
+            "current_asset": None,
+            "start_date": period_start.isoformat(),
+            "end_date": period_start.isoformat(),
+            "coverage": "empty",
+            "coverage_label": "暂无资产快照",
+        }
+
+    current_asset = round(float(current.total_asset or 0.0), 2)
+    baseline: QmtAccountEquitySnapshotDB | None
+    coverage = "full"
+    if key == "day":
+        baseline = _previous_equity_snapshot(db, user_id, account_key, current.snapshot_date)
+        if baseline is None and allow_today_pnl_fallback:
+            amount = round(float(current.today_pnl or 0.0), 2)
+            baseline_asset = round(current_asset - amount, 2)
+            rate = _calculate_return_rate(amount, baseline_asset)
+            return {
+                "key": key,
+                "label": label,
+                "amount": amount,
+                "rate": rate,
+                "baseline_asset": baseline_asset if baseline_asset > 0 else None,
+                "current_asset": current_asset,
+                "start_date": current.snapshot_date.isoformat(),
+                "end_date": current.snapshot_date.isoformat(),
+                "coverage": "fallback",
+                "coverage_label": "暂无上一快照，已按当日盈亏估算",
+            }
+    else:
+        baseline, has_period_anchor = _period_baseline_equity_snapshot(
+            db,
+            user_id,
+            account_key,
+            period_start=period_start,
+            current_date=current.snapshot_date,
+        )
+        coverage = "full" if has_period_anchor else "partial"
+
+    if baseline is None:
+        return {
+            "key": key,
+            "label": label,
+            "amount": None,
+            "rate": None,
+            "baseline_asset": None,
+            "current_asset": current_asset,
+            "start_date": period_start.isoformat(),
+            "end_date": current.snapshot_date.isoformat(),
+            "coverage": "empty",
+            "coverage_label": "数据沉淀中",
+        }
+
+    baseline_asset = round(float(baseline.total_asset or 0.0), 2)
+    amount = round(current_asset - baseline_asset, 2)
+    return {
+        "key": key,
+        "label": label,
+        "amount": amount,
+        "rate": _calculate_return_rate(amount, baseline_asset),
+        "baseline_asset": baseline_asset,
+        "current_asset": current_asset,
+        "start_date": baseline.snapshot_date.isoformat(),
+        "end_date": current.snapshot_date.isoformat(),
+        "coverage": coverage,
+        "coverage_label": "完整统计" if coverage == "full" else "数据沉淀中",
+    }
+
+
+def _calculate_return_rate(amount: float | None, baseline_asset: float | None) -> float | None:
+    if amount is None or baseline_asset is None or baseline_asset <= 0:
+        return None
+    return round((float(amount) / float(baseline_asset)) * 100, 2)
+
+
+def _build_return_calendar(
+    db: Session,
+    user_id: str,
+    account_key: str,
+    *,
+    current_date: date,
+) -> dict[str, Any]:
+    month_start = current_date.replace(day=1)
+    month_end = current_date.replace(day=calendar.monthrange(current_date.year, current_date.month)[1])
+    rows = (
+        db.query(QmtAccountEquitySnapshotDB)
+        .filter(
+            QmtAccountEquitySnapshotDB.user_id == user_id,
+            QmtAccountEquitySnapshotDB.account_key == account_key,
+            QmtAccountEquitySnapshotDB.snapshot_date >= month_start,
+            QmtAccountEquitySnapshotDB.snapshot_date <= month_end,
+        )
+        .order_by(QmtAccountEquitySnapshotDB.snapshot_date.asc())
+        .all()
+    )
+    previous = _previous_equity_snapshot(db, user_id, account_key, month_start)
+    rows_by_date = {row.snapshot_date: row for row in rows}
+    daily_values: dict[date, dict[str, Any]] = {}
+    rolling_previous = previous
+    max_abs_amount = 0.0
+    for row in rows:
+        current_asset = round(float(row.total_asset or 0.0), 2)
+        if rolling_previous is not None:
+            baseline_asset = round(float(rolling_previous.total_asset or 0.0), 2)
+            amount = round(current_asset - baseline_asset, 2)
+            coverage = "full"
+            coverage_label = "完整统计"
+        else:
+            amount = round(float(row.today_pnl or 0.0), 2)
+            baseline_asset = round(current_asset - amount, 2)
+            coverage = "fallback"
+            coverage_label = "按当日盈亏估算"
+        rate = _calculate_return_rate(amount, baseline_asset)
+        max_abs_amount = max(max_abs_amount, abs(amount))
+        daily_values[row.snapshot_date] = {
+            "date": row.snapshot_date.isoformat(),
+            "amount": amount,
+            "rate": rate,
+            "baseline_asset": baseline_asset if baseline_asset > 0 else None,
+            "current_asset": current_asset,
+            "coverage": coverage,
+            "coverage_label": coverage_label,
+            "has_snapshot": True,
+            "fetched_at": row.fetched_at.isoformat() if row.fetched_at else None,
+        }
+        rolling_previous = row
+
+    days: list[dict[str, Any]] = []
+    cursor = month_start
+    while cursor <= month_end:
+        item = daily_values.get(cursor)
+        if item is None:
+            item = {
+                "date": cursor.isoformat(),
+                "amount": None,
+                "rate": None,
+                "baseline_asset": None,
+                "current_asset": None,
+                "coverage": "empty",
+                "coverage_label": "暂无快照",
+                "has_snapshot": False,
+                "fetched_at": None,
+            }
+        amount = item.get("amount")
+        intensity = 0.0
+        if amount is not None and max_abs_amount > 0:
+            intensity = round(min(abs(float(amount)) / max_abs_amount, 1.0), 4)
+        item.update(
+            {
+                "day": cursor.day,
+                "weekday": cursor.weekday(),
+                "intensity": intensity,
+                "tone": "gain" if (amount or 0) > 0 else "loss" if (amount or 0) < 0 else "flat" if item.get("has_snapshot") else "empty",
+            }
+        )
+        days.append(item)
+        cursor += timedelta(days=1)
+
+    return {
+        "year": current_date.year,
+        "month": current_date.month,
+        "month_label": f"{current_date.year}年{current_date.month:02d}月",
+        "start_date": month_start.isoformat(),
+        "end_date": month_end.isoformat(),
+        "max_abs_amount": round(max_abs_amount, 2),
+        "days": days,
+    }
+
+
+def _build_traded_security_summaries(
+    db: Session,
+    user_id: str,
+    account_key: str,
+) -> list[dict[str, Any]]:
+    rows = (
+        db.query(QmtAccountTradeHistoryDB)
+        .filter(
+            QmtAccountTradeHistoryDB.user_id == user_id,
+            QmtAccountTradeHistoryDB.account_key == account_key,
+        )
+        .order_by(QmtAccountTradeHistoryDB.trade_time.desc().nullslast(), QmtAccountTradeHistoryDB.fetched_at.desc().nullslast())
+        .limit(2000)
+        .all()
+    )
+    summary_map: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        symbol = str(row.symbol or "").strip().upper()
+        if not symbol:
+            continue
+        item = summary_map.setdefault(
+            symbol,
+            {
+                "symbol": symbol,
+                "name": row.name or symbol,
+                "trade_count": 0,
+                "buy_quantity": 0.0,
+                "sell_quantity": 0.0,
+                "buy_amount": 0.0,
+                "sell_amount": 0.0,
+                "net_quantity": 0.0,
+                "net_cashflow": 0.0,
+                "realized_cost_basis": 0.0,
+                "realized_pnl": 0.0,
+                "realized_pnl_pct": None,
+                "pnl_status": "empty",
+                "latest_side": None,
+                "latest_price": None,
+                "latest_trade_time": None,
+                "first_trade_time": None,
+            },
+        )
+        side = str(row.side or "").strip().lower()
+        quantity = float(row.quantity or 0.0)
+        amount = float(row.amount or 0.0)
+        item["trade_count"] += 1
+        if side == "buy":
+            item["buy_quantity"] += quantity
+            item["buy_amount"] += amount
+            item["net_quantity"] += quantity
+            item["net_cashflow"] -= amount
+        elif side == "sell":
+            item["sell_quantity"] += quantity
+            item["sell_amount"] += amount
+            item["net_quantity"] -= quantity
+            item["net_cashflow"] += amount
+            if row.realized_pnl is not None:
+                item["realized_pnl"] += float(row.realized_pnl or 0.0)
+                item["realized_cost_basis"] += float(row.cost_basis or 0.0)
+                item["pnl_status"] = "estimated"
+            elif item["pnl_status"] != "estimated":
+                item["pnl_status"] = str(row.pnl_status or "cost_missing")
+        trade_time_text = row.trade_time.isoformat() if row.trade_time else None
+        if item["latest_trade_time"] is None:
+            item["latest_side"] = side or None
+            item["latest_price"] = row.price
+            item["latest_trade_time"] = trade_time_text
+        item["first_trade_time"] = trade_time_text or item["first_trade_time"]
+        if row.name:
+            item["name"] = row.name
+
+    items = list(summary_map.values())
+    for item in items:
+        if item["realized_cost_basis"] > 0:
+            item["realized_pnl_pct"] = round((float(item["realized_pnl"]) / float(item["realized_cost_basis"])) * 100, 2)
+        for key in ("buy_quantity", "sell_quantity", "buy_amount", "sell_amount", "net_quantity", "net_cashflow", "realized_cost_basis", "realized_pnl"):
+            item[key] = round(float(item[key] or 0.0), 2)
+    items.sort(key=lambda item: str(item.get("latest_trade_time") or ""), reverse=True)
+    return items

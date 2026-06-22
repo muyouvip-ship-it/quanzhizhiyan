@@ -582,11 +582,56 @@ class RealtimeApprovalDB(Base):
         }
 
 
+class SelectionCenterTaskDB(Base):
+    """选股中心执行记录表，保存每次执行的固定结果快照。"""
+
+    __tablename__ = "selection_center_tasks"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(64), index=True, nullable=False, comment="用户ID")
+    name = Column(String(200), nullable=False, comment="任务名称")
+    mode = Column(String(20), index=True, nullable=False, comment="strategy/catalyst/hybrid")
+    status = Column(String(20), default="running", index=True, comment="running/completed/failed")
+    progress = Column(Float, default=0.0, comment="进度 0-100")
+    universe = Column(String(200), nullable=True, comment="股票池描述")
+    rule = Column(Text, nullable=True, comment="选股规则描述")
+    filters_json = Column(JSON, nullable=True, comment="过滤条件标签")
+    config_json = Column(JSON, nullable=True, comment="任务创建配置")
+    candidates_json = Column(JSON, nullable=True, comment="选股结果快照")
+    error_message = Column(Text, nullable=True, comment="失败原因")
+    created_at = Column(DateTime, default=datetime.now, index=True, comment="创建时间")
+    started_at = Column(DateTime, nullable=True, comment="开始时间")
+    completed_at = Column(DateTime, nullable=True, comment="完成时间")
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, comment="更新时间")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "name": self.name,
+            "mode": self.mode,
+            "status": self.status,
+            "progress": float(self.progress or 0.0),
+            "universe": self.universe or "",
+            "rule": self.rule or "",
+            "filters": list(self.filters_json or []),
+            "config": self.config_json or {},
+            "candidates": list(self.candidates_json or []),
+            "error_message": self.error_message,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 Index("idx_realtime_events_monitor_created", RealtimeEventDB.monitor_id, RealtimeEventDB.created_at)
 Index("idx_realtime_events_user_monitor_created_id", RealtimeEventDB.user_id, RealtimeEventDB.monitor_id, RealtimeEventDB.created_at, RealtimeEventDB.id)
 Index("idx_realtime_signal_exec_monitor_bar", RealtimeSignalExecutionDB.monitor_id, RealtimeSignalExecutionDB.timeframe, RealtimeSignalExecutionDB.bar_end)
 Index("idx_realtime_signal_exec_user_symbol", RealtimeSignalExecutionDB.user_id, RealtimeSignalExecutionDB.symbol, RealtimeSignalExecutionDB.first_seen_at)
 Index("idx_realtime_approvals_user_status", RealtimeApprovalDB.user_id, RealtimeApprovalDB.status)
+Index("idx_selection_center_tasks_user_created", SelectionCenterTaskDB.user_id, SelectionCenterTaskDB.created_at)
+Index("idx_selection_center_tasks_user_mode_created", SelectionCenterTaskDB.user_id, SelectionCenterTaskDB.mode, SelectionCenterTaskDB.created_at)
 
 
 # ============================================================
@@ -666,7 +711,7 @@ class IndexDailyKlineDB(Base):
     amount = Column(Float, comment="成交额")
     
     # 元数据
-    source = Column(String(20), default='akshare', comment="数据来源")
+    source = Column(String(32), default='akshare', comment="数据来源")
     created_at = Column(DateTime, default=datetime.now, comment="创建时间")
     
     # 联合唯一索引

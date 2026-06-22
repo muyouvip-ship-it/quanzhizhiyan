@@ -101,6 +101,15 @@ def compile_strategy_dsl(dsl: dict[str, Any]) -> CompiledStrategy:
     except ValidationError as exc:
         errors.extend(_format_schema_errors(exc))
 
+    # Normalize Chinese indicator names to internal column names
+    _CN_INDICATOR_MAP = {"波段": "first_day_band", "B1": "first_day_band_b1"}
+    for branch_key in ("entry", "exit"):
+        for condition in (normalized.get(branch_key) or {}).get("conditions") or []:
+            for key in ("left", "right", "field", "indicator"):
+                value = condition.get(key)
+                if isinstance(value, str) and value in _CN_INDICATOR_MAP:
+                    condition[key] = _CN_INDICATOR_MAP[value]
+
     required_fields = {"close", "open"}
     compiled_targets = ["dsl_ast", "a_share_execution_rules"]
     factor_defs: list[dict[str, Any]] = []

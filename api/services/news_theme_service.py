@@ -9,6 +9,7 @@ import re
 import threading
 import time as time_module
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from typing import Any, Iterable
@@ -17,9 +18,10 @@ from zoneinfo import ZoneInfo
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from sqlalchemy import bindparam, text
+from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session
 
-from api.database import SessionLocal
+from api.database import SessionLocal, engine
 from api.core.runtime_config import (
     account_llm_runtime_sources,
     build_news_runtime_config,
@@ -84,6 +86,13 @@ POLICY_AUTHORITY_KEYWORDS = (
     "商务部",
     "国资委",
 )
+OFFICIAL_NOTICE_SOURCE_KEYWORDS = (
+    "巨潮资讯公告",
+    "上交所公告",
+    "深交所公告",
+    "北交所公告",
+    "交易所公告",
+)
 POLICY_ACTION_KEYWORDS = (
     "印发",
     "行动方案",
@@ -111,7 +120,20 @@ TIER_A_KEYWORDS = (
     "上海证券报",
     "财联社",
 )
-TIER_C_KEYWORDS = ("传闻", "网传", "小作文", "据传", "未经证实")
+TIER_B_KEYWORDS = ("研报", "研究报告", "券商")
+TIER_C_KEYWORDS = (
+    "传闻",
+    "网传",
+    "小作文",
+    "据传",
+    "未经证实",
+    "7x24",
+    "快讯",
+    "全球快讯",
+    "新浪7x24",
+    "富途快讯",
+    "同花顺全球直播",
+)
 STRONG_POSITIVE_KEYWORDS = ("超预期", "大幅增长", "中标", "获批", "涨价", "补贴", "专项", "突破")
 NEGATIVE_RISK_KEYWORDS = ("澄清", "减持", "监管", "处罚", "调查", "亏损", "不及预期", "退市", "风险")
 RESEARCH_SOURCE_SYMBOL_VERBS = (
@@ -551,14 +573,18 @@ def normalize_theme_name(value: str, content: str = "") -> tuple[str | None, lis
 
 def classify_source_tier(source: str, content: str) -> tuple[str, bool]:
     haystack = f"{source or ''} {content or ''}"
+    if any(keyword in haystack for keyword in OFFICIAL_NOTICE_SOURCE_KEYWORDS):
+        return "S", True
     has_policy_authority = any(keyword in haystack for keyword in POLICY_AUTHORITY_KEYWORDS)
     has_policy_action = any(keyword in haystack for keyword in POLICY_ACTION_KEYWORDS)
     if has_policy_authority and has_policy_action:
         return "S", True
-    if any(keyword in haystack for keyword in TIER_A_KEYWORDS) or has_policy_authority:
-        return "A", False
     if any(keyword in haystack for keyword in TIER_C_KEYWORDS):
         return "C", False
+    if any(keyword in haystack for keyword in TIER_B_KEYWORDS):
+        return "B", False
+    if any(keyword in haystack for keyword in TIER_A_KEYWORDS) or has_policy_authority:
+        return "A", False
     return "B", False
 
 
@@ -797,73 +823,70 @@ def _apply_llm_core_stock_suggestions(
         )
         return ranking
 
-    _advisory_xact_lock(db, _llm_cache_lock_id(cache_key))
-    if not force_sync_llm:
-        cached = _load_core_stock_suggestion_cache(db, cache_key)
-        if cached is not None:
-            _mark_core_stock_llm_trace(
-                ranking,
-                themes=trace_themes,
-                status="cache_hit_after_lock",
-                cache_updated_at=_iso(_safe_datetime(cached.get("updated_at"))),
-                cache_has_error=bool(cached.get("error")),
-                trigger_context=cached.get("trigger_context") or public_trigger_context,
-                **trace_base,
-            )
-            ranking = _merge_event_semantics(ranking, cached.get("event_semantics") or {}, source="llm:cache")
-            return _merge_core_stock_suggestions(ranking, cached.get("suggestions") or {}, source="llm:cache")
-
     try:
-        _mark_core_stock_llm_trace(
-            ranking,
-            themes=trace_themes,
-            status="invoking",
-            trigger_context=public_trigger_context,
-            **trace_base,
-        )
-        raw_suggestions = _invoke_core_stock_llm(
-            config,
-            {
-                "window": window,
-                "window_start": _iso(window_start),
-                "window_end": _iso(window_end),
-                "themes": prompt_items,
-            },
-        )
-        suggestions = _normalize_core_stock_suggestions(raw_suggestions)
-        event_semantics = _normalize_event_semantics(raw_suggestions)
-        _store_core_stock_suggestion_cache(
-            db,
-            cache_key=cache_key,
-            window=window,
-            evidence_hash=evidence_hash,
-            config_hash=config_hash,
-            provider=str(config.get("provider") or ""),
-            model=str(config.get("model") or ""),
-            suggestions=suggestions,
-            event_semantics=event_semantics,
-            trigger_context=public_trigger_context,
-            error=None,
-        )
-        ranking = _merge_event_semantics(
-            ranking,
-            event_semantics,
-            source=f"llm:{config.get('provider')}/{config.get('model')}",
-        )
-        _mark_core_stock_llm_trace(
-            ranking,
-            themes=trace_themes,
-            status="invoked",
-            suggested_theme_count=len(suggestions),
-            semantic_theme_count=len(event_semantics),
-            trigger_context=public_trigger_context,
-            **trace_base,
-        )
-        return _merge_core_stock_suggestions(
-            ranking,
-            suggestions,
-            source=f"llm:{config.get('provider')}/{config.get('model')}",
-        )
+        lock_id = _llm_cache_lock_id(cache_key)
+        with _session_advisory_lock(lock_id) as locked:
+            if not locked:
+                recent_cached = _load_recent_core_stock_success_cache(
+                    db,
+                    window=window,
+                    provider=str(config.get("provider") or ""),
+                    model=str(config.get("model") or ""),
+                    config_hash=config_hash,
+                    exclude_cache_key=cache_key,
+                )
+                if recent_cached is not None:
+                    _mark_core_stock_llm_trace(
+                        ranking,
+                        themes=trace_themes,
+                        status="lock_busy_recent_cache_hit",
+                        cache_updated_at=_iso(_safe_datetime(recent_cached.get("updated_at"))),
+                        recent_cache_key=recent_cached.get("cache_key"),
+                        trigger_context=recent_cached.get("trigger_context") or public_trigger_context,
+                        **trace_base,
+                    )
+                    ranking = _merge_event_semantics(ranking, recent_cached.get("event_semantics") or {}, source="llm:recent_cache")
+                    return _merge_core_stock_suggestions(ranking, recent_cached.get("suggestions") or {}, source="llm:recent_cache")
+                _mark_core_stock_llm_trace(
+                    ranking,
+                    themes=trace_themes,
+                    status="lock_busy",
+                    reason="another request is refreshing the same LLM cache",
+                    trigger_context=public_trigger_context,
+                    **trace_base,
+                )
+                return ranking
+
+            if not force_sync_llm:
+                cached = _load_core_stock_suggestion_cache(db, cache_key)
+                if cached is not None:
+                    _mark_core_stock_llm_trace(
+                        ranking,
+                        themes=trace_themes,
+                        status="cache_hit_after_lock",
+                        cache_updated_at=_iso(_safe_datetime(cached.get("updated_at"))),
+                        cache_has_error=bool(cached.get("error")),
+                        trigger_context=cached.get("trigger_context") or public_trigger_context,
+                        **trace_base,
+                    )
+                    ranking = _merge_event_semantics(ranking, cached.get("event_semantics") or {}, source="llm:cache")
+                    return _merge_core_stock_suggestions(ranking, cached.get("suggestions") or {}, source="llm:cache")
+
+            return _invoke_and_store_core_stock_suggestions_sync(
+                db,
+                ranking,
+                config=config,
+                cache_key=cache_key,
+                window=window,
+                evidence_hash=evidence_hash,
+                config_hash=config_hash,
+                prompt_items=prompt_items,
+                window_start=window_start,
+                window_end=window_end,
+                public_trigger_context=public_trigger_context,
+                trace_themes=trace_themes,
+                trace_base=trace_base,
+            )
     except Exception as exc:
         logger.warning("[news-theme] LLM core stock suggestions failed: %s", exc)
         _store_core_stock_suggestion_cache(
@@ -888,6 +911,91 @@ def _apply_llm_core_stock_suggestions(
             **trace_base,
         )
         return ranking
+
+
+def _invoke_and_store_core_stock_suggestions_sync(
+    db: Session,
+    ranking: list[dict[str, Any]],
+    *,
+    config: dict[str, Any],
+    cache_key: str,
+    window: str,
+    evidence_hash: str,
+    config_hash: str,
+    prompt_items: list[dict[str, Any]],
+    window_start: datetime,
+    window_end: datetime,
+    public_trigger_context: dict[str, Any],
+    trace_themes: list[str],
+    trace_base: dict[str, Any],
+) -> list[dict[str, Any]]:
+    _mark_core_stock_llm_trace(
+        ranking,
+        themes=trace_themes,
+        status="invoking",
+        trigger_context=public_trigger_context,
+        **trace_base,
+    )
+    _end_read_transaction_before_external_call(db)
+    raw_suggestions = _invoke_core_stock_llm(
+        config,
+        {
+            "window": window,
+            "window_start": _iso(window_start),
+            "window_end": _iso(window_end),
+            "themes": prompt_items,
+        },
+    )
+    suggestions = _normalize_core_stock_suggestions(raw_suggestions)
+    event_semantics = _normalize_event_semantics(raw_suggestions)
+    _store_core_stock_suggestion_cache(
+        db,
+        cache_key=cache_key,
+        window=window,
+        evidence_hash=evidence_hash,
+        config_hash=config_hash,
+        provider=str(config.get("provider") or ""),
+        model=str(config.get("model") or ""),
+        suggestions=suggestions,
+        event_semantics=event_semantics,
+        trigger_context=public_trigger_context,
+        error=None,
+    )
+    ranking = _merge_event_semantics(
+        ranking,
+        event_semantics,
+        source=f"llm:{config.get('provider')}/{config.get('model')}",
+    )
+    _mark_core_stock_llm_trace(
+        ranking,
+        themes=trace_themes,
+        status="invoked",
+        suggested_theme_count=len(suggestions),
+        semantic_theme_count=len(event_semantics),
+        trigger_context=public_trigger_context,
+        **trace_base,
+    )
+    return _merge_core_stock_suggestions(
+        ranking,
+        suggestions,
+        source=f"llm:{config.get('provider')}/{config.get('model')}",
+    )
+
+
+def _end_read_transaction_before_external_call(db: Session) -> None:
+    try:
+        in_transaction = bool(db.in_transaction())
+    except Exception:
+        in_transaction = False
+    if not in_transaction:
+        return
+    try:
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 def _mark_core_stock_llm_trace(
@@ -2549,6 +2657,42 @@ def _advisory_xact_lock(db: Session, lock_id: int) -> None:
     )
 
 
+@contextmanager
+def _session_advisory_lock(lock_id: int):
+    connection: Connection | None = None
+    locked = False
+    try:
+        bind = engine
+        if getattr(getattr(bind, "dialect", None), "name", "") != "postgresql":
+            yield True
+            return
+        connection = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+        locked = bool(
+            connection.execute(
+                text("SELECT pg_try_advisory_lock(:class_id, :lock_id)"),
+                {
+                    "class_id": THEME_REFRESH_ADVISORY_LOCK_CLASS,
+                    "lock_id": int(lock_id),
+                },
+            ).scalar()
+        )
+        yield locked
+    finally:
+        if connection is not None:
+            if locked:
+                try:
+                    connection.execute(
+                        text("SELECT pg_advisory_unlock(:class_id, :lock_id)"),
+                        {
+                            "class_id": THEME_REFRESH_ADVISORY_LOCK_CLASS,
+                            "lock_id": int(lock_id),
+                        },
+                    )
+                except Exception:
+                    logger.warning("[news-theme] advisory lock release failed", exc_info=True)
+            connection.close()
+
+
 def _snapshot_row_to_payload(row: Any, *, include_evidence: bool) -> dict[str, Any]:
     evidence_items = _loads(row["evidence_items_json"])
     evidence_top_tier = (
@@ -2795,16 +2939,21 @@ def _top_source_tier(tiers: Iterable[str]) -> str:
 def _dominant_source_tier(events: Iterable[ThemeEvent]) -> str:
     order = {"S": 4, "A": 3, "B": 2, "C": 1}
     tiers_by_digest: dict[str, str] = {}
+    official_s_count = 0
     for event in events:
         tier = str(event.source_tier or "").strip()
         if not tier:
             continue
+        if tier == "S" and any(keyword in str(event.source or "") for keyword in OFFICIAL_NOTICE_SOURCE_KEYWORDS):
+            official_s_count += 1
         current = tiers_by_digest.get(event.digest)
         if current is None or order.get(tier, 0) > order.get(current, 0):
             tiers_by_digest[event.digest] = tier
     counts = Counter(tiers_by_digest.values())
     if not counts:
         return "B"
+    if official_s_count and not (counts.get("A") or counts.get("B")):
+        return "S"
     return max(counts, key=lambda tier: (counts[tier], order.get(tier, 0)))
 
 

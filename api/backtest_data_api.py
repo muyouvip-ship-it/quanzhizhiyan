@@ -12,6 +12,7 @@ from typing import Any, List, Optional
 import asyncio
 import json
 import logging
+import os
 import threading
 import pandas as pd
 
@@ -25,7 +26,7 @@ from api.data_quality_manager import DataQualityManager
 from api.data_source_monitor import get_data_source_monitor
 from api.services.daily_kline_parquet_store import get_daily_kline_parquet_stats, write_daily_kline_parquet_cache
 from api.services.market_data_pipeline_service import DAILY_RAW_TABLES, preferred_daily_kline_table
-from api.services.qmt_market_data_service import sync_index_minute_history
+from api.services.qmt_market_data_service import sync_index_daily_history, sync_index_minute_history
 from tradingagents.dataflows.trade_calendar import is_cn_trading_day
 from .backtest_data_models import (
     BacktestDataTaskCreate, BacktestDataTask,
@@ -42,14 +43,34 @@ router = APIRouter(prefix="/v1/backtest-data", tags=["backtest-data"])
 _TABLE_STATS_MAPPING = {
     # 设置页统计必须走最终物理表，不能扫 market_* 兼容视图。
     "daily_kline": ("stock_daily_kline", "trade_date"),
-    "index_data": ("index_daily_data", "trade_date"),
-    "index_daily_kline": ("index_daily_kline", "trade_date"),
+    "index_data": ("index_daily_kline", "trade_date"),
     "minute_kline": ("stock_minute_kline", "trade_time"),
     "index_minute_kline": ("index_minute_kline", "trade_time"),
 }
+_ALLOWED_TABLE_NAMES = frozenset({
+    *(name for name, _ in _TABLE_STATS_MAPPING.values()),
+    *DAILY_RAW_TABLES.values(),
+    "norm_stock_daily_kline",
+    "pub_stock_daily_kline",
+})
+
+
+def _validate_table_name(table_name: str) -> str:
+    """Whitelist table names to prevent SQL injection via dynamic identifiers."""
+    if table_name not in _ALLOWED_TABLE_NAMES:
+        raise ValueError(f"Invalid table name: {table_name}")
+    return table_name
 
 _DAILY_KLINE_CALENDAR_TABLES = ("stock_daily_kline",)
 _FAST_STATS_EXACT_ROW_THRESHOLD = 2_000_000
+_FULL_MARKET_MINUTE_MIN_SYMBOLS = max(int(os.getenv("BACKTEST_FULL_MARKET_MINUTE_MIN_SYMBOLS", "3000") or 3000), 1)
+_INDEX_MIN_SYMBOLS = max(int(os.getenv("BACKTEST_INDEX_MIN_SYMBOLS", "8") or 8), 1)
+_MINUTE_MIN_BARS = max(int(os.getenv("BACKTEST_MINUTE_COMPLETE_MIN_BARS", "200") or 200), 1)
+DEFAULT_MARKET_CLOSE_SYNC_TYPES = ["daily_kline", "index_data", "index_minute_kline", "minute_kline"]
+DEFAULT_MARKET_CLOSE_DATA_SOURCE = "tdx"
+DEFAULT_MARKET_CLOSE_SCHEDULE_TIME = "15:05"
+DEFAULT_AKSHARE_BATCH_SIZE = max(int(os.getenv("AKSHARE_BATCH_SIZE", "20") or 20), 1)
+DEFAULT_AKSHARE_BATCH_SLEEP_SECONDS = max(float(os.getenv("AKSHARE_BATCH_SLEEP_SECONDS", "0.5") or 0.5), 0.0)
 
 
 def _normalize_config_payload(payload: dict) -> dict:
@@ -59,6 +80,9 @@ def _normalize_config_payload(payload: dict) -> dict:
     if not enabled_data_types:
         enabled_data_types = raw.get("data_types") or []
     enabled_data_types = [str(item).strip() for item in enabled_data_types if str(item).strip()]
+    auto_download = bool(raw.get("auto_download")) if "auto_download" in raw else bool(raw.get("auto_update", False))
+    if not enabled_data_types and auto_download:
+        enabled_data_types = list(DEFAULT_MARKET_CLOSE_SYNC_TYPES)
     default_symbols = raw.get("default_symbols")
     if default_symbols is None:
         default_symbols = raw.get("symbols") or []
@@ -81,18 +105,17 @@ def _normalize_config_payload(payload: dict) -> dict:
     data_source_preference = str(
         raw.get("data_source_preference")
         or raw.get("data_source")
-        or "akshare"
-    ).strip() or "akshare"
+        or DEFAULT_MARKET_CLOSE_DATA_SOURCE
+    ).strip() or DEFAULT_MARKET_CLOSE_DATA_SOURCE
     # Subscription UI no longer exposes Tencent as a selectable daily source.
-    # Keep Tencent available for explicit one-off download tasks, but prevent
-    # stale saved subscription configs from silently bypassing QuantClass.
+    # Keep Tencent available for explicit one-off download tasks, but normalize
+    # stale saved subscription configs back to the market-close TDX path.
     if "daily_kline" in enabled_data_types and data_source_preference.lower() == "tencent":
-        data_source_preference = "quantclass"
-    auto_download = bool(raw.get("auto_download")) if "auto_download" in raw else bool(raw.get("auto_update", False))
+        data_source_preference = DEFAULT_MARKET_CLOSE_DATA_SOURCE
     update_frequency = raw.get("update_frequency")
     if not update_frequency and auto_download:
         update_frequency = "daily"
-    schedule_time = str(raw.get("schedule_time") or "18:30").strip() or "18:30"
+    schedule_time = str(raw.get("schedule_time") or DEFAULT_MARKET_CLOSE_SCHEDULE_TIME).strip() or DEFAULT_MARKET_CLOSE_SCHEDULE_TIME
     timezone_value = str(raw.get("timezone") or "Asia/Shanghai").strip() or "Asia/Shanghai"
     only_trading_day = bool(raw.get("only_trading_day", True))
     daily_kline_policy = raw.get("daily_kline_policy")
@@ -150,7 +173,28 @@ def _parse_json_config(value: object) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _extract_written_records(message: str | None, fallback: int = 0) -> int:
+    text_value = str(message or "")
+    marker = "写入 "
+    if marker not in text_value:
+        return fallback
+    tail = text_value.rsplit(marker, 1)[-1]
+    digits: list[str] = []
+    for char in tail:
+        if char.isdigit():
+            digits.append(char)
+        elif digits:
+            break
+    if not digits:
+        return fallback
+    try:
+        return int("".join(digits))
+    except ValueError:
+        return fallback
+
+
 def _build_backtest_table_stat(db: Session, *, data_type: str, table_name: str, date_column: str) -> BacktestDataStats | None:
+    _validate_table_name(table_name)
     if not _relation_exists(db, table_name):
         return None
 
@@ -281,6 +325,24 @@ def _build_large_table_stat(db: Session, *, data_type: str, table_name: str, dat
     max_date = stats.get("date_range_end")
     last_table_updated_at = stats.get("last_table_updated_at")
     now = last_table_updated_at or datetime.utcnow()
+    quality_score = 80
+    if data_type in {"minute_kline", "index_minute_kline"}:
+        coverage = _latest_minute_coverage_snapshot(
+            db,
+            table_name=table_name,
+            target_date=max_date,
+            expected_min_symbols=_INDEX_MIN_SYMBOLS if data_type == "index_minute_kline" else _FULL_MARKET_MINUTE_MIN_SYMBOLS,
+        )
+        if coverage.get("complete"):
+            quality_score = 95
+            if stats.get("symbol_count") is None:
+                stats["symbol_count"] = coverage.get("qualified_symbol_count")
+        elif int(coverage.get("qualified_symbol_count") or 0) > 0:
+            quality_score = 80
+        else:
+            quality_score = 60
+        if stats.get("trading_days") is None:
+            stats["trading_days"] = _estimate_cn_trading_days(min_date, max_date)
 
     return BacktestDataStats(
         data_type=data_type,
@@ -298,7 +360,7 @@ def _build_large_table_stat(db: Session, *, data_type: str, table_name: str, dat
         cache_date_range_start=None,
         cache_date_range_end=None,
         cache_last_updated_at=None,
-        data_quality_score=80,
+        data_quality_score=quality_score,
         missing_dates=[],
         created_at=now,
         updated_at=now,
@@ -340,6 +402,7 @@ def _collect_large_table_stats(db: Session, *, data_type: str, table_name: str, 
         primary_key_records=int(primary_key_records or 0),
         cached_end=_coerce_date(cached.get("date_range_end")) if cached else None,
         db_end=max_date,
+        prefer_estimated=data_type in {"minute_kline", "index_minute_kline"},
     )
 
     if total_records <= 0 and (min_date is None or max_date is None):
@@ -379,7 +442,10 @@ def _choose_fast_total_records(
     primary_key_records: int,
     cached_end: date | None,
     db_end: date | None,
+    prefer_estimated: bool = False,
 ) -> int:
+    if prefer_estimated and estimated_records > 0:
+        return int(max(estimated_records, cached_total or 0))
     if cached_total > 0 and cached_end and db_end and cached_end >= db_end:
         return int(cached_total)
     if estimated_records >= max(cached_total // 2, 1_000_000):
@@ -391,6 +457,59 @@ def _choose_fast_total_records(
     if primary_key_records > 0:
         return int(primary_key_records)
     return max(int(cached_total or 0), int(estimated_records or 0))
+
+
+def _latest_minute_coverage_snapshot(
+    db: Session,
+    *,
+    table_name: str,
+    target_date: date | None,
+    expected_min_symbols: int,
+) -> dict[str, Any]:
+    _validate_table_name(table_name)
+    if target_date is None or not _relation_exists(db, table_name):
+        return {"complete": False, "qualified_symbol_count": 0, "expected_min": expected_min_symbols}
+    start_time = datetime.combine(target_date, datetime.min.time())
+    end_time = start_time + timedelta(days=1)
+    row = db.execute(text(f"""
+        SELECT COUNT(*) AS qualified_symbol_count
+        FROM (
+            SELECT symbol, COUNT(*) AS bar_count
+            FROM {table_name}
+            WHERE trade_time >= :start_time
+              AND trade_time < :end_time
+            GROUP BY symbol
+            HAVING COUNT(*) >= :min_bars
+        ) t
+    """), {
+        "start_time": start_time,
+        "end_time": end_time,
+        "min_bars": _MINUTE_MIN_BARS,
+    }).fetchone()
+    qualified = int(row.qualified_symbol_count or 0) if row else 0
+    expected = max(int(expected_min_symbols or 1), 1)
+    return {
+        "complete": qualified >= expected,
+        "qualified_symbol_count": qualified,
+        "expected_min": expected,
+        "min_bars": _MINUTE_MIN_BARS,
+    }
+
+
+def _estimate_cn_trading_days(start: date | None, end: date | None) -> int | None:
+    if start is None or end is None or start > end:
+        return None
+    current = start
+    total = 0
+    while current <= end:
+        try:
+            if is_cn_trading_day(current.isoformat()):
+                total += 1
+        except Exception:
+            if current.weekday() < 5:
+                total += 1
+        current += timedelta(days=1)
+    return total
 
 
 def _load_cached_data_stat(db: Session, *, data_type: str) -> dict | None:
@@ -408,6 +527,7 @@ def _load_cached_data_stat(db: Session, *, data_type: str) -> dict | None:
 
 
 def _aggregate_table_stats(db: Session, *, table_name: str, date_column: str) -> dict | None:
+    _validate_table_name(table_name)
     if not _relation_exists(db, table_name):
         return None
     row = db.execute(text(f"""
@@ -448,13 +568,14 @@ def _estimate_table_rows(db: Session, table_name: str) -> int:
     if not _relation_exists(db, table_name):
         return 0
     return int(db.execute(text("""
-        SELECT COALESCE(
-            NULLIF((
+        SELECT GREATEST(
+            COALESCE((
                 SELECT n_live_tup::bigint
                 FROM pg_stat_user_tables
-                WHERE schemaname = ANY(current_schemas(false)) AND relname = :table_name
+                WHERE schemaname = ANY(current_schemas(false))
+                  AND relname = :table_name
             ), 0),
-            NULLIF((
+            COALESCE((
                 SELECT reltuples::bigint
                 FROM pg_class
                 WHERE oid = to_regclass(:table_name)
@@ -805,10 +926,10 @@ def _normalized_symbol_sql(column_name: str = "symbol") -> str:
 
 # 数据源兼容性映射
 DATA_SOURCE_COMPATIBILITY = {
-    'daily_kline': ['quantclass', 'tencent', 'akshare', 'baostock'],
-    'minute_kline': ['qmt', 'akshare'],  # QMT 优先，AKShare 作为兜底
-    'index_data': ['quantclass', 'akshare', 'baostock', 'tushare', 'eastmoney'],
-    'index_minute_kline': ['qmt', 'akshare'],
+    'daily_kline': ['tdx', 'quantclass', 'tencent', 'akshare', 'baostock'],
+    'minute_kline': ['tdx', 'qmt', 'akshare'],
+    'index_data': ['tdx', 'qmt', 'akshare', 'quantclass', 'baostock', 'tushare', 'eastmoney'],
+    'index_minute_kline': ['tdx', 'qmt', 'akshare'],
     'chip_data': ['quantclass'],  # 只有量化课堂支持
     'financial_data': ['quantclass'],  # 只有量化课堂支持
     'research_reports': ['eastmoney']  # 只有东方财富支持
@@ -827,15 +948,15 @@ def create_backtest_data_task(
         # 插入任务记录
         query = text("""
             INSERT INTO backtest_data_tasks 
-            (user_id, task_type, data_source, date_range_start, date_range_end, symbols, status)
-            VALUES (:user_id, :task_type, :data_source, :date_range_start, :date_range_end, :symbols, 'pending')
+            (user_id, task_type, data_source, date_range_start, date_range_end, symbols, status, task_scope)
+            VALUES (:user_id, :task_type, :data_source, :date_range_start, :date_range_end, :symbols, 'pending', 'primary')
             RETURNING id
         """)
         
         result = db.execute(query, {
             "user_id": current_user.id,
             "task_type": task.task_type,
-            "data_source": task.data_source or "akshare",
+            "data_source": task.data_source or DEFAULT_MARKET_CLOSE_DATA_SOURCE,
             "date_range_start": task.date_range_start,
             "date_range_end": task.date_range_end,
             "symbols": task.symbols or []
@@ -1359,6 +1480,7 @@ def _serialize_governance_stats(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _daily_governance_table_stats(db: Session, table_name: str) -> dict[str, Any]:
+    _validate_table_name(table_name)
     exists = _relation_exists(db, table_name)
     if not exists:
         return {
@@ -1563,8 +1685,8 @@ def batch_download_data(
             # 创建新任务
             query = text("""
                 INSERT INTO backtest_data_tasks 
-                (user_id, task_type, data_source, date_range_start, date_range_end, symbols, status)
-                VALUES (:user_id, :task_type, :data_source, :date_range_start, :date_range_end, :symbols, 'pending')
+                (user_id, task_type, data_source, date_range_start, date_range_end, symbols, status, task_scope)
+                VALUES (:user_id, :task_type, :data_source, :date_range_start, :date_range_end, :symbols, 'pending', 'primary')
                 RETURNING id
             """)
             
@@ -1693,20 +1815,84 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                 # 根据数据类型下载
                 if task.task_type == 'daily_kline':
                     # 检查数据源
-                    if task.data_source == 'quantclass':
+                    if task.data_source == 'tdx':
+                        logger.info("使用通达信/TDX数据源同步股票日K线")
+
+                        def tdx_daily_progress_callback(progress: int, message: str):
+                            written_records = _extract_written_records(message, total_records)
+                            with get_db_ctx() as db_update:
+                                db_update.execute(text("""
+                                    UPDATE backtest_data_tasks
+                                    SET progress = :progress,
+                                        downloaded_records = :records,
+                                        error_message = :error_message,
+                                        updated_at = NOW()
+                                    WHERE id = :task_id
+                                """), {
+                                    "task_id": task_id,
+                                    "progress": max(0, min(int(progress), 100)),
+                                    "records": written_records,
+                                    "error_message": message[:500] if message else None,
+                                })
+                                db_update.commit()
+
+                        try:
+                            from api.services.tdx_market_data_service import sync_stock_daily_history as sync_tdx_stock_daily_history
+
+                            result = sync_tdx_stock_daily_history(
+                                start_date=task.date_range_start,
+                                end_date=task.date_range_end,
+                                symbols=task.symbols or [],
+                                progress_callback=tdx_daily_progress_callback,
+                            )
+                        except Exception as exc:
+                            result = {"success": False, "error": str(exc), "rows": 0}
+
+                        if result.get("success"):
+                            total_records = int(result.get("rows") or 0)
+                            success_count = int(result.get("success_symbols") or 0) or len([value for value in (result.get("symbol_rows") or {}).values() if value]) or 1
+                            cache_refresh = _refresh_daily_kline_cache_from_db(
+                                db,
+                                start_date=task.date_range_start,
+                                end_date=task.date_range_end,
+                                symbols=task.symbols or None,
+                            )
+                            logger.info(
+                                "TDX日K同步完成: rows=%s symbols=%s cache_updated=%s",
+                                total_records,
+                                success_count,
+                                cache_refresh.get("updated"),
+                            )
+                        else:
+                            error_count = 1
+                            specific_error_message = result.get("error") or "TDX股票日K同步未写入记录"
+                            logger.error("TDX股票日K同步失败: %s", specific_error_message)
+
+                    elif task.data_source == 'quantclass':
                         # 使用量化课堂数据源
                         logger.info("使用量化课堂数据源下载股票日K线")
                         
                         try:
                             # 量化课堂配置
-                            quantclass_api_key = '2HUTNZYOSRA8X5Z7TY2VZGKNTX5UN28B'
-                            quantclass_hid = '1ad9e296ad8d3816b9bce5cba86b1ff6'
+                            quantclass_api_key = os.getenv("QUANTCLASS_API_KEY", "2HUTNZYOSRA8X5Z7TY2VZGKNTX5UN28B")
+                            quantclass_hid = os.getenv("QUANTCLASS_HID", "1ad9e296ad8d3816b9bce5cba86b1ff6")
                             
                             # 创建下载器
                             qc_downloader = QuantClassDownloader(quantclass_api_key, quantclass_hid)
                             
-                            # 下载数据
-                            download_result = qc_downloader.download_product('stock-trading-data-pro')
+                            # Daily enrichment tasks are date-scoped: download the exact
+                            # target day so a newer QuantClass package cannot advance the
+                            # watermark for the wrong date.
+                            task_scope = str(getattr(task, "task_scope", None) or "primary")
+                            download_date_time = (
+                                task.date_range_end.isoformat()
+                                if task_scope == "daily_enrichment" and task.date_range_end
+                                else None
+                            )
+                            download_result = qc_downloader.download_product(
+                                'stock-trading-data-pro',
+                                date_time=download_date_time,
+                            )
                             
                             if download_result['success']:
                                 # 导入数据库
@@ -1786,8 +1972,7 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                             total_stocks = len(symbols)
                             logger.info(f"准备下载 {total_stocks} 只股票的日K线数据 (使用{task.data_source or 'akshare'})")
                     
-                            # 并行下载（每次处理10只股票，避免源端限流）
-                            batch_size = 10
+                            batch_size = DEFAULT_AKSHARE_BATCH_SIZE
                             for i in range(0, len(symbols), batch_size):
                                 batch = symbols[i:i+batch_size]
                             
@@ -1828,8 +2013,8 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                                     })
                                     db_update.commit()
                             
-                                # 批次间延迟，避免源端限流
-                                await asyncio.sleep(2)
+                                if DEFAULT_AKSHARE_BATCH_SLEEP_SECONDS > 0:
+                                    await asyncio.sleep(DEFAULT_AKSHARE_BATCH_SLEEP_SECONDS)
 
                             if success_count > 0:
                                 cache_refresh = _refresh_daily_kline_cache_from_db(
@@ -1860,8 +2045,8 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                         
                         try:
                             # 量化课堂配置
-                            quantclass_api_key = '2HUTNZYOSRA8X5Z7TY2VZGKNTX5UN28B'
-                            quantclass_hid = '1ad9e296ad8d3816b9bce5cba86b1ff6'
+                            quantclass_api_key = os.getenv("QUANTCLASS_API_KEY", "2HUTNZYOSRA8X5Z7TY2VZGKNTX5UN28B")
+                            quantclass_hid = os.getenv("QUANTCLASS_HID", "1ad9e296ad8d3816b9bce5cba86b1ff6")
                             
                             # 创建下载器
                             qc_downloader = QuantClassDownloader(quantclass_api_key, quantclass_hid)
@@ -1889,31 +2074,126 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                             logger.error(f"量化课堂指数数据下载异常: {e}")
                     
                     else:
-                        # 使用AKShare数据源
-                        logger.info("使用AKShare数据源下载指数数据")
-                        
-                        # 下载主要指数数据
-                        symbols = downloader.get_main_index_symbols()
-                        if task.symbols:
-                            symbols = [s for s in symbols if s in task.symbols]
-                        
-                        logger.info(f"准备下载 {len(symbols)} 个指数数据")
-                        
-                        for symbol in symbols:
-                            result = await downloader.download_index_data(
-                                symbol, task.date_range_start, task.date_range_end
-                            )
-                            
-                            if result['success']:
-                                total_records += result['records']
-                                success_count += 1
+                        requested_source = str(task.data_source or "akshare").strip().lower() or "akshare"
+                        sync_source = requested_source if requested_source in {"tdx", "qmt", "akshare"} else "akshare"
+                        index_symbols = task.symbols or []
+                        logger.info(
+                            "准备同步 %s 个市场页指数日K数据 (source=%s, table=index_daily_kline)",
+                            len(index_symbols) or 8,
+                            sync_source,
+                        )
+
+                        def index_daily_progress_callback(progress: int, message: str):
+                            with get_db_ctx() as db_update:
+                                db_update.execute(text("""
+                                    UPDATE backtest_data_tasks
+                                    SET progress = :progress,
+                                        error_message = :error_message,
+                                        updated_at = NOW()
+                                    WHERE id = :task_id
+                                """), {
+                                    "task_id": task_id,
+                                    "progress": max(0, min(int(progress), 100)),
+                                    "error_message": message[:500] if message else None,
+                                })
+                                db_update.commit()
+
+                        try:
+                            if sync_source == "tdx":
+                                from api.services.tdx_market_data_service import sync_index_daily_history as sync_tdx_index_daily_history
+
+                                result = sync_tdx_index_daily_history(
+                                    start_date=task.date_range_start.isoformat(),
+                                    end_date=task.date_range_end.isoformat(),
+                                    symbols=index_symbols,
+                                    progress_callback=index_daily_progress_callback,
+                                )
                             else:
-                                error_count += 1
-                            
-                            await asyncio.sleep(1.5)
+                                result = sync_index_daily_history(
+                                    start_date=task.date_range_start.isoformat(),
+                                    end_date=task.date_range_end.isoformat(),
+                                    symbols=index_symbols,
+                                    data_source=sync_source,
+                                    db=db,
+                                    progress_callback=index_daily_progress_callback,
+                                )
+                        except Exception as exc:
+                            result = {"success": False, "error": str(exc), "rows": 0}
+
+                        if result.get('success'):
+                            total_records += int(result.get('rows') or 0)
+                            success_count += len([value for value in (result.get('symbol_rows') or {}).values() if value]) or len(result.get('symbols') or []) or 1
+                        else:
+                            error_count += 1
+                            specific_error_message = result.get('error') or "指数日K同步未写入记录"
+                            logger.error(f"指数日K下载失败: {specific_error_message}")
                 
                 elif task.task_type == 'minute_kline':
-                    if task.data_source == 'qmt':
+                    if task.data_source == 'tdx':
+                        symbols = task.symbols or []
+                        total_stocks = len(symbols)
+                        scope_text = f"{total_stocks} 只股票" if total_stocks > 0 else "全市场股票"
+                        logger.info(f"准备下载 {scope_text} 的1分钟K线数据 (使用TDX)")
+
+                        def tdx_minute_progress_callback(progress: int, message: str):
+                            written_records = _extract_written_records(message, total_records)
+                            with get_db_ctx() as db_update:
+                                db_update.execute(text("""
+                                    UPDATE backtest_data_tasks
+                                    SET progress = :progress,
+                                        downloaded_records = :records,
+                                        error_message = :error_message,
+                                        updated_at = NOW()
+                                    WHERE id = :task_id
+                                """), {
+                                    "task_id": task_id,
+                                    "progress": max(0, min(int(progress), 100)),
+                                    "records": written_records,
+                                    "error_message": message[:500] if message else None,
+                                })
+                                db_update.commit()
+
+                        try:
+                            from api.services.tdx_market_data_service import sync_stock_minute_history as sync_tdx_stock_minute_history
+
+                            result = sync_tdx_stock_minute_history(
+                                start_date=task.date_range_start,
+                                end_date=task.date_range_end,
+                                symbols=task.symbols or [],
+                                progress_callback=tdx_minute_progress_callback,
+                            )
+                        except Exception as exc:
+                            result = {"success": False, "error": str(exc), "rows": 0}
+
+                        if result.get('success'):
+                            total_records += int(result.get('rows') or 0)
+                            success_count += int(result.get("success_symbols") or 0) or len([value for value in (result.get("symbol_rows") or {}).values() if value]) or 1
+                        else:
+                            error_count += 1
+                            specific_error_message = result.get('error') or "TDX 1分钟K线同步未写入记录"
+                            logger.error(f"TDX 1分钟K线下载失败: {specific_error_message}")
+
+                        with get_db_ctx() as db_update:
+                            db_update.execute(text("""
+                                UPDATE backtest_data_tasks
+                                SET progress = :progress,
+                                    downloaded_records = :records,
+                                    error_message = :error_message,
+                                    updated_at = NOW()
+                                WHERE id = :task_id
+                            """), {
+                                "task_id": task_id,
+                                "progress": 100 if result.get('success') else 0,
+                                "records": total_records,
+                                "error_message": (
+                                    f"TDX 分钟线同步完成，区间记录约 {total_records} 条"
+                                    if result.get('success')
+                                    else result.get('error')
+                                )
+                            })
+                            db_update.commit()
+
+                    elif task.data_source == 'qmt':
                         symbols = task.symbols or []
                         total_stocks = len(symbols)
                         scope_text = f"{total_stocks} 只股票" if total_stocks > 0 else "全市场股票"
@@ -1977,7 +2257,7 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                         total_stocks = len(symbols)
                         logger.info(f"准备下载 {total_stocks} 只股票的1分钟K线数据 (使用AKShare)")
 
-                        batch_size = 10
+                        batch_size = DEFAULT_AKSHARE_BATCH_SIZE
                         for i in range(0, len(symbols), batch_size):
                             batch = symbols[i:i+batch_size]
 
@@ -2000,7 +2280,7 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                                     logger.error(f"股票 {symbol} 1分钟K线下载失败: {result.get('error', '未知错误')}")
                                     error_count += 1
 
-                            progress = int((i + batch_size) / len(symbols) * 100)
+                            progress = int((i + len(batch)) / max(len(symbols), 1) * 100)
                             with get_db_ctx() as db_update:
                                 db_update.execute(text("""
                                     UPDATE backtest_data_tasks
@@ -2017,12 +2297,13 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                                 })
                                 db_update.commit()
 
-                            await asyncio.sleep(2)
+                            if DEFAULT_AKSHARE_BATCH_SLEEP_SECONDS > 0:
+                                await asyncio.sleep(DEFAULT_AKSHARE_BATCH_SLEEP_SECONDS)
 
                 elif task.task_type == 'index_minute_kline':
-                    if task.data_source not in {'qmt', 'akshare'}:
+                    if task.data_source not in {'tdx', 'qmt', 'akshare'}:
                         error_count += 1
-                        logger.error("指数1分钟K线当前仅支持QMT或AKShare数据源")
+                        logger.error("指数1分钟K线当前仅支持TDX、QMT或AKShare数据源")
                     else:
                         index_symbols = task.symbols or []
                         logger.info(f"准备下载 {len(index_symbols) or 8} 个指数的1分钟K线数据 (使用{task.data_source})")
@@ -2044,19 +2325,33 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
 
                         index_progress_callback(
                             5,
-                            f"QMT 指数分钟线历史同步已启动，专用通道：{settings.qmt_minute_history_account_key or 'live_real'}"
-                            if task.data_source == "qmt"
-                            else "AKShare 指数分钟线历史同步已启动（仅最近 5 个交易日可用）",
+                            (
+                                "TDX 指数分钟线历史同步已启动"
+                                if task.data_source == "tdx"
+                                else f"QMT 指数分钟线历史同步已启动，专用通道：{settings.qmt_minute_history_account_key or 'live_real'}"
+                                if task.data_source == "qmt"
+                                else "AKShare 指数分钟线历史同步已启动（仅最近 5 个交易日可用）"
+                            ),
                         )
                         try:
-                            result = sync_index_minute_history(
-                                start_date=task.date_range_start.isoformat(),
-                                end_date=task.date_range_end.isoformat(),
-                                symbols=index_symbols,
-                                account_key=None,
-                                data_source=task.data_source,
-                                progress_callback=index_progress_callback,
-                            )
+                            if task.data_source == "tdx":
+                                from api.services.tdx_market_data_service import sync_index_minute_history as sync_tdx_index_minute_history
+
+                                result = sync_tdx_index_minute_history(
+                                    start_date=task.date_range_start.isoformat(),
+                                    end_date=task.date_range_end.isoformat(),
+                                    symbols=index_symbols,
+                                    progress_callback=index_progress_callback,
+                                )
+                            else:
+                                result = sync_index_minute_history(
+                                    start_date=task.date_range_start.isoformat(),
+                                    end_date=task.date_range_end.isoformat(),
+                                    symbols=index_symbols,
+                                    account_key=None,
+                                    data_source=task.data_source,
+                                    progress_callback=index_progress_callback,
+                                )
                         except Exception as exc:
                             result = {"success": False, "error": str(exc), "rows": 0}
 
@@ -2065,7 +2360,8 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                             success_count += len(result.get('symbols') or []) or 1
                         else:
                             error_count += 1
-                            logger.error(f"QMT 指数1分钟K线下载失败: {result.get('error', '未知错误')}")
+                            specific_error_message = result.get('error') or "指数1分钟K线同步未写入记录"
+                            logger.error(f"指数1分钟K线下载失败: {specific_error_message}")
 
                         with get_db_ctx() as db_update:
                             db_update.execute(text("""
@@ -2080,7 +2376,7 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                                 "progress": 100 if result.get('success') else 0,
                                 "records": total_records,
                                 "error_message": (
-                                    f"QMT 指数分钟线同步完成，区间记录约 {total_records} 条；缺失指数: {','.join(result.get('missing_symbols') or []) or '无'}"
+                                    f"{task.data_source.upper()} 指数分钟线同步完成，区间记录约 {total_records} 条；缺失指数: {','.join(result.get('missing_symbols') or []) or '无'}"
                                     if result.get('success')
                                     else result.get('error')
                                 )
@@ -2093,8 +2389,8 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                         logger.info("使用量化课堂数据源下载筹码数据")
                         
                         try:
-                            quantclass_api_key = '2HUTNZYOSRA8X5Z7TY2VZGKNTX5UN28B'
-                            quantclass_hid = '1ad9e296ad8d3816b9bce5cba86b1ff6'
+                            quantclass_api_key = os.getenv("QUANTCLASS_API_KEY", "2HUTNZYOSRA8X5Z7TY2VZGKNTX5UN28B")
+                            quantclass_hid = os.getenv("QUANTCLASS_HID", "1ad9e296ad8d3816b9bce5cba86b1ff6")
                             
                             qc_downloader = QuantClassDownloader(quantclass_api_key, quantclass_hid)
                             download_result = qc_downloader.download_product('stock-chip-distribution')
@@ -2126,8 +2422,8 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                         logger.info("使用量化课堂数据源下载财务数据")
                         
                         try:
-                            quantclass_api_key = '2HUTNZYOSRA8X5Z7TY2VZGKNTX5UN28B'
-                            quantclass_hid = '1ad9e296ad8d3816b9bce5cba86b1ff6'
+                            quantclass_api_key = os.getenv("QUANTCLASS_API_KEY", "2HUTNZYOSRA8X5Z7TY2VZGKNTX5UN28B")
+                            quantclass_hid = os.getenv("QUANTCLASS_HID", "1ad9e296ad8d3816b9bce5cba86b1ff6")
                             
                             qc_downloader = QuantClassDownloader(quantclass_api_key, quantclass_hid)
                             download_result = qc_downloader.download_product('stock-fin-pre-data-sina')
@@ -2204,10 +2500,14 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
 
                     subscription_config_id = getattr(task, "subscription_config_id", None)
                     if subscription_config_id:
+                        task_scope = str(getattr(task, "task_scope", None) or "primary")
                         scope_key = "all"
                         task_symbols = list(task.symbols or [])
                         if task_symbols:
                             scope_key = "symbols:" + ",".join(sorted({str(item).strip().upper() for item in task_symbols if str(item).strip()})[:200])
+                        watermark_data_type = task.task_type
+                        if task_scope == "daily_enrichment" and task.task_type == "daily_kline":
+                            watermark_data_type = "daily_kline_enrichment"
 
                         watermark_existing = db.execute(text("""
                             SELECT id
@@ -2221,18 +2521,22 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                         """), {
                             "user_id": str(task.user_id),
                             "config_id": int(subscription_config_id),
-                            "data_type": task.task_type,
+                            "data_type": watermark_data_type,
                             "data_source": str(task.data_source or ""),
                             "scope_key": scope_key,
                         }).fetchone()
+                        watermark_last_data_date = actual_last_data_date
+                        if task_scope == "daily_enrichment" and task.task_type == "daily_kline":
+                            watermark_last_data_date = task.date_range_end
+
                         watermark_payload = {
                             "user_id": str(task.user_id),
                             "config_id": int(subscription_config_id),
-                            "data_type": task.task_type,
+                            "data_type": watermark_data_type,
                             "data_source": str(task.data_source or ""),
                             "scope_key": scope_key,
                             "last_run_started_at": datetime.utcnow(),
-                            "last_data_date": actual_last_data_date if final_status == "completed" else None,
+                            "last_data_date": watermark_last_data_date if final_status == "completed" else None,
                             "last_success_at": datetime.utcnow() if final_status == "completed" else None,
                             "last_status": final_status,
                             "last_error": final_error_message if final_status != "completed" else None,
@@ -2293,7 +2597,7 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                         # 确定表名
                         table_name = 'stock_daily_kline'
                         if task.task_type == 'index_data':
-                            table_name = 'index_daily_data'
+                            table_name = 'index_daily_kline'
                         elif task.task_type == 'minute_kline':
                             table_name = 'stock_minute_kline'
                         elif task.task_type == 'index_minute_kline':
@@ -2466,15 +2770,15 @@ def generate_quality_report(
         # 检查指数数据（如果表存在）
         try:
             index_result = quality_manager.validate_database_integrity(
-                db, "index_daily_data", "index_data"
+                db, "index_daily_kline", "index_data"
             )
-            report["tables"]["index_daily_data"] = {
+            report["tables"]["index_daily_kline"] = {
                 "valid": index_result['valid'],
                 "issues": index_result['issues'],
                 "stats": index_result['stats']
             }
         except:
-            report["tables"]["index_daily_data"] = {
+            report["tables"]["index_daily_kline"] = {
                 "valid": False,
                 "issues": ["表不存在"],
                 "stats": {}

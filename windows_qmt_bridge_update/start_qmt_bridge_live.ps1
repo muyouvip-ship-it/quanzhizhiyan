@@ -19,7 +19,10 @@ if (-not $env:QMT_BRIDGE_ROLE) {
     $env:QMT_BRIDGE_ROLE = "live"
 }
 if (-not $env:QMT_BRIDGE_ALLOW_TRADING) {
-    $env:QMT_BRIDGE_ALLOW_TRADING = "0"
+    $env:QMT_BRIDGE_ALLOW_TRADING = "1"
+}
+if (-not $env:QMT_BRIDGE_ACCOUNT_KEY) {
+    $env:QMT_BRIDGE_ACCOUNT_KEY = "live_real"
 }
 
 Write-Host "=========================================="
@@ -30,6 +33,7 @@ Write-Host "QMT_BRIDGE_HOST=$env:QMT_BRIDGE_HOST"
 Write-Host "QMT_BRIDGE_PORT=$env:QMT_BRIDGE_PORT"
 Write-Host "QMT_BRIDGE_ROLE=$env:QMT_BRIDGE_ROLE"
 Write-Host "QMT_BRIDGE_ALLOW_TRADING=$env:QMT_BRIDGE_ALLOW_TRADING"
+Write-Host "QMT_BRIDGE_ACCOUNT_KEY=$env:QMT_BRIDGE_ACCOUNT_KEY"
 Write-Host "=========================================="
 
 if (-not (Test-Path -Path $env:QMT_USERDATA_PATH)) {

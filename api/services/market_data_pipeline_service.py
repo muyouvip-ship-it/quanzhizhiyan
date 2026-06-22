@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 DAILY_RAW_TABLES = {
     "postgresql": "raw_stock_daily_kline_postgresql",
     "quantclass": "raw_stock_daily_kline_quantclass",
+    "tdx": "raw_stock_daily_kline_tdx",
     "akshare": "raw_stock_daily_kline_akshare",
     "baostock": "raw_stock_daily_kline_baostock",
     "efinance": "raw_stock_daily_kline_efinance",
@@ -30,10 +31,21 @@ MINUTE_RAW_TABLES = {
     "tdx": "raw_stock_minute_kline_tdx",
     "akshare": "raw_stock_minute_kline_akshare",
 }
-DAILY_SOURCE_PRIORITY = {"quantclass": 110, "akshare": 100, "baostock": 80, "postgresql": 70, "efinance": 60}
+DAILY_SOURCE_PRIORITY = {"tdx": 110, "quantclass": 105, "akshare": 100, "baostock": 80, "postgresql": 70, "efinance": 60}
+DAILY_ENRICHMENT_FIELDS = (
+    "pre_close",
+    "float_market_cap",
+    "total_market_cap",
+    "net_profit_ttm",
+    "sw_industry_l1",
+    "sw_industry_l2",
+    "sw_industry_l3",
+)
 MINUTE_SOURCE_PRIORITY = {"qmt": 100, "tdx": 90, "postgresql": 70, "akshare": 50}
 MINUTE_EXPECTED_BARS = 240
 MINUTE_PUBLISH_MIN_RATIO = 0.98
+MINUTE_PUBLISH_BATCH_SYMBOLS = max(int(os.getenv("MINUTE_PUBLISH_BATCH_SYMBOLS", "300") or 300), 1)
+MINUTE_LEGACY_SYNC_BATCH_SYMBOLS = max(int(os.getenv("MINUTE_LEGACY_SYNC_BATCH_SYMBOLS", "300") or 300), 1)
 FINAL_DAILY_KLINE_TABLE = "stock_daily_kline"
 FINAL_MINUTE_KLINE_TABLE = "stock_minute_kline"
 
@@ -83,6 +95,7 @@ def ingest_raw_daily_rows(
     table_name = DAILY_RAW_TABLES.get(normalized_source)
     if not table_name:
         return {"success": False, "rows": 0, "error": f"unsupported daily raw source: {source}"}
+    _ensure_pipeline_table(table_name)
     payload, trade_dates = _normalize_daily_rows(rows, source=normalized_source, batch_id=batch_id or uuid4().hex)
     if not payload:
         return {"success": False, "rows": 0, "error": "empty daily rows"}
@@ -218,6 +231,7 @@ def ingest_raw_minute_rows(
     table_name = MINUTE_RAW_TABLES.get(normalized_source)
     if not table_name:
         return {"success": False, "rows": 0, "error": f"unsupported minute raw source: {source}"}
+    _ensure_pipeline_table(table_name)
     payload, trade_dates = _normalize_minute_rows(rows, source=normalized_source, batch_id=batch_id or uuid4().hex)
     if not payload:
         return {"success": False, "rows": 0, "error": "empty minute rows"}
@@ -320,6 +334,73 @@ def publish_minute_trade_date(
     }
 
 
+def publish_minute_trade_date_batched(
+    *,
+    trade_date: date | str,
+    symbols: list[str] | None = None,
+    minimum_coverage_ratio: float = MINUTE_PUBLISH_MIN_RATIO,
+    batch_size: int | None = None,
+) -> dict[str, Any]:
+    normalized_trade_date = _normalize_trade_date(trade_date)
+    if normalized_trade_date is None:
+        return {"success": False, "published_count": 0, "warning_count": 0, "missing_count": 0, "error": "invalid trade_date"}
+
+    canonical_symbols = _canonical_symbols(symbols or [])
+    if not canonical_symbols:
+        canonical_symbols = _load_minute_trade_date_symbols(normalized_trade_date)
+        if not canonical_symbols:
+            return {
+                "success": True,
+                "published_count": 0,
+                "warning_count": 0,
+                "missing_count": 0,
+                "batches": 0,
+                "batch_size": max(int(batch_size or MINUTE_PUBLISH_BATCH_SYMBOLS), 1),
+            }
+
+    effective_batch_size = max(int(batch_size or MINUTE_PUBLISH_BATCH_SYMBOLS), 1)
+    if len(canonical_symbols) <= effective_batch_size:
+        return publish_minute_trade_date(
+            trade_date=normalized_trade_date,
+            symbols=canonical_symbols,
+            minimum_coverage_ratio=minimum_coverage_ratio,
+        )
+
+    published_count = 0
+    warning_count = 0
+    missing_count = 0
+    batches = 0
+    for index in range(0, len(canonical_symbols), effective_batch_size):
+        batches += 1
+        batch = canonical_symbols[index:index + effective_batch_size]
+        result = publish_minute_trade_date(
+            trade_date=normalized_trade_date,
+            symbols=batch,
+            minimum_coverage_ratio=minimum_coverage_ratio,
+        )
+        if not result.get("success"):
+            return {
+                "success": False,
+                "published_count": published_count,
+                "warning_count": warning_count,
+                "missing_count": missing_count,
+                "batches": batches,
+                "error": result.get("error") or "minute publish batch failed",
+            }
+        published_count += int(result.get("published_count") or 0)
+        warning_count += int(result.get("warning_count") or 0)
+        missing_count += int(result.get("missing_count") or 0)
+
+    return {
+        "success": True,
+        "published_count": published_count,
+        "warning_count": warning_count,
+        "missing_count": missing_count,
+        "batches": batches,
+        "batch_size": effective_batch_size,
+    }
+
+
 def sync_legacy_minute_to_raw(
     *,
     source: str,
@@ -332,34 +413,116 @@ def sync_legacy_minute_to_raw(
         return {"success": False, "rows": 0}
 
     query_symbols = _normalize_symbols(symbols or [])
+    start_dt = datetime.combine(normalized_trade_date, time.min)
+    end_dt = datetime.combine(normalized_trade_date + timedelta(days=1), time.min)
+    if not query_symbols:
+        canonical_symbols = _load_legacy_minute_symbols(normalized_trade_date)
+        if len(canonical_symbols) > MINUTE_LEGACY_SYNC_BATCH_SYMBOLS:
+            total_rows = 0
+            trade_dates: set[date] = set()
+            batches = 0
+            for index in range(0, len(canonical_symbols), MINUTE_LEGACY_SYNC_BATCH_SYMBOLS):
+                batches += 1
+                batch = canonical_symbols[index:index + MINUTE_LEGACY_SYNC_BATCH_SYMBOLS]
+                result = sync_legacy_minute_to_raw(source=source, trade_date=normalized_trade_date, symbols=batch)
+                if not result.get("success"):
+                    return {
+                        "success": False,
+                        "rows": total_rows,
+                        "batches": batches,
+                        "error": result.get("error") or "legacy minute sync batch failed",
+                    }
+                total_rows += int(result.get("rows") or 0)
+                trade_dates.update(_normalize_trade_date(item) for item in result.get("trade_dates") or [] if _normalize_trade_date(item))
+            return {
+                "success": total_rows > 0,
+                "rows": total_rows,
+                "trade_dates": [item.isoformat() for item in sorted(trade_dates)],
+                "batches": batches,
+                "batch_size": MINUTE_LEGACY_SYNC_BATCH_SYMBOLS,
+            }
+
     with SessionLocal() as db:
         if query_symbols:
             statement = text(
                 """
                 SELECT symbol, trade_time, open, high, low, close, volume, amount
                 FROM stock_minute_kline
-                WHERE DATE(trade_time) = :trade_date
+                WHERE trade_time >= :start_dt
+                  AND trade_time < :end_dt
                   AND symbol IN :symbols
                 ORDER BY symbol, trade_time
                 """
             ).bindparams(bindparam("symbols", expanding=True))
-            rows = db.execute(statement, {"trade_date": normalized_trade_date, "symbols": query_symbols}).mappings().all()
+            rows = db.execute(
+                statement,
+                {"start_dt": start_dt, "end_dt": end_dt, "symbols": query_symbols},
+            ).mappings().all()
         else:
             rows = db.execute(
                 text(
                     """
                     SELECT symbol, trade_time, open, high, low, close, volume, amount
                     FROM stock_minute_kline
-                    WHERE DATE(trade_time) = :trade_date
+                    WHERE trade_time >= :start_dt
+                      AND trade_time < :end_dt
                     ORDER BY symbol, trade_time
                     """
                 ),
-                {"trade_date": normalized_trade_date},
+                {"start_dt": start_dt, "end_dt": end_dt},
             ).mappings().all()
     result = ingest_raw_minute_rows(source=source, rows=[dict(row) for row in rows])
     if result.get("success"):
-        publish_minute_trade_date(trade_date=normalized_trade_date, symbols=query_symbols or None, minimum_coverage_ratio=0.0)
+        affected_symbols = _canonical_symbols([str(row["symbol"]) for row in rows if row.get("symbol")])
+        publish_minute_trade_date_batched(
+            trade_date=normalized_trade_date,
+            symbols=affected_symbols or query_symbols or None,
+            minimum_coverage_ratio=0.0,
+        )
     return result
+
+
+def _load_legacy_minute_symbols(trade_date: date) -> list[str]:
+    start_dt = datetime.combine(trade_date, time.min)
+    end_dt = datetime.combine(trade_date + timedelta(days=1), time.min)
+    with SessionLocal() as db:
+        rows = db.execute(
+            text(
+                """
+                SELECT DISTINCT symbol
+                FROM stock_minute_kline
+                WHERE trade_time >= :start_dt
+                  AND trade_time < :end_dt
+                  AND symbol IS NOT NULL
+                  AND symbol <> ''
+                ORDER BY symbol
+                """
+            ),
+            {"start_dt": start_dt, "end_dt": end_dt},
+        ).fetchall()
+    return _canonical_symbols([str(row[0]) for row in rows])
+
+
+def _load_minute_trade_date_symbols(trade_date: date) -> list[str]:
+    symbols: set[str] = set()
+    with engine.connect() as conn:
+        for table_name in MINUTE_RAW_TABLES.values():
+            if not _has_table(table_name):
+                continue
+            rows = conn.execute(
+                text(
+                    f"""
+                    SELECT DISTINCT symbol
+                    FROM {table_name}
+                    WHERE trade_date = :trade_date
+                      AND symbol IS NOT NULL
+                      AND symbol <> ''
+                    """
+                ),
+                {"trade_date": trade_date},
+            ).fetchall()
+            symbols.update(str(row[0]) for row in rows if row[0])
+    return _canonical_symbols(list(symbols))
 
 
 def get_market_data_publish_status(
@@ -544,18 +707,19 @@ def _select_daily_candidate(items: list[dict[str, Any]]) -> tuple[dict[str, Any]
         return None, "missing_or_conflicted", "invalid", issues, {"sources": [str(item.get("source") or "") for item in items]}
 
     valid_items.sort(key=lambda item: DAILY_SOURCE_PRIORITY.get(str(item.get("source") or ""), 0), reverse=True)
-    selected = valid_items[0]
+    base = valid_items[0]
+    selected = _merge_daily_enrichment_fields(base, valid_items)
     source_summary = {
         "sources": [str(item.get("source") or "") for item in items],
-        "selected_source": str(selected.get("source") or ""),
+        "selected_source": str(base.get("source") or ""),
+        "enrichment_sources": _daily_enrichment_sources(base, selected),
         "comparisons": {},
     }
     warning = False
-    selected_source = str(selected.get("source") or "")
-    selected_signature = _daily_numeric_signature(selected)
+    selected_source = str(base.get("source") or "")
     for item in valid_items[1:]:
         source = str(item.get("source") or "")
-        diffs = _daily_diff_summary(selected, item)
+        diffs = _daily_diff_summary(base, item)
         source_summary["comparisons"][source] = diffs
         if diffs["price_diff_max"] > 0.011 or diffs["volume_ratio_diff"] > 0.15 or diffs["amount_ratio_diff"] > 0.15:
             warning = True
@@ -563,6 +727,43 @@ def _select_daily_candidate(items: list[dict[str, Any]]) -> tuple[dict[str, Any]
     publish_status = "published_with_warning" if warning else "published"
     quality_status = "warning" if warning else "validated"
     return selected, publish_status, quality_status, issues, source_summary
+
+
+def _merge_daily_enrichment_fields(base: dict[str, Any], candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    selected = dict(base)
+    selected["_field_sources"] = {"base": str(base.get("source") or "")}
+    for field in DAILY_ENRICHMENT_FIELDS:
+        if _daily_field_has_value(field, selected.get(field)):
+            continue
+        for item in candidates:
+            value = item.get(field)
+            if not _daily_field_has_value(field, value):
+                continue
+            selected[field] = value
+            selected["_field_sources"][field] = str(item.get("source") or "")
+            break
+    return selected
+
+
+def _daily_enrichment_sources(base: dict[str, Any], selected: dict[str, Any]) -> dict[str, str]:
+    base_source = str(base.get("source") or "")
+    field_sources = dict(selected.get("_field_sources") or {})
+    return {
+        field: source
+        for field, source in field_sources.items()
+        if field != "base" and source and source != base_source
+    }
+
+
+def _daily_field_has_value(field: str, value: Any) -> bool:
+    if field.startswith("sw_industry"):
+        return bool(_safe_text(value))
+    number = _safe_float(value)
+    if number is None:
+        return False
+    if field in {"pre_close", "float_market_cap", "total_market_cap"}:
+        return number > 0
+    return True
 
 
 def _compose_minute_symbol_rows(
@@ -1529,6 +1730,15 @@ def _normalize_symbols(values: list[str]) -> list[str]:
     return sorted(set(result))
 
 
+def _canonical_symbols(values: list[str]) -> list[str]:
+    result: set[str] = set()
+    for value in values:
+        normalized = _normalize_symbol(value)
+        if normalized:
+            result.add(normalized)
+    return sorted(result)
+
+
 
 
 def _safe_text(value: Any) -> str | None:
@@ -1560,6 +1770,17 @@ def _has_table(table_name: str) -> bool:
         return inspect(engine).has_table(table_name)
     except Exception:
         return False
+
+
+def _ensure_pipeline_table(table_name: str) -> None:
+    if _has_table(table_name):
+        return
+    try:
+        from api.database import _ensure_market_data_pipeline_schema
+
+        _ensure_market_data_pipeline_schema()
+    except Exception as exc:
+        logger.warning("[market-data-pipeline] ensure schema failed table=%s error=%s", table_name, exc)
 
 
 def _table_has_rows(table_name: str) -> bool:

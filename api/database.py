@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timezone
 from typing import Generator
 
-from sqlalchemy import Boolean, create_engine, Column, String, DateTime, Text, Integer, Float, JSON, UniqueConstraint, event, inspect, text
+from sqlalchemy import Boolean, create_engine, Column, Date, String, DateTime, Text, Integer, Float, JSON, UniqueConstraint, event, inspect, text
 from sqlalchemy import inspection
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
@@ -264,6 +264,8 @@ def _ensure_market_data_schema() -> None:
                 index_daily_columns = {column["name"] for column in current_inspector.get_columns("index_daily_kline")}
                 if "source" not in index_daily_columns:
                     conn.execute(text("ALTER TABLE index_daily_kline ADD COLUMN source VARCHAR(32) DEFAULT 'qmt'"))
+                else:
+                    conn.execute(text("ALTER TABLE index_daily_kline ALTER COLUMN source TYPE VARCHAR(32)"))
                 if "created_at" not in index_daily_columns:
                     conn.execute(text("ALTER TABLE index_daily_kline ADD COLUMN created_at TIMESTAMP DEFAULT NOW()"))
                 if "updated_at" not in index_daily_columns:
@@ -291,6 +293,7 @@ def _ensure_market_data_pipeline_schema() -> None:
             daily_raw_tables = [
                 "raw_stock_daily_kline_postgresql",
                 "raw_stock_daily_kline_quantclass",
+                "raw_stock_daily_kline_tdx",
                 "raw_stock_daily_kline_akshare",
                 "raw_stock_daily_kline_baostock",
                 "raw_stock_daily_kline_efinance",
@@ -356,6 +359,7 @@ def _ensure_market_data_pipeline_schema() -> None:
                 """))
                 conn.execute(text(f"CREATE UNIQUE INDEX IF NOT EXISTS uq_{table_name}_symbol_time ON {table_name}(symbol, trade_time)"))
                 conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_trade_date ON {table_name}(trade_date)"))
+                conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_trade_date_symbol ON {table_name}(trade_date, symbol)"))
 
             conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS norm_stock_daily_kline (
@@ -406,6 +410,7 @@ def _ensure_market_data_pipeline_schema() -> None:
             """))
             conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_norm_stock_minute_source_symbol_time ON norm_stock_minute_kline(source, symbol, trade_time)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_norm_stock_minute_trade_date ON norm_stock_minute_kline(trade_date)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_norm_stock_minute_trade_date_symbol ON norm_stock_minute_kline(trade_date, symbol)"))
 
             conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS pub_stock_daily_kline (
@@ -463,6 +468,7 @@ def _ensure_market_data_pipeline_schema() -> None:
             """))
             conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_pub_stock_minute_symbol_time ON pub_stock_minute_kline(symbol, trade_time)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_pub_stock_minute_trade_date ON pub_stock_minute_kline(trade_date)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_pub_stock_minute_trade_date_symbol ON pub_stock_minute_kline(trade_date, symbol)"))
 
             conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS daily_kline_reconciliation_runs (
@@ -913,6 +919,7 @@ def _ensure_backtest_data_schema() -> None:
                     error_message TEXT,
                     subscription_config_id INTEGER,
                     trigger_mode VARCHAR(20) DEFAULT 'manual',
+                    task_scope VARCHAR(50) DEFAULT 'primary',
                     created_at TIMESTAMP DEFAULT NOW(),
                     updated_at TIMESTAMP DEFAULT NOW(),
                     completed_at TIMESTAMP
@@ -926,10 +933,10 @@ def _ensure_backtest_data_schema() -> None:
                     enabled_data_types TEXT[] NOT NULL DEFAULT '{}',
                     default_date_range_days INTEGER DEFAULT 365,
                     default_symbols TEXT[] DEFAULT '{}',
-                    data_source_preference VARCHAR(100) DEFAULT 'akshare',
+                    data_source_preference VARCHAR(100) DEFAULT 'tdx',
                     auto_download BOOLEAN DEFAULT FALSE,
                     update_frequency VARCHAR(20),
-                    schedule_time VARCHAR(8) DEFAULT '18:30',
+                    schedule_time VARCHAR(8) DEFAULT '15:05',
                     timezone VARCHAR(64) DEFAULT 'Asia/Shanghai',
                     only_trading_day BOOLEAN DEFAULT TRUE,
                     last_run_at TIMESTAMP,
@@ -1003,9 +1010,11 @@ def _ensure_backtest_data_schema() -> None:
                 conn.execute(text("ALTER TABLE backtest_data_tasks ADD COLUMN subscription_config_id INTEGER"))
             if "trigger_mode" not in task_columns:
                 conn.execute(text("ALTER TABLE backtest_data_tasks ADD COLUMN trigger_mode VARCHAR(20) DEFAULT 'manual'"))
+            if "task_scope" not in task_columns:
+                conn.execute(text("ALTER TABLE backtest_data_tasks ADD COLUMN task_scope VARCHAR(50) DEFAULT 'primary'"))
 
             if "schedule_time" not in config_columns:
-                conn.execute(text("ALTER TABLE backtest_data_configs ADD COLUMN schedule_time VARCHAR(8) DEFAULT '18:30'"))
+                conn.execute(text("ALTER TABLE backtest_data_configs ADD COLUMN schedule_time VARCHAR(8) DEFAULT '15:05'"))
             if "timezone" not in config_columns:
                 conn.execute(text("ALTER TABLE backtest_data_configs ADD COLUMN timezone VARCHAR(64) DEFAULT 'Asia/Shanghai'"))
             if "only_trading_day" not in config_columns:
@@ -1499,4 +1508,67 @@ class QmtAccountSnapshotDB(Base):
 
     __table_args__ = (
         UniqueConstraint('user_id', 'account_key', name='uq_qmt_account_snapshot_user_account'),
+    )
+
+
+class QmtAccountEquitySnapshotDB(Base):
+    """Persist daily latest QMT account equity snapshots for return statistics."""
+
+    __tablename__ = "qmt_account_equity_snapshots"
+
+    id = Column(String(36), primary_key=True)
+    user_id = Column(String(64), index=True, nullable=False)
+    account_key = Column(String(64), index=True, nullable=False)
+    role = Column(String(32), index=True, nullable=True)
+    account_id = Column(String(64), nullable=True)
+    snapshot_date = Column(Date, index=True, nullable=False)
+    total_asset = Column(Float, nullable=False, default=0.0)
+    market_value = Column(Float, nullable=False, default=0.0)
+    available_cash = Column(Float, nullable=False, default=0.0)
+    total_pnl = Column(Float, nullable=False, default=0.0)
+    total_pnl_pct = Column(Float, nullable=True)
+    today_pnl = Column(Float, nullable=False, default=0.0)
+    summary_json = Column(JSON, nullable=True)
+    fetched_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        UniqueConstraint('user_id', 'account_key', 'snapshot_date', name='uq_qmt_equity_snapshot_user_account_date'),
+    )
+
+
+class QmtAccountTradeHistoryDB(Base):
+    """Persist deduplicated QMT account trades for historical security lists."""
+
+    __tablename__ = "qmt_account_trade_history"
+
+    id = Column(String(36), primary_key=True)
+    user_id = Column(String(64), index=True, nullable=False)
+    account_key = Column(String(64), index=True, nullable=False)
+    role = Column(String(32), index=True, nullable=True)
+    account_id = Column(String(64), nullable=True)
+    trade_uid = Column(String(96), nullable=False)
+    trade_id = Column(String(128), nullable=True)
+    order_id = Column(String(128), nullable=True)
+    symbol = Column(String(32), index=True, nullable=False)
+    name = Column(String(128), nullable=True)
+    side = Column(String(32), nullable=True)
+    price = Column(Float, nullable=True)
+    quantity = Column(Float, nullable=True)
+    amount = Column(Float, nullable=True)
+    cost_price = Column(Float, nullable=True)
+    cost_basis = Column(Float, nullable=True)
+    realized_pnl = Column(Float, nullable=True)
+    realized_pnl_pct = Column(Float, nullable=True)
+    pnl_status = Column(String(32), nullable=True)
+    trade_time = Column(DateTime, nullable=True)
+    trade_date = Column(Date, index=True, nullable=True)
+    raw_json = Column(JSON, nullable=True)
+    fetched_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        UniqueConstraint('user_id', 'account_key', 'trade_uid', name='uq_qmt_trade_history_user_account_uid'),
     )

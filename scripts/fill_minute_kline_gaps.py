@@ -63,21 +63,22 @@ def normalize_symbol(raw: str) -> str:
     return s
 
 
-def find_gap_pairs(start_date: date, end_date: date) -> list[tuple[str, date, int]]:
-    """返回需要补齐的 (normalized_symbol, trade_date, market_code)。market: 0=SZ, 1=SH, -1=BJ"""
+def find_gap_pairs(start_date: date, end_date: date, *, min_bars: int = 240) -> list[tuple[str, date, int]]:
+    """返回需要补齐的 (normalized_symbol, trade_date, market_code)。market: 0=SZ, 1=SH, 2=BJ"""
     conn = psycopg2.connect(DB_URL)
     cur = conn.cursor()
     cur.execute("""
         SELECT DISTINCT d.symbol, d.trade_date
         FROM stock_daily_kline d
         LEFT JOIN (
-            SELECT symbol, trade_time::date AS td FROM stock_minute_kline
+            SELECT symbol, trade_time::date AS td, COUNT(*) AS bar_count FROM stock_minute_kline
             WHERE trade_time >= %s AND trade_time < %s
             GROUP BY symbol, trade_time::date
         ) m ON m.symbol = d.symbol AND m.td = d.trade_date
-        WHERE d.trade_date >= %s AND d.trade_date <= %s AND m.td IS NULL
+        WHERE d.trade_date >= %s AND d.trade_date <= %s
+          AND COALESCE(m.bar_count, 0) < %s
         ORDER BY d.symbol, d.trade_date
-    """, (start_date, end_date + timedelta(days=1), start_date, end_date))
+    """, (start_date, end_date + timedelta(days=1), start_date, end_date, min_bars))
     rows_raw = cur.fetchall()
     cur.close()
     conn.close()
@@ -131,13 +132,13 @@ def fetch_tdx_bars(market: int, code: str, num_pages: int = 5) -> list[tuple]:
 
 
 def process_gap_stock(args: tuple) -> tuple[str, int, int, str]:
-    """args: (symbol, market, start_dt_str, end_dt_str)"""
-    symbol, market, start_dt_str, end_dt_str = args
+    """args: (symbol, market, start_dt_str, end_dt_str, pages)"""
+    symbol, market, start_dt_str, end_dt_str, pages = args
     conn = None
     try:
         code = symbol.split(".")[0]
 
-        bars = fetch_tdx_bars(market, code, num_pages=5)
+        bars = fetch_tdx_bars(market, code, num_pages=pages)
         if not bars:
             return symbol, 0, 0, "no_data"
 
@@ -172,12 +173,14 @@ def main() -> int:
     parser.add_argument("--end-date", default="2026-06-05")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--limit", type=int, default=0, help="测试限制股票数")
+    parser.add_argument("--min-bars", type=int, default=240, help="低于该分钟数视为缺口，默认 240")
+    parser.add_argument("--pages", type=int, default=int(os.getenv("MINUTE_GAP_FILLER_TDX_PAGES", "5") or 5), help="TDX 每只股票拉取页数，每页 800 根")
     args = parser.parse_args()
 
     start_d = date.fromisoformat(args.start_date)
     end_d = date.fromisoformat(args.end_date)
 
-    gap_pairs = find_gap_pairs(start_d, end_d)
+    gap_pairs = find_gap_pairs(start_d, end_d, min_bars=max(int(args.min_bars or 240), 1))
     log.info("缺口 (symbol, trade_date) 对总数: %s", len(gap_pairs))
 
     tasks_map: OrderedDict[str, dict] = OrderedDict()
@@ -191,7 +194,7 @@ def main() -> int:
         symbols_needed = symbols_needed[:args.limit]
     log.info("需要补齐的股票数: %s (limit=%s)", len(symbols_needed), args.limit or "无限制")
 
-    tasks = [(sym, info["market"], start_d.isoformat(), end_d.isoformat())
+    tasks = [(sym, info["market"], start_d.isoformat(), end_d.isoformat(), max(int(args.pages or 5), 1))
              for sym, info in ((s, tasks_map[s]) for s in symbols_needed)]
 
     total_inserted = 0

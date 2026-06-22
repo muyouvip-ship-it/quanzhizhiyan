@@ -1,9 +1,90 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Serif+SC:wght@500;600;700&display=swap');
 @import "tailwindcss";
 @config "../tailwind.config.js";
 
 @layer base {
+  :root,
+  :root[data-skin="terminal"] {
+    --skin-bg: #0a0e14;
+    --skin-panel: #12171f;
+    --skin-card: #161c26;
+    --skin-input: #0f141d;
+    --skin-border: #1e293b;
+    --skin-border-soft: rgba(30, 41, 59, 0.64);
+    --skin-text: #c9d1d9;
+    --skin-muted: #8b949e;
+    --skin-dim: #484f58;
+    --skin-accent: #d2991d;
+    --skin-accent-strong: #f0c674;
+    --skin-accent-soft: rgba(210, 153, 29, 0.12);
+    --skin-green: #3fb950;
+    --skin-red: #f85149;
+    --skin-blue: #58a6ff;
+    --skin-blue-hover: #8cc8ff;
+    --skin-cyan: #39d2c0;
+    --skin-radius: 2px;
+    --skin-card-shadow: none;
+    --skin-font-body: 'JetBrains Mono', 'PingFang SC', 'Microsoft YaHei', monospace;
+    --skin-font-display: 'Noto Serif SC', 'Songti SC', serif;
+    --skin-body-bg:
+      linear-gradient(rgba(88, 166, 255, 0.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(88, 166, 255, 0.025) 1px, transparent 1px),
+      var(--skin-bg);
+    --skin-body-bg-size: 28px 28px;
+  }
+
+  :root[data-skin="classic"] {
+    --skin-bg: #f8fafc;
+    --skin-panel: #ffffff;
+    --skin-card: #ffffff;
+    --skin-input: #ffffff;
+    --skin-border: #e2e8f0;
+    --skin-border-soft: rgba(226, 232, 240, 0.78);
+    --skin-text: #0f172a;
+    --skin-muted: #64748b;
+    --skin-dim: #94a3b8;
+    --skin-accent: #2563eb;
+    --skin-accent-strong: #1d4ed8;
+    --skin-accent-soft: rgba(37, 99, 235, 0.1);
+    --skin-green: #16a34a;
+    --skin-red: #dc2626;
+    --skin-blue: #2563eb;
+    --skin-blue-hover: #1d4ed8;
+    --skin-cyan: #7c3aed;
+    --skin-radius: 12px;
+    --skin-card-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
+    --skin-font-body: 'Inter', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    --skin-font-display: 'Inter', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    --skin-body-bg:
+      radial-gradient(900px 420px at 15% -10%, rgba(191, 219, 254, 0.72), transparent 48%),
+      linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%);
+    --skin-body-bg-size: auto;
+  }
+
+  :root.dark[data-skin="classic"] {
+    --skin-bg: #020617;
+    --skin-panel: #0f172a;
+    --skin-card: rgba(30, 41, 59, 0.8);
+    --skin-input: #1e293b;
+    --skin-border: #334155;
+    --skin-border-soft: rgba(51, 65, 85, 0.78);
+    --skin-text: #f1f5f9;
+    --skin-muted: #94a3b8;
+    --skin-dim: #64748b;
+    --skin-accent: #3b82f6;
+    --skin-accent-strong: #60a5fa;
+    --skin-accent-soft: rgba(59, 130, 246, 0.16);
+    --skin-green: #22c55e;
+    --skin-red: #ef4444;
+    --skin-blue: #60a5fa;
+    --skin-blue-hover: #93c5fd;
+    --skin-cyan: #a78bfa;
+    --skin-card-shadow: 0 12px 32px rgba(0, 0, 0, 0.24);
+    --skin-body-bg: linear-gradient(135deg, #0f172a 0%, #111827 58%, #1e293b 100%);
+  }
+
   * {
-    @apply border-slate-200 dark:border-slate-700;
+    border-color: var(--skin-border);
   }
 
   html {
@@ -11,8 +92,11 @@
   }
 
   body {
-    @apply bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100;
-    font-family: 'Inter', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    background: var(--skin-body-bg);
+    background-size: var(--skin-body-bg-size);
+    color: var(--skin-text);
+    font-family: var(--skin-font-body);
+    font-feature-settings: "tnum";
   }
 
   ::-webkit-scrollbar {
@@ -21,15 +105,16 @@
   }
 
   ::-webkit-scrollbar-track {
-    @apply bg-slate-100 dark:bg-slate-800 rounded;
+    background: var(--skin-panel);
   }
 
   ::-webkit-scrollbar-thumb {
-    @apply bg-slate-300 dark:bg-slate-600 rounded-full;
+    background: #303946;
+    border-radius: 999px;
   }
 
   ::-webkit-scrollbar-thumb:hover {
-    @apply bg-slate-400 dark:bg-slate-500;
+    background: #465160;
   }
 }
 
@@ -46,26 +131,35 @@
 
   /* 卡片样式 - 亮色/暗色适配 */
   .card {
-    @apply bg-white dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-xl p-4;
-    @apply shadow-sm dark:shadow-lg;
+    background: var(--skin-card);
+    border: 1px solid var(--skin-border);
+    border-radius: var(--skin-radius);
+    padding: 1rem;
+    box-shadow: var(--skin-card-shadow);
   }
 
   .card-hover {
-    @apply transition-all duration-300;
+    @apply transition-all duration-200;
   }
 
   .card-hover:hover {
-    @apply border-blue-400 dark:border-blue-500/50;
-    @apply shadow-md dark:shadow-blue-500/10;
-    transform: translateY(-2px);
+    border-color: color-mix(in srgb, var(--skin-accent) 72%, transparent);
+    background: color-mix(in srgb, var(--skin-card) 92%, var(--skin-accent) 8%);
   }
 
   /* 按钮样式 */
   .btn-primary {
-    @apply px-4 py-2 rounded-lg font-medium text-white transition-all duration-200;
-    @apply bg-gradient-to-r from-blue-500 to-blue-600;
-    @apply hover:from-blue-600 hover:to-blue-700;
-    @apply shadow-md hover:shadow-lg;
+    @apply px-4 py-2 font-semibold transition-all duration-200;
+    border: 1px solid color-mix(in srgb, var(--skin-accent) 62%, transparent);
+    border-radius: var(--skin-radius);
+    background: var(--skin-accent-soft);
+    color: var(--skin-accent-strong);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  }
+
+  .btn-primary:hover {
+    background: color-mix(in srgb, var(--skin-accent-soft) 80%, var(--skin-accent) 20%);
+    border-color: var(--skin-accent);
   }
 
   .btn-primary:disabled {
@@ -74,67 +168,137 @@
   }
 
   .btn-secondary {
-    @apply px-4 py-2 rounded-lg font-medium transition-all duration-200;
-    @apply bg-slate-100 text-slate-700 border border-slate-300;
-    @apply dark:bg-slate-700 dark:text-slate-200 dark:border-slate-600;
-    @apply hover:bg-slate-200 dark:hover:bg-slate-600;
+    @apply px-4 py-2 font-medium transition-all duration-200;
+    border: 1px solid var(--skin-border);
+    border-radius: var(--skin-radius);
+    background: var(--skin-panel);
+    color: var(--skin-text);
+  }
+
+  .btn-secondary:hover {
+    border-color: var(--skin-muted);
+    background: color-mix(in srgb, var(--skin-panel) 88%, var(--skin-accent) 12%);
   }
 
   /* 输入框 */
   .input {
-    @apply px-3 py-2 rounded-lg transition-all duration-200;
-    @apply bg-white dark:bg-slate-800;
-    @apply text-slate-900 dark:text-slate-100;
-    @apply placeholder:text-slate-400 dark:placeholder:text-slate-500;
-    @apply border border-slate-300 dark:border-slate-600;
-    @apply focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500;
+    @apply px-3 py-2 transition-all duration-200;
+    border: 1px solid var(--skin-border);
+    border-radius: var(--skin-radius);
+    background: var(--skin-input);
+    color: var(--skin-text);
+  }
+
+  .input::placeholder {
+    color: var(--skin-dim);
+  }
+
+  .input:focus {
+    border-color: var(--skin-accent);
+    box-shadow: 0 0 0 2px var(--skin-accent-soft);
+    outline: none;
   }
 
   /* 标签样式 */
   .badge-green {
-    @apply badge bg-green-100 text-green-700 dark:bg-green-500/20 dark:text-green-400;
-    @apply border border-green-200 dark:border-green-500/30;
+    @apply badge;
+    background: color-mix(in srgb, var(--skin-green) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--skin-green) 34%, transparent);
+    color: var(--skin-green);
   }
 
   .badge-red {
-    @apply badge bg-red-100 text-red-700 dark:bg-red-500/20 dark:text-red-400;
-    @apply border border-red-200 dark:border-red-500/30;
+    @apply badge;
+    background: color-mix(in srgb, var(--skin-red) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--skin-red) 34%, transparent);
+    color: var(--skin-red);
   }
 
   .badge-blue {
-    @apply badge bg-blue-100 text-blue-700 dark:bg-blue-500/20 dark:text-blue-400;
-    @apply border border-blue-200 dark:border-blue-500/30;
+    @apply badge;
+    background: color-mix(in srgb, var(--skin-blue) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--skin-blue) 34%, transparent);
+    color: var(--skin-blue);
   }
 
   .badge-orange {
-    @apply badge bg-orange-100 text-orange-700 dark:bg-orange-500/20 dark:text-orange-400;
-    @apply border border-orange-200 dark:border-orange-500/30;
+    @apply badge;
+    background: var(--skin-accent-soft);
+    border: 1px solid color-mix(in srgb, var(--skin-accent) 34%, transparent);
+    color: var(--skin-accent);
   }
 
   .badge-purple {
-    @apply badge bg-purple-100 text-purple-700 dark:bg-purple-500/20 dark:text-purple-400;
-    @apply border border-purple-200 dark:border-purple-500/30;
+    @apply badge;
+    background: color-mix(in srgb, var(--skin-cyan) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--skin-cyan) 30%, transparent);
+    color: var(--skin-cyan);
   }
 
   /* 渐变文字 */
   .text-gradient {
-    @apply bg-clip-text text-transparent bg-gradient-to-r from-blue-500 via-purple-500 to-cyan-400;
+    color: var(--skin-accent);
   }
 
   /* 状态指示器 */
   .status-dot-green {
-    @apply status-dot bg-green-500;
-    box-shadow: 0 0 8px rgba(34, 197, 94, 0.6);
+    @apply status-dot;
+    background: var(--skin-green);
+    box-shadow: 0 0 8px rgba(63, 185, 80, 0.6);
   }
 
   .status-dot-blue {
-    @apply status-dot bg-blue-500;
-    box-shadow: 0 0 8px rgba(59, 130, 246, 0.6);
+    @apply status-dot;
+    background: var(--skin-blue);
+    box-shadow: 0 0 8px rgba(88, 166, 255, 0.6);
   }
 
   .status-dot-orange {
-    @apply status-dot bg-orange-500;
-    box-shadow: 0 0 8px rgba(249, 115, 22, 0.6);
+    @apply status-dot;
+    background: var(--skin-accent);
+    box-shadow: 0 0 8px rgba(210, 153, 29, 0.6);
+  }
+
+  .skin-display {
+    font-family: var(--skin-font-display);
+  }
+
+  .skin-link {
+    color: var(--skin-blue);
+  }
+
+  .skin-link:hover {
+    color: var(--skin-blue-hover);
+  }
+
+  .tone-blue {
+    background: color-mix(in srgb, var(--skin-blue) 10%, transparent);
+    border-color: color-mix(in srgb, var(--skin-blue) 35%, transparent);
+    color: var(--skin-blue);
+  }
+
+  .tone-green {
+    background: color-mix(in srgb, var(--skin-green) 10%, transparent);
+    border-color: color-mix(in srgb, var(--skin-green) 35%, transparent);
+    color: var(--skin-green);
+  }
+
+  .tone-orange {
+    background: var(--skin-accent-soft);
+    border-color: color-mix(in srgb, var(--skin-accent) 35%, transparent);
+    color: var(--skin-accent);
+  }
+
+  .tone-purple {
+    background: color-mix(in srgb, var(--skin-cyan) 10%, transparent);
+    border-color: color-mix(in srgb, var(--skin-cyan) 35%, transparent);
+    color: var(--skin-cyan);
+  }
+
+  .tone-red {
+    background: color-mix(in srgb, var(--skin-red) 10%, transparent);
+    border-color: color-mix(in srgb, var(--skin-red) 35%, transparent);
+    color: var(--skin-red);
   }
 }
 

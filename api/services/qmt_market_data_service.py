@@ -16,6 +16,7 @@ from api.services.market_data_pipeline_service import (
     ingest_raw_minute_rows,
     preferred_daily_kline_table,
     preferred_minute_kline_table,
+    publish_minute_trade_date_batched,
     publish_minute_trade_date,
 )
 from api.services import qmt_virtual_account_service
@@ -60,14 +61,7 @@ def normalize_market_symbol(value: Any) -> str:
 
 
 def is_index_symbol(value: Any) -> bool:
-    symbol = normalize_market_symbol(value)
-    if not symbol:
-        return False
-    if symbol in _INDEX_SYMBOLS:
-        return True
-    if "." in symbol:
-        return False
-    return symbol in _INDEX_CODE_TO_SYMBOL
+    return bool(_normalize_index_symbol(value))
 
 
 def fetch_realtime_quotes(
@@ -316,26 +310,79 @@ def sync_major_index_daily(
     *,
     start_date: str,
     end_date: str,
+    symbols: list[str] | None = None,
     account_key: str | None = None,
+    data_source: str | None = None,
     db: Session | None = None,
     user_id: str | None = None,
+    progress_callback: Any | None = None,
 ) -> dict[str, Any]:
-    rows = _fetch_daily_rows_safe(
-        [item["symbol"] for item in MAJOR_INDEX_PRESETS],
+    return sync_index_daily_history(
         start_date=start_date,
         end_date=end_date,
+        symbols=symbols,
+        account_key=account_key,
+        data_source=data_source,
+        db=db,
+        user_id=user_id,
+        progress_callback=progress_callback,
+    )
+
+
+def sync_index_daily_history(
+    *,
+    start_date: str,
+    end_date: str,
+    symbols: list[str] | None = None,
+    account_key: str | None = None,
+    data_source: str | None = None,
+    db: Session | None = None,
+    user_id: str | None = None,
+    progress_callback: Any | None = None,
+) -> dict[str, Any]:
+    normalized_symbols = _normalize_index_symbols(symbols)
+    if not normalized_symbols:
+        normalized_symbols = [item["symbol"] for item in MAJOR_INDEX_PRESETS]
+
+    start = _parse_trade_date(start_date)
+    end = _parse_trade_date(end_date)
+    if start is None or end is None or start > end:
+        raise ValueError("start_date / end_date is invalid")
+
+    normalized_source = str(data_source or "qmt").strip().lower() or "qmt"
+    if normalized_source == "akshare":
+        return _sync_index_daily_history_via_akshare(
+            start=start,
+            end=end,
+            symbols=normalized_symbols,
+            progress_callback=progress_callback,
+        )
+
+    if callable(progress_callback):
+        progress_callback(5, f"正在同步指数日K {start.isoformat()} ~ {end.isoformat()}")
+
+    rows = _fetch_daily_rows_safe(
+        normalized_symbols,
+        start_date=start.isoformat(),
+        end_date=end.isoformat(),
         account_key=account_key,
         db=db,
         user_id=user_id,
     )
-    if rows:
-        _upsert_index_daily_rows(rows)
+    inserted = _upsert_index_daily_rows(rows) if rows else 0
+    present_symbols = {normalize_market_symbol(item.get("symbol")) for item in rows if item.get("symbol")}
+    missing_symbols = [symbol for symbol in normalized_symbols if symbol not in present_symbols]
+
+    if callable(progress_callback):
+        progress_callback(100 if inserted else 0, f"指数日K同步完成，写入 {inserted} 条")
+
     return {
-        "success": bool(rows),
-        "rows": len(rows),
-        "symbols": [item["symbol"] for item in MAJOR_INDEX_PRESETS],
-        "start_date": start_date,
-        "end_date": end_date,
+        "success": bool(inserted),
+        "rows": inserted,
+        "symbols": normalized_symbols,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "missing_symbols": missing_symbols,
         "source": "qmt_daily",
     }
 
@@ -523,6 +570,160 @@ def resolve_market_account_key(
             return config.key
 
     return preferred_key or (configs[0].key if configs else None)
+
+
+def _sync_index_daily_history_via_akshare(
+    *,
+    start: date,
+    end: date,
+    symbols: list[str],
+    progress_callback: Any | None,
+) -> dict[str, Any]:
+    try:
+        import akshare as ak
+    except Exception as exc:
+        return {
+            "success": False,
+            "rows": 0,
+            "symbols": symbols,
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "missing_symbols": symbols,
+            "symbol_rows": {},
+            "source": "akshare_index_daily",
+            "error": f"AKShare 不可用：{exc}",
+        }
+
+    total_symbols = len(symbols)
+    total_rows = 0
+    symbol_rows: dict[str, int] = {}
+    missing_symbols: list[str] = []
+    symbol_errors: dict[str, str] = {}
+
+    for index, symbol in enumerate(symbols, start=1):
+        if callable(progress_callback):
+            progress = min(95, max(1, int((index - 1) / max(total_symbols, 1) * 100)))
+            progress_callback(progress, f"正在通过 AKShare 同步指数日K {symbol} ({index}/{total_symbols})")
+        try:
+            rows = _fetch_index_daily_rows_via_akshare_symbol(ak, symbol, start=start, end=end)
+            inserted = _upsert_index_daily_rows(rows) if rows else 0
+        except Exception as exc:
+            inserted = 0
+            rows = []
+            symbol_errors[symbol] = str(exc)[:300]
+            logger.warning("[qmt-market] akshare index daily sync failed symbol=%s error=%s", symbol, exc)
+
+        symbol_rows[symbol] = inserted
+        total_rows += inserted
+        if not rows:
+            missing_symbols.append(symbol)
+
+    if callable(progress_callback):
+        progress_callback(100 if total_rows else 0, f"AKShare 指数日K同步完成，共写入 {total_rows} 条")
+
+    return {
+        "success": total_rows > 0,
+        "rows": total_rows,
+        "symbols": symbols,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "missing_symbols": missing_symbols,
+        "symbol_rows": symbol_rows,
+        "symbol_errors": symbol_errors,
+        "source": "akshare_index_daily",
+    }
+
+
+def _fetch_index_daily_rows_via_akshare_symbol(
+    ak: Any,
+    symbol: str,
+    *,
+    start: date,
+    end: date,
+) -> list[dict[str, Any]]:
+    normalized = normalize_market_symbol(symbol)
+    code = normalized.split(".", 1)[0] if "." in normalized else normalized
+    start_text = start.strftime("%Y%m%d")
+    end_text = end.strftime("%Y%m%d")
+
+    try:
+        frame = ak.index_zh_a_hist(symbol=code, period="daily", start_date=start_text, end_date=end_text)
+        rows = _normalize_akshare_index_daily_frame(
+            frame,
+            symbol=normalized,
+            start=start,
+            end=end,
+            source="akshare_em",
+        )
+        if rows:
+            return rows
+    except Exception as exc:
+        logger.info("[qmt-market] akshare index_zh_a_hist fallback symbol=%s error=%s", normalized, exc)
+
+    frame = ak.stock_zh_index_daily(symbol=_sina_index_symbol(normalized))
+    return _normalize_akshare_index_daily_frame(
+        frame,
+        symbol=normalized,
+        start=start,
+        end=end,
+        source="akshare_sina",
+    )
+
+
+def _normalize_akshare_index_daily_frame(
+    frame: Any,
+    *,
+    symbol: str,
+    start: date,
+    end: date,
+    source: str,
+) -> list[dict[str, Any]]:
+    if frame is None or getattr(frame, "empty", True):
+        return []
+    rows: list[dict[str, Any]] = []
+    for raw_row in frame.to_dict("records"):
+        trade_day = _parse_trade_date(_row_first_value(raw_row, "日期", "date", "交易日期", "trade_date"))
+        if trade_day is None or trade_day < start or trade_day > end:
+            continue
+        rows.append(
+            {
+                "symbol": symbol,
+                "trade_date": trade_day,
+                "open": _safe_float(_row_first_value(raw_row, "开盘", "open")),
+                "high": _safe_float(_row_first_value(raw_row, "最高", "high")),
+                "low": _safe_float(_row_first_value(raw_row, "最低", "low")),
+                "close": _safe_float(_row_first_value(raw_row, "收盘", "close")),
+                "volume": _safe_float(_row_first_value(raw_row, "成交量", "volume")),
+                "amount": _safe_float(_row_first_value(raw_row, "成交额", "amount")),
+                "source": source,
+            }
+        )
+    rows.sort(key=lambda item: (item["symbol"], item["trade_date"]))
+    return rows
+
+
+def _row_first_value(row: dict[str, Any], *columns: str) -> Any:
+    for column in columns:
+        if column not in row:
+            continue
+        value = row.get(column)
+        if value is None:
+            continue
+        text_value = str(value).strip()
+        if not text_value or text_value.lower() in {"nan", "nat", "none"}:
+            continue
+        return value
+    return None
+
+
+def _sina_index_symbol(symbol: str) -> str:
+    normalized = normalize_market_symbol(symbol)
+    code = normalized.split(".", 1)[0] if "." in normalized else normalized
+    if normalized.endswith(".SH") or code.startswith(("0", "5", "6", "9")):
+        return f"sh{code}"
+    if normalized.endswith(".BJ") or code.startswith(("4", "8")):
+        return f"bj{code}"
+    return f"sz{code}"
 
 
 def _sync_index_minute_history_via_akshare(
@@ -726,10 +927,31 @@ def _normalize_akshare_index_minute_frame(symbol: str, frame: Any) -> list[dict[
 
 
 def _normalize_index_symbols(symbols: list[str] | None) -> list[str]:
-    normalized = _normalize_symbols(symbols or [])
-    if not normalized:
-        return []
-    return [item for item in normalized if is_index_symbol(item)]
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in symbols or []:
+        symbol = _normalize_index_symbol(item)
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            result.append(symbol)
+    return result
+
+
+def _normalize_index_symbol(value: Any) -> str:
+    raw = str(value or "").strip().upper()
+    if not raw:
+        return ""
+    if raw in _INDEX_SYMBOLS:
+        return raw
+    if "." in raw:
+        normalized = normalize_market_symbol(raw)
+        return normalized if normalized in _INDEX_SYMBOLS else ""
+    if raw.startswith(("SH", "SZ", "BJ")) and len(raw) >= 8:
+        prefix = raw[:2]
+        code = raw[2:]
+        candidate = _INDEX_CODE_TO_SYMBOL.get(code)
+        return candidate if candidate and candidate.endswith(f".{prefix}") else ""
+    return _INDEX_CODE_TO_SYMBOL.get(raw, "")
 
 
 def _resolve_trade_dates(start: date, end: date) -> list[date]:
@@ -1265,7 +1487,7 @@ def _upsert_intraday_rows(table_name: str, rows: list[dict[str, Any]]) -> int:
             result = ingest_raw_minute_rows(source="qmt", rows=payload)
             for trade_day in result.get("trade_dates") or []:
                 affected_symbols = sorted({str(item["symbol"]) for item in payload if item.get("symbol")})
-                publish_minute_trade_date(
+                publish_minute_trade_date_batched(
                     trade_date=trade_day,
                     symbols=affected_symbols or None,
                     minimum_coverage_ratio=0.0,
@@ -1300,7 +1522,7 @@ def _upsert_index_daily_rows(rows: list[dict[str, Any]]) -> int:
             "amount": _safe_float(item.get("amount")),
         }
         if has_source:
-            row["source"] = str(item.get("source") or "qmt_bridge")
+            row["source"] = str(item.get("source") or "qmt_bridge")[:20]
         if has_created_at:
             row["created_at"] = now
         if has_updated_at:
@@ -1537,5 +1759,3 @@ def _parse_datetime(value: Any) -> datetime | None:
         return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
     except ValueError:
         return None
-
-

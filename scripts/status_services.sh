@@ -2,7 +2,7 @@
 set -euo pipefail
 
 BACKEND_PORT="${BACKEND_PORT:-8500}"
-FRONTEND_PORT="${FRONTEND_PORT:-5174}"
+FRONTEND_PORT="${FRONTEND_PORT:-5173}"
 BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
 FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -43,6 +43,15 @@ cleanup_stale_pidfile() {
   fi
 }
 
+curl_host() {
+  local host="$1"
+  if [[ "$host" == "0.0.0.0" ]]; then
+    printf '127.0.0.1'
+  else
+    printf '%s' "$host"
+  fi
+}
+
 cleanup_stale_pidfile .runtime/backend.pid backend
 cleanup_stale_pidfile .runtime/frontend.pid frontend
 cleanup_stale_pidfile .runtime/scheduler.pid scheduler
@@ -60,6 +69,17 @@ echo
 
 echo "[status] frontend"
 curl -I -sS --max-time 5 "http://${FRONTEND_HOST}:${FRONTEND_PORT}" | head -n 1 || true
+frontend_check_host="$(curl_host "$FRONTEND_HOST")"
+if curl -sS --max-time 5 "http://${frontend_check_host}:${FRONTEND_PORT}/" | grep -q '/@vite/client'; then
+  echo "vite dev server: ok"
+else
+  echo "vite dev server: failed"
+fi
+if curl -fsS --max-time 5 "http://${frontend_check_host}:${FRONTEND_PORT}/healthz" >/dev/null; then
+  echo "frontend api proxy: ok"
+else
+  echo "frontend api proxy: failed"
+fi
 
 echo
 

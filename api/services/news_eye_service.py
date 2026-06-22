@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -9,7 +10,7 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
@@ -17,6 +18,7 @@ import pandas as pd
 from fastapi import HTTPException
 from langchain_core.messages import HumanMessage, SystemMessage
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from api.core.runtime_config import (
@@ -26,7 +28,8 @@ from api.core.runtime_config import (
     llm_runtime_package_source,
 )
 from api.core.stock_map import get_reverse_stock_map, get_stock_map_version
-from api.database import SessionLocal, ScheduledAnalysisDB, WatchlistItemDB
+from api.database import ImportedPortfolioPositionDB, SessionLocal, ScheduledAnalysisDB, WatchlistItemDB
+from api.models.strategy_models import SelectionCenterTaskDB
 from api.services.data_source_governance import build_news_eye_governance
 from tradingagents.llm_clients.factory import create_llm_client
 
@@ -168,10 +171,14 @@ _NEWS_SCHEMA_ENSURED_BINDS: set[str] = set()
 _SEARCH_INDEX_BACKFILLED_BINDS: set[str] = set()
 _DEDUPE_KEYS_BACKFILLED_BINDS: set[str] = set()
 _POLL_SECONDS = max(int(os.getenv("NEWS_EYE_POLL_SECONDS", "45")), 15)
+_NEWS_RETENTION_DAYS = max(int(os.getenv("NEWS_EYE_RETENTION_DAYS", "7")), 1)
 _BACKGROUND_LIMIT = max(int(os.getenv("NEWS_EYE_BACKGROUND_LIMIT", "120")), 20)
 _MANUAL_LIMIT = max(int(os.getenv("NEWS_EYE_MANUAL_LIMIT", "160")), 20)
 _WATCHLIST_SYMBOL_LIMIT = max(int(os.getenv("NEWS_EYE_WATCHLIST_SYMBOL_LIMIT", "12")), 0)
 _SYMBOL_SOURCE_LIMIT = max(int(os.getenv("NEWS_EYE_SYMBOL_SOURCE_LIMIT", "6")), 1)
+_NOTICE_SOURCE_LIMIT = max(int(os.getenv("NEWS_EYE_NOTICE_SOURCE_LIMIT", "24")), 1)
+_OFFICIAL_NOTICE_SOURCE_LIMIT = max(int(os.getenv("NEWS_EYE_OFFICIAL_NOTICE_SOURCE_LIMIT", "32")), 1)
+_RESEARCH_SOURCE_LIMIT = max(int(os.getenv("NEWS_EYE_RESEARCH_SOURCE_LIMIT", "4")), 1)
 _SOURCE_TIMEOUT_SECONDS = max(float(os.getenv("NEWS_EYE_SOURCE_TIMEOUT_SECONDS", "8")), 2.0)
 _SOURCE_FETCH_WORKERS = max(int(os.getenv("NEWS_EYE_SOURCE_FETCH_WORKERS", "6")), 2)
 _SOURCE_FETCH_EXECUTOR = ThreadPoolExecutor(max_workers=_SOURCE_FETCH_WORKERS, thread_name_prefix="news-eye-source")
@@ -203,6 +210,48 @@ class NewsSourceSpec:
     kwargs: dict[str, Any] = field(default_factory=dict)
     symbol_param: str | None = None
     symbol_transform: Any | None = None
+    normalizer: Any | None = None
+
+
+@dataclass(frozen=True)
+class OfficialNoticeSourceSpec:
+    label: str
+    func_names: tuple[str, ...]
+    kwargs: dict[str, Any] = field(default_factory=dict)
+    per_symbol: bool = False
+    symbol_param: str | None = None
+    symbol_transform: Any | None = None
+    symbol_suffixes: tuple[str, ...] = ()
+
+
+OFFICIAL_NOTICE_SOURCE_SPECS: tuple[OfficialNoticeSourceSpec, ...] = (
+    OfficialNoticeSourceSpec(
+        "巨潮资讯公告",
+        ("stock_zh_a_disclosure_report_cninfo",),
+        {"market": "沪深京", "keyword": "", "category": ""},
+        per_symbol=True,
+        symbol_param="symbol",
+        symbol_transform=lambda symbol: str(symbol).split(".", 1)[0],
+    ),
+    OfficialNoticeSourceSpec(
+        "上交所公告",
+        ("stock_sse_announcement", "stock_sse_announcement_report", "stock_zh_a_disclosure_report_cninfo"),
+        {"market": "沪深京", "keyword": "", "category": ""},
+        per_symbol=True,
+        symbol_param="symbol",
+        symbol_transform=lambda symbol: str(symbol).split(".", 1)[0],
+        symbol_suffixes=("SH",),
+    ),
+    OfficialNoticeSourceSpec(
+        "深交所公告",
+        ("stock_szse_announcement", "stock_szse_disclosure", "stock_zh_a_disclosure_report_cninfo"),
+        {"market": "沪深京", "keyword": "", "category": ""},
+        per_symbol=True,
+        symbol_param="symbol",
+        symbol_transform=lambda symbol: str(symbol).split(".", 1)[0],
+        symbol_suffixes=("SZ", "BJ"),
+    ),
+)
 
 
 GENERAL_SOURCE_SPECS: tuple[NewsSourceSpec, ...] = (
@@ -213,12 +262,24 @@ GENERAL_SOURCE_SPECS: tuple[NewsSourceSpec, ...] = (
     NewsSourceSpec("富途快讯", "stock_info_global_futu"),
     NewsSourceSpec("同花顺全球直播", "stock_info_global_ths"),
 )
+NOTICE_SOURCE_SPECS: tuple[NewsSourceSpec, ...] = (
+    NewsSourceSpec("东方财富公告:重大事项", "stock_notice_report", {"symbol": "重大事项"}, normalizer="notice"),
+    NewsSourceSpec("东方财富公告:风险提示", "stock_notice_report", {"symbol": "风险提示"}, normalizer="notice"),
+    NewsSourceSpec("东方财富公告:财务报告", "stock_notice_report", {"symbol": "财务报告"}, normalizer="notice"),
+)
 SYMBOL_SOURCE_SPECS: tuple[NewsSourceSpec, ...] = (
     NewsSourceSpec(
         "东方财富个股新闻",
         "stock_news_em",
         symbol_param="symbol",
         symbol_transform=lambda symbol: str(symbol).split(".", 1)[0],
+    ),
+    NewsSourceSpec(
+        "东方财富研报",
+        "stock_research_report_em",
+        symbol_param="symbol",
+        symbol_transform=lambda symbol: str(symbol).split(".", 1)[0],
+        normalizer="research",
     ),
 )
 
@@ -261,6 +322,13 @@ async def _run_loop() -> None:
 def _scan_and_refresh_once() -> None:
     with SessionLocal() as db:
         ensure_news_tables(db)
+        cleanup_result = prune_old_news_items(db)
+        if cleanup_result.get("deleted", 0) > 0:
+            logger.info(
+                "[news-eye] pruned old news deleted=%s cutoff=%s",
+                cleanup_result.get("deleted", 0),
+                cleanup_result.get("cutoff"),
+            )
         background_user_id = _load_background_refresh_user_id(db)
         user_symbols = load_user_focus_symbols(db, background_user_id, limit=_WATCHLIST_SYMBOL_LIMIT) if background_user_id else []
         symbols = _dedupe_symbols([*user_symbols, *_load_global_focus_symbols(db, limit=_WATCHLIST_SYMBOL_LIMIT)])[:_WATCHLIST_SYMBOL_LIMIT]
@@ -273,6 +341,13 @@ def _scan_and_refresh_once() -> None:
             user_id=background_user_id,
             async_event_driven_selection=True,
         )
+        final_cleanup_result = prune_old_news_items(db)
+        if final_cleanup_result.get("deleted", 0) > 0:
+            logger.info(
+                "[news-eye] pruned old news after refresh deleted=%s cutoff=%s",
+                final_cleanup_result.get("deleted", 0),
+                final_cleanup_result.get("cutoff"),
+            )
         logger.info(
             "[news-eye] background refresh saved=%s user=%s sources=%s symbols=%s warnings=%s",
             result.get("saved", 0),
@@ -889,6 +964,31 @@ def refresh_news_cache(
         raise
 
 
+def prune_old_news_items(
+    db: Session,
+    *,
+    reference_time: datetime | None = None,
+    retention_days: int | None = None,
+) -> dict[str, Any]:
+    ensure_news_tables(db)
+    days = max(int(retention_days or _NEWS_RETENTION_DAYS), 1)
+    now = reference_time or _utcnow_naive()
+    if getattr(now, "tzinfo", None) is not None:
+        now = now.astimezone(CN_TZ).replace(tzinfo=None)
+    cutoff = now - timedelta(days=days)
+    result = db.execute(
+        text("DELETE FROM market_news_items WHERE published_at < :cutoff"),
+        {"cutoff": cutoff},
+    )
+    deleted = max(int(result.rowcount or 0), 0)
+    db.commit()
+    return {
+        "deleted": deleted,
+        "retention_days": days,
+        "cutoff": _iso_or_none(cutoff),
+    }
+
+
 def _public_event_driven_selection_state(
     payload: dict[str, Any] | None,
     *,
@@ -1070,6 +1170,13 @@ def load_user_focus_symbols(db: Session, user_id: str, *, limit: int = _WATCHLIS
     symbols: list[str] = []
     seen: set[str] = set()
 
+    def append_symbol(raw: Any) -> None:
+        symbol = _normalize_a_share_symbol(raw) or str(raw or "").strip().upper()
+        if not symbol or symbol in seen or len(symbols) >= limit:
+            return
+        seen.add(symbol)
+        symbols.append(symbol)
+
     watchlist_rows = (
         db.query(WatchlistItemDB.symbol)
         .filter(WatchlistItemDB.user_id == user_id)
@@ -1082,14 +1189,22 @@ def load_user_focus_symbols(db: Session, user_id: str, *, limit: int = _WATCHLIS
         .order_by(ScheduledAnalysisDB.created_at.desc())
         .all()
     )
-    for row in list(watchlist_rows) + list(scheduled_rows):
-        symbol = str(row[0] or "").strip().upper()
-        if not symbol or symbol in seen:
-            continue
-        seen.add(symbol)
-        symbols.append(symbol)
-        if len(symbols) >= limit:
-            break
+    position_rows = (
+        db.query(ImportedPortfolioPositionDB.symbol)
+        .filter(
+            ImportedPortfolioPositionDB.user_id == user_id,
+            (ImportedPortfolioPositionDB.current_position.is_(None)) | (ImportedPortfolioPositionDB.current_position > 0),
+        )
+        .order_by(ImportedPortfolioPositionDB.updated_at.desc())
+        .limit(limit * 3)
+        .all()
+    )
+    selection_rows = _load_recent_selection_candidate_rows(db, user_id=user_id, limit=3)
+    for row in list(position_rows) + list(watchlist_rows) + list(scheduled_rows):
+        append_symbol(row[0])
+    for row in selection_rows:
+        for symbol in _symbols_from_selection_candidates(row[0]):
+            append_symbol(symbol)
     return symbols
 
 
@@ -1123,6 +1238,21 @@ def _load_global_focus_symbols(db: Session, *, limit: int) -> list[str]:
         return []
     symbols: list[str] = []
     seen: set[str] = set()
+
+    def append_symbol(raw: Any) -> None:
+        symbol = _normalize_a_share_symbol(raw) or str(raw or "").strip().upper()
+        if not symbol or symbol in seen or len(symbols) >= limit:
+            return
+        seen.add(symbol)
+        symbols.append(symbol)
+
+    position_rows = (
+        db.query(ImportedPortfolioPositionDB.symbol)
+        .filter((ImportedPortfolioPositionDB.current_position.is_(None)) | (ImportedPortfolioPositionDB.current_position > 0))
+        .order_by(ImportedPortfolioPositionDB.updated_at.desc())
+        .limit(limit * 3)
+        .all()
+    )
     rows = (
         db.query(WatchlistItemDB.symbol)
         .order_by(WatchlistItemDB.created_at.desc())
@@ -1135,15 +1265,45 @@ def _load_global_focus_symbols(db: Session, *, limit: int) -> list[str]:
         .limit(limit * 3)
         .all()
     )
-    for row in list(rows) + list(scheduled_rows):
-        symbol = str(row[0] or "").strip().upper()
-        if not symbol or symbol in seen:
-            continue
-        seen.add(symbol)
-        symbols.append(symbol)
-        if len(symbols) >= limit:
-            break
+    selection_rows = _load_recent_selection_candidate_rows(db, limit=3)
+    for row in list(position_rows) + list(rows) + list(scheduled_rows):
+        append_symbol(row[0])
+    for row in selection_rows:
+        for symbol in _symbols_from_selection_candidates(row[0]):
+            append_symbol(symbol)
     return symbols
+
+
+def _load_recent_selection_candidate_rows(db: Session, *, user_id: str | None = None, limit: int) -> list[Any]:
+    try:
+        query = db.query(SelectionCenterTaskDB.candidates_json).filter(SelectionCenterTaskDB.status == "completed")
+        if user_id:
+            query = query.filter(SelectionCenterTaskDB.user_id == user_id)
+        return query.order_by(SelectionCenterTaskDB.created_at.desc()).limit(limit).all()
+    except SQLAlchemyError:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return []
+
+
+def _symbols_from_selection_candidates(value: Any) -> list[str]:
+    candidates = value
+    if isinstance(candidates, dict):
+        candidates = candidates.get("results") or candidates.get("items") or candidates.get("candidates") or []
+    if not isinstance(candidates, list):
+        return []
+    result: list[str] = []
+    for item in candidates:
+        if isinstance(item, dict):
+            raw = item.get("symbol") or item.get("code") or item.get("stock_code")
+        else:
+            raw = item
+        symbol = _normalize_a_share_symbol(raw) or str(raw or "").strip().upper()
+        if symbol:
+            result.append(symbol)
+    return _dedupe_symbols(result)
 
 
 def _dedupe_symbols(symbols: Iterable[Any]) -> list[str]:
@@ -1165,6 +1325,18 @@ def _fetch_external_news(limit: int, *, symbols: list[str]) -> tuple[list[dict[s
     active_sources: list[str] = []
     warnings: list[str] = []
     per_source_limit = max(10, min(limit, 60))
+    notice_dates = _recent_notice_dates()
+    focus_symbols = _dedupe_symbols(symbols)[:_WATCHLIST_SYMBOL_LIMIT]
+
+    if focus_symbols:
+        official_items, official_sources, official_warnings = _fetch_official_notice_sources(
+            ak,
+            symbols=focus_symbols,
+            notice_dates=notice_dates,
+        )
+        items.extend(official_items)
+        active_sources.extend(official_sources)
+        warnings.extend(official_warnings)
 
     for spec in GENERAL_SOURCE_SPECS:
         func = getattr(ak, spec.func_name, None)
@@ -1183,7 +1355,38 @@ def _fetch_external_news(limit: int, *, symbols: list[str]) -> tuple[list[dict[s
         except Exception as exc:
             warnings.append(f"{spec.label} 拉取失败: {exc}")
 
-    for symbol in symbols[:_WATCHLIST_SYMBOL_LIMIT]:
+    for spec in NOTICE_SOURCE_SPECS:
+        func = getattr(ak, spec.func_name, None)
+        if func is None:
+            warnings.append(f"{spec.label} 接口不存在")
+            continue
+        source_items: list[dict[str, Any]] = []
+        source_errors: list[str] = []
+        for notice_date in notice_dates:
+            call_kwargs = dict(spec.kwargs)
+            call_kwargs["date"] = notice_date
+            try:
+                frame = _call_news_source(func, call_kwargs, label=f"{spec.label}:{notice_date}")
+                source_items.extend(
+                    _normalize_special_news_frame(
+                        frame,
+                        spec,
+                        limit=_NOTICE_SOURCE_LIMIT,
+                        seed_symbols=None,
+                    )
+                )
+            except Exception as exc:
+                source_errors.append(str(exc))
+        source_items = _dedupe_items(source_items)[:_NOTICE_SOURCE_LIMIT]
+        if source_items:
+            items.extend(source_items)
+            active_sources.append(spec.label)
+        elif source_errors:
+            warnings.append(f"{spec.label} 拉取失败: {'; '.join(source_errors[:2])}")
+        else:
+            warnings.append(f"{spec.label} 暂无高相关资讯")
+
+    for symbol in focus_symbols:
         for spec in SYMBOL_SOURCE_SPECS:
             func = getattr(ak, spec.func_name, None)
             if func is None or spec.symbol_param is None:
@@ -1194,10 +1397,10 @@ def _fetch_external_news(limit: int, *, symbols: list[str]) -> tuple[list[dict[s
             try:
                 active_label = f"{spec.label}:{symbol}"
                 frame = _call_news_source(func, call_kwargs, label=active_label)
-                normalized = _normalize_news_frame(
+                normalized = _normalize_special_news_frame(
                     frame,
-                    spec.label,
-                    limit=_SYMBOL_SOURCE_LIMIT,
+                    spec,
+                    limit=_symbol_source_limit_for_spec(spec),
                     seed_symbols=[symbol],
                 )
                 if normalized:
@@ -1208,6 +1411,87 @@ def _fetch_external_news(limit: int, *, symbols: list[str]) -> tuple[list[dict[s
                 warnings.append(f"{spec.label}({symbol}) 拉取失败: {exc}")
 
     return _dedupe_items(items)[: max(limit, 20)], active_sources, warnings
+
+
+def _fetch_official_notice_sources(
+    ak: Any,
+    *,
+    symbols: list[str],
+    notice_dates: list[str],
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    items: list[dict[str, Any]] = []
+    active_sources: list[str] = []
+    warnings: list[str] = []
+    for spec in OFFICIAL_NOTICE_SOURCE_SPECS:
+        source_items: list[dict[str, Any]] = []
+        source_errors: list[str] = []
+        for func_name in spec.func_names:
+            func = getattr(ak, func_name, None)
+            if func is None:
+                continue
+            calls = _official_notice_call_kwargs(spec, symbols=symbols, notice_dates=notice_dates)
+            for call_kwargs in calls:
+                try:
+                    filtered_kwargs = _filter_supported_kwargs(func, call_kwargs)
+                    frame = _call_news_source(func, filtered_kwargs, label=spec.label)
+                    source_items.extend(_normalize_official_notice_frame(frame, spec.label, limit=_OFFICIAL_NOTICE_SOURCE_LIMIT))
+                except Exception as exc:
+                    source_errors.append(str(exc))
+            source_items = _dedupe_items(source_items)[:_OFFICIAL_NOTICE_SOURCE_LIMIT]
+            if source_items:
+                break
+        if source_items:
+            items.extend(source_items)
+            active_sources.append(spec.label)
+        elif source_errors:
+            warnings.append(f"{spec.label} 拉取失败: {'; '.join(source_errors[:2])}")
+        else:
+            warnings.append(f"{spec.label} 接口不存在或暂无公告")
+    return items, active_sources, warnings
+
+
+def _official_notice_call_kwargs(
+    spec: OfficialNoticeSourceSpec,
+    *,
+    symbols: list[str],
+    notice_dates: list[str],
+) -> list[dict[str, Any]]:
+    latest_date = max(notice_dates) if notice_dates else datetime.now(CN_TZ).strftime("%Y%m%d")
+    earliest_date = min(notice_dates) if notice_dates else latest_date
+    base = {
+        **dict(spec.kwargs),
+        "date": latest_date,
+        "start_date": earliest_date,
+        "end_date": latest_date,
+        "begin_date": earliest_date,
+    }
+    if not spec.per_symbol or not spec.symbol_param:
+        return [base]
+    call_symbols = symbols or [""]
+    if spec.symbol_suffixes:
+        allowed_suffixes = {suffix.upper() for suffix in spec.symbol_suffixes}
+        call_symbols = [
+            symbol for symbol in call_symbols
+            if "." in symbol and symbol.rsplit(".", 1)[-1].upper() in allowed_suffixes
+        ]
+        if not call_symbols:
+            return []
+    calls: list[dict[str, Any]] = []
+    for symbol in call_symbols:
+        transformed = spec.symbol_transform(symbol) if callable(spec.symbol_transform) else symbol
+        calls.append({**base, spec.symbol_param: transformed})
+    return calls
+
+
+def _filter_supported_kwargs(func: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return dict(kwargs)
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+        return dict(kwargs)
+    supported = set(signature.parameters)
+    return {key: value for key, value in kwargs.items() if key in supported}
 
 
 def _call_news_source(func: Any, kwargs: dict[str, Any], *, label: str) -> Any:
@@ -1230,7 +1514,150 @@ def _sync_state_error_from_warnings(warnings: list[str], active_sources: list[st
 
 def _is_noncritical_news_warning(warning: str) -> bool:
     text_value = str(warning or "")
-    return "个股新闻(" in text_value or "暂无高相关资讯" in text_value or "拉取超过" in text_value
+    return (
+        "个股新闻(" in text_value
+        or "暂无高相关资讯" in text_value
+        or "接口不存在或暂无公告" in text_value
+        or "拉取超过" in text_value
+    )
+
+
+def _recent_notice_dates(reference_time: datetime | None = None) -> list[str]:
+    now = reference_time or datetime.now(CN_TZ)
+    if getattr(now, "tzinfo", None) is None:
+        now = now.replace(tzinfo=CN_TZ)
+    local_now = now.astimezone(CN_TZ)
+    return [
+        (local_now - timedelta(days=offset)).strftime("%Y%m%d")
+        for offset in range(2)
+    ]
+
+
+def _symbol_source_limit_for_spec(spec: NewsSourceSpec) -> int:
+    return _RESEARCH_SOURCE_LIMIT if spec.normalizer == "research" else _SYMBOL_SOURCE_LIMIT
+
+
+def _normalize_special_news_frame(
+    frame: Any,
+    spec: NewsSourceSpec,
+    *,
+    limit: int,
+    seed_symbols: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    if spec.normalizer == "notice":
+        return _normalize_notice_frame(frame, spec.label, limit=limit)
+    if spec.normalizer == "research":
+        return _normalize_research_frame(frame, spec.label, limit=limit, seed_symbols=seed_symbols)
+    return _normalize_news_frame(frame, spec.label, limit=limit, seed_symbols=seed_symbols)
+
+
+def _normalize_official_notice_frame(frame: Any, source_name: str, *, limit: int) -> list[dict[str, Any]]:
+    return _normalize_notice_frame(frame, source_name, limit=limit)
+
+
+def _normalize_notice_frame(frame: Any, source_name: str, *, limit: int) -> list[dict[str, Any]]:
+    if frame is None:
+        return []
+    data = pd.DataFrame(frame)
+    if data.empty:
+        return []
+    items: list[dict[str, Any]] = []
+    for _, row in data.head(limit).iterrows():
+        code = _first_text(row, ("代码", "股票代码", "证券代码", "secCode", "securityCode", "symbol"))
+        symbol = _normalize_a_share_symbol(code)
+        name = _first_text(row, ("名称", "股票简称", "简称", "证券简称", "secName", "securityName"))
+        title = _first_text(row, ("公告标题", "标题", "title", "公告名称", "announcementTitle", "announcementName"))
+        notice_type = _first_text(row, ("公告类型", "类型", "category", "announcementTypeName", "columnName"))
+        if not title:
+            continue
+        display_symbol = f"{name}({symbol})" if name and symbol else (name or symbol or "上市公司")
+        content_parts = ["公告", display_symbol]
+        if notice_type:
+            content_parts.append(notice_type)
+        content_parts.append(title)
+        items.append(
+            {
+                "content": "｜".join(content_parts),
+                "published_at": _parse_time(
+                    _first_text(row, ("公告日期", "发布日期", "发布时间", "公告时间", "date", "time", "announcementTime", "publishTime"))
+                ),
+                "source": source_name,
+                "url": _normalize_notice_url(_first_text(row, ("网址", "链接", "url", "URL", "公告链接", "adjunctUrl", "adjunctUrlMirror"))),
+                "seed_symbols": [symbol] if symbol else [],
+            }
+        )
+    return items
+
+
+def _normalize_notice_url(value: Any) -> str | None:
+    url = str(value or "").strip()
+    if not url:
+        return None
+    if url.startswith(("http://", "https://")):
+        return url
+    if url.startswith("//"):
+        return f"https:{url}"
+    if "finalpage/" in url or url.lower().endswith(".pdf"):
+        return f"https://static.cninfo.com.cn/{url.lstrip('/')}"
+    return url
+
+
+def _normalize_research_frame(
+    frame: Any,
+    source_name: str,
+    *,
+    limit: int,
+    seed_symbols: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    if frame is None:
+        return []
+    data = pd.DataFrame(frame)
+    if data.empty:
+        return []
+    items: list[dict[str, Any]] = []
+    for _, row in data.head(limit).iterrows():
+        code = _first_text(row, ("股票代码", "代码", "证券代码", "symbol"))
+        symbol = _normalize_a_share_symbol(code) or (seed_symbols or [None])[0]
+        name = _first_text(row, ("股票简称", "名称", "简称", "证券简称"))
+        title = _first_text(row, ("报告名称", "标题", "title", "研报标题"))
+        rating = _first_text(row, ("东财评级", "评级", "投资评级"))
+        institution = _first_text(row, ("机构", "研究机构", "source"))
+        industry = _first_text(row, ("行业", "所属行业"))
+        if not title:
+            continue
+        display_symbol = f"{name}({symbol})" if name and symbol else (name or symbol or "个股")
+        detail_parts = [part for part in (institution, rating, industry) if part]
+        content = f"研报｜{display_symbol}｜{title}"
+        if detail_parts:
+            content = f"{content}｜{'｜'.join(detail_parts)}"
+        items.append(
+            {
+                "content": content,
+                "published_at": _parse_time(_first_text(row, ("日期", "发布时间", "发布日期", "time", "date"))),
+                "source": source_name,
+                "url": _first_text(row, ("报告PDF链接", "链接", "url", "URL", "detailUrl")) or None,
+                "seed_symbols": [symbol] if symbol else list(seed_symbols or []),
+            }
+        )
+    return items
+
+
+def _normalize_a_share_symbol(value: Any) -> str:
+    text_value = str(value or "").strip().upper()
+    if not text_value:
+        return ""
+    if "." in text_value:
+        code, suffix = text_value.split(".", 1)
+        if len(code) == 6 and code.isdigit() and suffix in {"SH", "SZ", "BJ"}:
+            return f"{code}.{suffix}"
+    code = re.sub(r"\D", "", text_value)
+    if len(code) != 6:
+        return ""
+    if code.startswith(("4", "8", "9")):
+        return f"{code}.BJ"
+    if code.startswith("6"):
+        return f"{code}.SH"
+    return f"{code}.SZ"
 
 
 def _normalize_news_frame(

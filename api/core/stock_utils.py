@@ -76,10 +76,10 @@ def _resolve_symbol_from_token(raw: str, code_to_name: Dict[str, str]) -> str:
 
     digits_match = re.search(r"(\d{6})", raw.strip().upper())
     if not digits_match:
-        return symbol
+        return ""
 
     code = digits_match.group(1)
     candidates = [candidate for candidate in code_to_name if candidate.startswith(f"{code}.")]
     if len(candidates) == 1:
         return candidates[0]
-    return symbol
+    return ""

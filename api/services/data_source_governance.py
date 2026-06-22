@@ -213,39 +213,88 @@ _SURFACE_REGISTRY: list[dict[str, Any]] = [
 
 _NEWS_SOURCE_LINKS: tuple[dict[str, str], ...] = (
     {
+        "key": "cninfo_disclosure_report",
+        "name": "巨潮资讯公告",
+        "url": "https://www.cninfo.com.cn/new/commonUrl/pageOfSearch?url=disclosure/list/search",
+        "tier": "一级",
+        "role": "官方公告",
+    },
+    {
+        "key": "sse_announcement",
+        "name": "上交所公告",
+        "url": "https://www.sse.com.cn/disclosure/listedinfo/announcement/",
+        "tier": "一级",
+        "role": "官方公告",
+    },
+    {
+        "key": "szse_announcement",
+        "name": "深交所公告",
+        "url": "https://www.szse.cn/disclosure/listed/bulletinDetail/index.html",
+        "tier": "一级",
+        "role": "官方公告",
+    },
+    {
         "key": "stock_info_global_cls",
         "name": "财联社电报",
         "url": "https://www.cls.cn/telegraph",
+        "tier": "四级",
+        "role": "背景快讯",
     },
     {
         "key": "stock_info_global_em",
         "name": "东方财富全球快讯",
         "url": "https://kuaixun.eastmoney.com/7_24.html",
+        "tier": "四级",
+        "role": "背景快讯",
     },
     {
         "key": "stock_info_cjzc_em",
         "name": "东方财富财经早餐",
         "url": "https://stock.eastmoney.com/a/czpnc.html",
+        "tier": "四级",
+        "role": "背景快讯",
     },
     {
         "key": "stock_info_global_sina",
         "name": "新浪7x24",
         "url": "https://finance.sina.com.cn/7x24",
+        "tier": "四级",
+        "role": "背景快讯",
     },
     {
         "key": "stock_info_global_futu",
         "name": "富途快讯",
         "url": "https://news.futunn.com/main/live",
+        "tier": "四级",
+        "role": "背景快讯",
     },
     {
         "key": "stock_info_global_ths",
         "name": "同花顺全球直播",
         "url": "https://news.10jqka.com.cn/realtimenews.html",
+        "tier": "四级",
+        "role": "背景快讯",
     },
     {
         "key": "stock_news_em",
         "name": "东方财富个股新闻",
         "url": "https://so.eastmoney.com/news/s?keyword=000001",
+        "tier": "二级",
+        "role": "个股新闻",
+    },
+    {
+        "key": "stock_notice_report",
+        "name": "东方财富公告",
+        "url": "https://data.eastmoney.com/notices/hsa/5.html",
+        "tier": "二级",
+        "role": "公告聚合",
+    },
+    {
+        "key": "stock_research_report_em",
+        "name": "东方财富个股研报",
+        "url": "https://data.eastmoney.com/report/stock.jshtml",
+        "tier": "三级",
+        "role": "研报",
     },
 )
 

@@ -12,8 +12,8 @@ from api.database import UserDB, get_db_ctx
 from api.services import auth_service, token_service
 
 _auth_scheme = HTTPBearer(auto_error=False)
-# Dev-only defaults – only active when APP_ENV != "production"
-_DEFAULT_DEV_ACCESS_TOKEN = os.getenv("TA_DEV_ACCESS_TOKEN", "dev-test-token-001")
+# Dev-only token – only active when APP_ENV != "production" and TA_DEV_ACCESS_TOKEN is explicitly set.
+_DEFAULT_DEV_ACCESS_TOKEN = os.getenv("TA_DEV_ACCESS_TOKEN", "")
 _DEFAULT_DEV_USER_ID = os.getenv("TA_DEV_USER_ID", "test-user-001")
 _DEFAULT_DEV_USER_EMAIL = os.getenv("TA_DEV_USER_EMAIL", "test@example.com")
 
@@ -22,8 +22,8 @@ def _is_dev_mode() -> bool:
     return os.getenv("APP_ENV", "development").lower() != "production"
 
 
-def _dev_access_token() -> str:
-    return os.getenv("TA_DEV_ACCESS_TOKEN", _DEFAULT_DEV_ACCESS_TOKEN).strip() or _DEFAULT_DEV_ACCESS_TOKEN
+def _dev_access_token() -> str | None:
+    return os.getenv("TA_DEV_ACCESS_TOKEN", "").strip() or None
 
 
 def _dev_user_email() -> str:
@@ -77,7 +77,8 @@ class RequireUser:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="请先登录")
         token = credentials.credentials
         with get_db_ctx() as db:
-            if _is_dev_mode() and token == _dev_access_token():
+            dev_token = _dev_access_token()
+            if _is_dev_mode() and dev_token and token == dev_token:
                 return _resolve_dev_user(db)
             try:
                 payload = auth_service.decode_access_token(token)

@@ -1,4 +1,4 @@
-import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, IntradayResponse, KlineResponse, LatestAnnouncementResponse, MarketQuoteResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse, RuntimeLogSource, RuntimeLogsResponse, StrategyDefinition, StrategyDraftResponse, StrategyListResponseV2, StrategyCompileResponse, StrategyDsl, BacktestRun, BacktestMetrics, BacktestTradeRecord, BacktestEquityPoint, BacktestWatchlistItem, BacktestMinuteConfirmationItem, BacktestTradeSnapshot, BacktestSignalItem, BacktestPositionItem, BacktestOrderItem, EvolutionExperiment, EvolutionCandidate, BacktestCompareResponse, OfficialStrategyPackListResponse, OfficialStrategyPackCloneResponse, OfficialStrategyPackItem, StrategyPlatformBacktestRequest, VirtualWarehouseOverviewResponse, VirtualWarehouseDiagnosticsResponse, QmtSyncProfile, PaperAccount, QmtOrderSubmitRequest, QmtOrderSubmitResponse, QmtOrderCancelResponse, QmtBulkSellTask, VirtualWarehouseOrder, VirtualWarehouseTrade, RealtimeMonitor, RealtimeEvent, RealtimeApprovalTask, RealtimeMonitorCreateRequest, RealtimeMonitorPositionsResponse, BacktestDataConfigItem, BacktestDataSubscriptionStatus, DailyKlineGovernanceSummaryResponse, ChanlunOverlayResponse, MarketOverviewResponse, NewsEyeAnalyzeRequest, NewsEyeAnalyzeResponse, NewsEyeListResponse, NewsEyeRefreshResponse, NewsThemePerformanceResponse, NewsThemeRankingResponse, NewsThemeSnapshotResponse, NewsThemeWindow, CatalystSelectionRankResponse, CatalystSelectionHistoryResponse, CatalystOpportunityEventResponse, CatalystMonitorPoolResponse, CatalystClosedLoopAuditResponse, CatalystEventRefreshRunResponse, CatalystLearningReplayResponse, CatalystSelectionSettlementResponse, DailyReview, DailyReviewConfig, DailyReviewHistoryItem, QmtBackgroundRefreshResponse, SystemDataSourceRegistryResponse } from '@/types'
+import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, IntradayResponse, KlineResponse, LatestAnnouncementResponse, MarketQuoteResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse, RuntimeLogSource, RuntimeLogsResponse, StrategyDefinition, StrategyDraftResponse, StrategyListResponseV2, StrategyCompileResponse, StrategyDsl, SelectionCenterTask, SelectionCenterTaskCreateRequest, SelectionCenterTaskListResponse, BacktestRun, BacktestMetrics, BacktestTradeRecord, BacktestEquityPoint, BacktestWatchlistItem, BacktestMinuteConfirmationItem, BacktestTradeSnapshot, BacktestSignalItem, BacktestPositionItem, BacktestOrderItem, EvolutionExperiment, EvolutionCandidate, BacktestCompareResponse, OfficialStrategyPackListResponse, OfficialStrategyPackCloneResponse, OfficialStrategyPackItem, StrategyPlatformBacktestRequest, VirtualWarehouseOverviewResponse, VirtualWarehouseDiagnosticsResponse, QmtReturnStatsResponse, QmtSyncProfile, PaperAccount, QmtOrderSubmitRequest, QmtOrderSubmitResponse, QmtOrderCancelResponse, QmtBulkSellTask, VirtualWarehouseOrder, VirtualWarehouseTrade, RealtimeMonitor, RealtimeEvent, RealtimeMonitorCreateRequest, RealtimeMonitorUpdateRequest, RealtimeMonitorPositionsResponse, RealtimeMonitorPerformanceResponse, BacktestDataConfigItem, BacktestDataSubscriptionStatus, DailyKlineGovernanceSummaryResponse, ChanlunOverlayResponse, MarketOverviewResponse, NewsEyeAnalyzeRequest, NewsEyeAnalyzeResponse, NewsEyeListResponse, NewsEyeRefreshResponse, NewsThemePerformanceResponse, NewsThemeRankingResponse, NewsThemeSnapshotResponse, NewsThemeWindow, CatalystSelectionRankResponse, CatalystSelectionHistoryResponse, CatalystOpportunityEventResponse, CatalystMonitorPoolResponse, CatalystClosedLoopAuditResponse, CatalystEventRefreshRunResponse, CatalystLearningReplayResponse, CatalystSelectionSettlementResponse, DailyReview, DailyReviewConfig, DailyReviewHistoryItem, QmtBackgroundRefreshResponse, SystemDataSourceRegistryResponse } from '@/types'
 
 type ApiRequestOptions = RequestInit & {
     timeoutMs?: number
@@ -475,12 +475,24 @@ class ApiService {
     async getPortfolioOverview(): Promise<PortfolioOverviewResponse> {
         return this.request<PortfolioOverviewResponse>('/v1/portfolio/overview')
     }
-    async getQmtVirtualWarehouseOverview(accountKey?: string, preferredRole?: 'paper' | 'live', preferCache = false): Promise<VirtualWarehouseOverviewResponse> {
+    async getQmtVirtualWarehouseOverview(
+        accountKey?: string,
+        preferredRole?: 'paper' | 'live',
+        preferCache = false,
+        allowCacheFallback = true,
+    ): Promise<VirtualWarehouseOverviewResponse> {
         const params = new URLSearchParams()
         if (accountKey) params.set('account_key', accountKey)
         if (preferredRole) params.set('preferred_role', preferredRole)
         if (preferCache) params.set('prefer_cache', 'true')
+        if (!allowCacheFallback) params.set('allow_cache_fallback', 'false')
         return this.request<VirtualWarehouseOverviewResponse>(`/v1/virtual-warehouse/qmt/overview${params.toString() ? `?${params}` : ''}`)
+    }
+    async getQmtReturnStats(accountKey?: string, preferredRole?: 'paper' | 'live'): Promise<QmtReturnStatsResponse> {
+        const params = new URLSearchParams()
+        if (accountKey) params.set('account_key', accountKey)
+        if (preferredRole) params.set('preferred_role', preferredRole)
+        return this.request<QmtReturnStatsResponse>(`/v1/virtual-warehouse/qmt/return-stats${params.toString() ? `?${params}` : ''}`)
     }
     async triggerQmtVirtualWarehouseRefresh(accountKey?: string, preferredRole?: 'paper' | 'live'): Promise<QmtBackgroundRefreshResponse> {
         const params = new URLSearchParams()
@@ -787,6 +799,9 @@ class ApiService {
         dsl: StrategyDsl
         source?: string
         status?: string
+        template_id?: string | null
+        template_name?: string | null
+        template_parameters?: Record<string, unknown>
     }): Promise<StrategyDefinition> {
         return this.request<StrategyDefinition>('/v1/strategies', {
             method: 'POST',
@@ -805,6 +820,9 @@ class ApiService {
         dsl: StrategyDsl
         source?: string
         status?: string
+        template_id?: string | null
+        template_name?: string | null
+        template_parameters?: Record<string, unknown>
     }): Promise<StrategyDefinition> {
         return this.request<StrategyDefinition>(`/v1/strategies/${strategyId}`, {
             method: 'PUT',
@@ -853,6 +871,40 @@ class ApiService {
         })
     }
 
+    async getSelectionCenterTasks(params?: {
+        mode?: string
+        limit?: number
+    }): Promise<SelectionCenterTaskListResponse> {
+        const query = new URLSearchParams()
+        if (params?.mode) query.append('mode', params.mode)
+        if (params?.limit) query.append('limit', String(params.limit))
+        const suffix = query.toString() ? `?${query}` : ''
+        return this.request<SelectionCenterTaskListResponse>(`/v1/selection-center/tasks${suffix}`)
+    }
+
+    async createSelectionCenterTask(data: SelectionCenterTaskCreateRequest): Promise<SelectionCenterTask> {
+        return this.request<SelectionCenterTask>('/v1/selection-center/tasks', {
+            method: 'POST',
+            body: JSON.stringify(data),
+        })
+    }
+
+    async getSelectionCenterTask(taskId: string): Promise<SelectionCenterTask> {
+        return this.request<SelectionCenterTask>(`/v1/selection-center/tasks/${taskId}`)
+    }
+
+    async rerunSelectionCenterTask(taskId: string): Promise<SelectionCenterTask> {
+        return this.request<SelectionCenterTask>(`/v1/selection-center/tasks/${taskId}/rerun`, {
+            method: 'POST',
+        })
+    }
+
+    async deleteSelectionCenterTask(taskId: string): Promise<{ message: string }> {
+        return this.request<{ message: string }>(`/v1/selection-center/tasks/${taskId}`, {
+            method: 'DELETE',
+        })
+    }
+
     async getStrategyPlatformBacktestMetrics(runId: string): Promise<{
         run_id: string
         metrics: BacktestMetrics
@@ -897,6 +949,13 @@ class ApiService {
         return this.request<RealtimeMonitor>(`/v1/realtime/monitors/${monitorId}`)
     }
 
+    async updateRealtimeMonitor(monitorId: string, data: RealtimeMonitorUpdateRequest): Promise<RealtimeMonitor> {
+        return this.request<RealtimeMonitor>(`/v1/realtime/monitors/${monitorId}`, {
+            method: 'PUT',
+            body: JSON.stringify(data),
+        })
+    }
+
     async deleteRealtimeMonitor(monitorId: string): Promise<{ message: string; monitor: RealtimeMonitor }> {
         return this.request<{ message: string; monitor: RealtimeMonitor }>(`/v1/realtime/monitors/${monitorId}`, {
             method: 'DELETE',
@@ -939,11 +998,12 @@ class ApiService {
         })
     }
 
-    async getRealtimeMonitorEvents(monitorId: string, params?: { limit?: number; after_id?: string; since_started?: boolean }): Promise<{ items: RealtimeEvent[] }> {
+    async getRealtimeMonitorEvents(monitorId: string, params?: { limit?: number; after_id?: string; since_started?: boolean; activity_only?: boolean }): Promise<{ items: RealtimeEvent[] }> {
         const query = new URLSearchParams()
         if (params?.limit) query.set('limit', String(params.limit))
         if (params?.after_id) query.set('after_id', params.after_id)
         if (params?.since_started !== undefined) query.set('since_started', String(params.since_started))
+        if (params?.activity_only !== undefined) query.set('activity_only', String(params.activity_only))
         return this.request<{ items: RealtimeEvent[] }>(`/v1/realtime/monitors/${monitorId}/events${query.toString() ? `?${query}` : ''}`)
     }
 
@@ -985,26 +1045,10 @@ class ApiService {
         return this.request<RealtimeMonitorPositionsResponse>(`/v1/realtime/monitors/${monitorId}/positions`)
     }
 
-    async getRealtimeApprovals(params?: { status?: string; monitor_id?: string }): Promise<{ items: RealtimeApprovalTask[] }> {
-        const query = new URLSearchParams()
-        if (params?.status) query.set('status', params.status)
-        if (params?.monitor_id) query.set('monitor_id', params.monitor_id)
-        return this.request<{ items: RealtimeApprovalTask[] }>(`/v1/realtime/approvals${query.toString() ? `?${query}` : ''}`)
+    async getRealtimeMonitorPerformance(monitorId: string): Promise<RealtimeMonitorPerformanceResponse> {
+        return this.request<RealtimeMonitorPerformanceResponse>(`/v1/realtime/monitors/${monitorId}/performance`)
     }
 
-    async approveRealtimeApproval(approvalId: string, decision?: Record<string, unknown>): Promise<RealtimeApprovalTask> {
-        return this.request<RealtimeApprovalTask>(`/v1/realtime/approvals/${approvalId}/approve`, {
-            method: 'POST',
-            body: JSON.stringify({ decision: decision || {} }),
-        })
-    }
-
-    async rejectRealtimeApproval(approvalId: string, decision?: Record<string, unknown>): Promise<RealtimeApprovalTask> {
-        return this.request<RealtimeApprovalTask>(`/v1/realtime/approvals/${approvalId}/reject`, {
-            method: 'POST',
-            body: JSON.stringify({ decision: decision || {} }),
-        })
-    }
 
     async runStrategyPlatformBacktest(data: StrategyPlatformBacktestRequest): Promise<BacktestRun> {
         return this.request<BacktestRun>('/v1/backtests', {

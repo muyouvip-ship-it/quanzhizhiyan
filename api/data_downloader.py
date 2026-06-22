@@ -34,6 +34,8 @@ from api.services.market_data_pipeline_service import (
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 QmtProgressCallback = Callable[[int, str], Awaitable[None] | None]
+AKSHARE_MINUTE_MIN_DELAY_SECONDS = max(float(os.getenv("AKSHARE_MINUTE_MIN_DELAY_SECONDS", "0.0") or 0.0), 0.0)
+AKSHARE_MINUTE_MAX_DELAY_SECONDS = max(float(os.getenv("AKSHARE_MINUTE_MAX_DELAY_SECONDS", "0.2") or 0.2), AKSHARE_MINUTE_MIN_DELAY_SECONDS)
 
 
 def _pick_frame_value(row: pd.Series, *candidates: str) -> float | None:
@@ -57,6 +59,30 @@ def _normalize_symbol_for_query(symbol: str) -> str:
             return f"{text}.SH"
         return f"{text}.SZ"
     return text
+
+
+def _normalize_index_symbol_for_query(symbol: str) -> str:
+    text = str(symbol or "").strip().upper()
+    index_symbol_by_code = {
+        "000001": "000001.SH",
+        "399001": "399001.SZ",
+        "399006": "399006.SZ",
+        "000300": "000300.SH",
+        "000905": "000905.SH",
+        "000852": "000852.SH",
+        "000688": "000688.SH",
+        "899050": "899050.BJ",
+    }
+    if text in index_symbol_by_code.values():
+        return text
+    if "." in text:
+        return text
+    if text.startswith(("SH", "SZ", "BJ")) and len(text) >= 8:
+        code = text[2:]
+        candidate = index_symbol_by_code.get(code)
+        if candidate and candidate.endswith(f".{text[:2]}"):
+            return candidate
+    return index_symbol_by_code.get(text, _normalize_symbol_for_query(text))
 
 
 def _stock_code_for_minute_query(symbol: str) -> str:
@@ -147,13 +173,14 @@ class DataDownloader:
                 """).bindparams(bindparam("symbols", expanding=True))
             elif data_type == 'index_data':
                 # 检查指数数据
+                symbol_variants = sorted({symbol, symbol.split(".", 1)[0], _normalize_index_symbol_for_query(symbol)} - {""})
                 query = text("""
                     SELECT MIN(trade_date) as min_date, MAX(trade_date) as max_date, COUNT(*) as count
-                    FROM index_daily_data 
-                    WHERE symbol = :symbol 
+                    FROM index_daily_kline
+                    WHERE symbol IN :symbols
                       AND trade_date >= :start_date 
                       AND trade_date <= :end_date
-                """)
+                """).bindparams(bindparam("symbols", expanding=True))
             else:
                 return {"exists": False, "complete": False}
             
@@ -161,7 +188,7 @@ class DataDownloader:
                 "start_date": start_date,
                 "end_date": end_date,
             }
-            if data_type == 'daily_kline':
+            if data_type in {'daily_kline', 'index_data'}:
                 params["symbols"] = symbol_variants
             else:
                 params["symbol"] = symbol
@@ -276,10 +303,18 @@ class DataDownloader:
     async def download_index_data(self, symbol: str, start_date: date, end_date: date) -> Dict[str, Any]:
         """下载指数数据 - 使用新浪接口"""
         try:
+            normalized_symbol = _normalize_index_symbol_for_query(symbol)
+            index_code = normalized_symbol.split(".", 1)[0] if "." in normalized_symbol else normalized_symbol
             logger.info(f"开始下载指数 {symbol} 数据: {start_date} ~ {end_date}")
             
             # 使用新浪接口
-            df = ak.stock_zh_index_daily(symbol=f"sh{symbol}" if symbol.startswith('000') or symbol.startswith('9') else f"sz{symbol}")
+            if normalized_symbol.endswith(".SH"):
+                ak_symbol = f"sh{index_code}"
+            elif normalized_symbol.endswith(".BJ"):
+                ak_symbol = f"bj{index_code}"
+            else:
+                ak_symbol = f"sz{index_code}"
+            df = ak.stock_zh_index_daily(symbol=ak_symbol)
             
             if df.empty:
                 logger.warning(f"指数 {symbol} 没有数据")
@@ -295,39 +330,36 @@ class DataDownloader:
                 logger.warning(f"指数 {symbol} 在指定日期范围内没有数据")
                 return {"success": False, "records": 0, "error": "日期范围内无数据"}
             
-            # 数据入库
-            records_inserted = 0
+            payload = []
             for _, row in df_filtered.iterrows():
-                try:
-                    insert_query = text("""
-                        INSERT INTO index_daily_data 
-                        (symbol, trade_date, open, high, low, close, volume, amount)
-                        VALUES (:symbol, :trade_date, :open, :high, :low, :close, :volume, :amount)
-                        ON CONFLICT (symbol, trade_date) DO UPDATE SET
-                            open = EXCLUDED.open,
-                            high = EXCLUDED.high,
-                            low = EXCLUDED.low,
-                            close = EXCLUDED.close,
-                            volume = EXCLUDED.volume,
-                            amount = EXCLUDED.amount,
-                            updated_at = NOW()
-                    """)
-                    
-                    self.db.execute(insert_query, {
-                        "symbol": symbol,
-                        "trade_date": row['date'].date(),
-                        "open": float(row['open']) if pd.notna(row['open']) else None,
-                        "high": float(row['high']) if pd.notna(row['high']) else None,
-                        "low": float(row['low']) if pd.notna(row['low']) else None,
-                        "close": float(row['close']) if pd.notna(row['close']) else None,
-                        "volume": int(row['volume']) if pd.notna(row['volume']) else None,
-                        "amount": float(row['amount']) if pd.notna(row['amount']) else None
-                    })
-                    records_inserted += 1
-                except Exception as e:
-                    logger.error(f"插入指数数据失败 {symbol} {row['date']}: {e}")
-                    continue
-            
+                payload.append({
+                    "symbol": normalized_symbol,
+                    "trade_date": row['date'].date(),
+                    "open": float(row['open']) if pd.notna(row['open']) else None,
+                    "high": float(row['high']) if pd.notna(row['high']) else None,
+                    "low": float(row['low']) if pd.notna(row['low']) else None,
+                    "close": float(row['close']) if pd.notna(row['close']) else None,
+                    "volume": int(row['volume']) if pd.notna(row['volume']) else None,
+                    "amount": float(row['amount']) if pd.notna(row['amount']) else None,
+                    "source": "akshare"
+                })
+            if payload:
+                insert_query = text("""
+                    INSERT INTO index_daily_kline
+                    (symbol, trade_date, open, high, low, close, volume, amount, source)
+                    VALUES (:symbol, :trade_date, :open, :high, :low, :close, :volume, :amount, :source)
+                    ON CONFLICT (symbol, trade_date) DO UPDATE SET
+                        open = EXCLUDED.open,
+                        high = EXCLUDED.high,
+                        low = EXCLUDED.low,
+                        close = EXCLUDED.close,
+                        volume = EXCLUDED.volume,
+                        amount = EXCLUDED.amount,
+                        source = EXCLUDED.source,
+                        updated_at = NOW()
+                """)
+                self.db.execute(insert_query, payload)
+            records_inserted = len(payload)
             self.db.commit()
             logger.info(f"成功下载指数 {symbol} 数据 {records_inserted} 条")
             return {"success": True, "records": records_inserted}
@@ -959,9 +991,9 @@ class DataDownloader:
     ) -> Dict[str, Any]:
         """下载股票1分钟K线数据，并写入 raw/norm/published 层。"""
         import random
-        
-        # 添加请求延时，避免API限流
-        await asyncio.sleep(random.uniform(0.2, 0.8))
+
+        if AKSHARE_MINUTE_MAX_DELAY_SECONDS > 0:
+            await asyncio.sleep(random.uniform(AKSHARE_MINUTE_MIN_DELAY_SECONDS, AKSHARE_MINUTE_MAX_DELAY_SECONDS))
         
         try:
             logger.info("开始下载 %s 1分钟K线数据: %s ~ %s (source=%s)", symbol, start_date, end_date, source)

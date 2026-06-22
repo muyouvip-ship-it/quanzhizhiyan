@@ -20,6 +20,33 @@ _TASK: asyncio.Task | None = None
 _STOP_EVENT: asyncio.Event | None = None
 _POLL_SECONDS = 60
 _STALE_TASK_MINUTES = max(int(os.getenv("BACKTEST_DATA_TASK_STALE_MINUTES", "120") or 120), 30)
+DEFAULT_MARKET_CLOSE_SYNC_TYPES = ["daily_kline", "index_data", "index_minute_kline", "minute_kline"]
+MARKET_CLOSE_TASK_PRIORITY = {
+    "daily_kline": 10,
+    "index_data": 20,
+    "index_minute_kline": 30,
+    "minute_kline": 90,
+}
+DEFAULT_MARKET_CLOSE_DATA_SOURCE = "tdx"
+DEFAULT_MARKET_CLOSE_SCHEDULE = (15, 5)
+DEFAULT_DAILY_ENRICHMENT_DATA_SOURCE = "quantclass"
+DEFAULT_DAILY_ENRICHMENT_SCHEDULE = (20, 5)
+_FULL_MARKET_MINUTE_MIN_SYMBOLS = max(int(os.getenv("BACKTEST_FULL_MARKET_MINUTE_MIN_SYMBOLS", "3000") or 3000), 1)
+_FULL_MARKET_DAILY_MIN_SYMBOLS = max(int(os.getenv("BACKTEST_FULL_MARKET_DAILY_MIN_SYMBOLS", "3000") or 3000), 1)
+_INDEX_MIN_SYMBOLS = max(int(os.getenv("BACKTEST_INDEX_MIN_SYMBOLS", "8") or 8), 1)
+_MINUTE_MIN_BARS = max(int(os.getenv("BACKTEST_MINUTE_COMPLETE_MIN_BARS", "200") or 200), 1)
+
+
+def _order_subscription_data_types(data_types: list[str]) -> list[str]:
+    indexed: list[tuple[int, int, str]] = []
+    for index, item in enumerate(data_types):
+        data_type = str(item).strip()
+        if not data_type:
+            continue
+        indexed.append((MARKET_CLOSE_TASK_PRIORITY.get(data_type, 50), index, data_type))
+    return [data_type for _priority, _index, data_type in sorted(indexed)]
+
+
 
 
 
@@ -81,8 +108,10 @@ def _scan_and_run_once() -> None:
         """)).fetchall()
         for row in rows:
             if not _should_run(row, now):
+                _run_daily_enrichment_if_due(row, now)
                 continue
             _run_single_config(row.id, now)
+            _run_daily_enrichment_if_due(row, now)
 
 
 def trigger_config_now(config_id: int) -> list[int]:
@@ -108,9 +137,9 @@ def get_config_status(config_id: int, *, user_id: str | None = None) -> dict:
 def _should_run(row, now: datetime) -> bool:
     timezone_name = str(getattr(row, "timezone", None) or "Asia/Shanghai").strip() or "Asia/Shanghai"
     local_now = now.astimezone(_safe_zoneinfo(timezone_name))
-    schedule_time = _parse_schedule_time(str(getattr(row, "schedule_time", None) or "18:30"))
+    schedule_time = _parse_schedule_time(str(getattr(row, "schedule_time", None) or "15:05"))
     if schedule_time is None:
-        schedule_time = (18, 30)
+        schedule_time = DEFAULT_MARKET_CLOSE_SCHEDULE
     if (local_now.hour, local_now.minute) < schedule_time:
         return False
 
@@ -161,14 +190,9 @@ def _run_single_config(config_id: int, now: datetime, *, force: bool = False) ->
         if recovered:
             db.commit()
             logger.warning("[backtest-auto-update] recovered stale tasks before config run config=%s count=%s", config_id, recovered)
-        data_types = [str(item).strip() for item in (row.enabled_data_types or []) if str(item).strip()]
+        data_types = _order_subscription_data_types(row.enabled_data_types or [])
         if not data_types:
-            stats_rows = db.execute(text("""
-                SELECT DISTINCT data_type
-                FROM backtest_data_stats
-                WHERE last_updated_date IS NOT NULL
-            """)).fetchall()
-            data_types = [str(item[0]).strip() for item in stats_rows if str(item[0]).strip()]
+            data_types = list(DEFAULT_MARKET_CLOSE_SYNC_TYPES)
         if not data_types:
             logger.info("[backtest-auto-update] skip config=%s no data types", config_id)
             return []
@@ -198,6 +222,7 @@ def _run_single_config(config_id: int, now: datetime, *, force: bool = False) ->
                 WHERE user_id = :user_id
                   AND task_type = :task_type
                   AND COALESCE(subscription_config_id, 0) = :config_id
+                  AND COALESCE(task_scope, 'primary') = 'primary'
                   AND status IN ('pending', 'running')
                 LIMIT 1
             """), {"user_id": row.user_id, "task_type": data_type, "config_id": int(row.id)}).fetchone()
@@ -217,8 +242,8 @@ def _run_single_config(config_id: int, now: datetime, *, force: bool = False) ->
             )
             result = db.execute(text("""
                 INSERT INTO backtest_data_tasks
-                (user_id, task_type, data_source, date_range_start, date_range_end, symbols, status, error_message, subscription_config_id, trigger_mode)
-                VALUES (:user_id, :task_type, :data_source, :date_range_start, :date_range_end, :symbols, 'pending', :error_message, :subscription_config_id, :trigger_mode)
+                (user_id, task_type, data_source, date_range_start, date_range_end, symbols, status, error_message, subscription_config_id, trigger_mode, task_scope)
+                VALUES (:user_id, :task_type, :data_source, :date_range_start, :date_range_end, :symbols, 'pending', :error_message, :subscription_config_id, :trigger_mode, 'primary')
                 RETURNING id
             """), {
                 "user_id": row.user_id,
@@ -267,6 +292,121 @@ def _run_single_config(config_id: int, now: datetime, *, force: bool = False) ->
     return task_ids
 
 
+def _run_daily_enrichment_if_due(row, now: datetime) -> list[int]:
+    data_types = [str(item).strip() for item in (getattr(row, "enabled_data_types", None) or []) if str(item).strip()]
+    if data_types and "daily_kline" not in data_types:
+        return []
+    if not _should_run_daily_enrichment(row, now):
+        return []
+    return _create_daily_enrichment_task(row, now)
+
+
+def _should_run_daily_enrichment(row, now: datetime) -> bool:
+    if not bool(getattr(row, "auto_download", False)):
+        return False
+    schedule_time = _parse_schedule_time(os.getenv("BACKTEST_DAILY_ENRICHMENT_TIME", "20:05")) or DEFAULT_DAILY_ENRICHMENT_SCHEDULE
+
+    target_data_date = _resolve_target_data_date_for_time(row, now, schedule_time=schedule_time)
+    if bool(getattr(row, "only_trading_day", True)):
+        try:
+            if not is_cn_trading_day(target_data_date.isoformat()):
+                return False
+        except Exception:
+            logger.warning("[backtest-auto-update] enrichment trading day check failed config=%s", getattr(row, "id", None))
+
+    scope_key = _scope_key(getattr(row, "default_symbols", None) or [])
+    with SessionLocal() as db:
+        existing_running = db.execute(text("""
+            SELECT id
+            FROM backtest_data_tasks
+            WHERE user_id = :user_id
+              AND COALESCE(subscription_config_id, 0) = :config_id
+              AND task_type = 'daily_kline'
+              AND COALESCE(data_source, '') = :data_source
+              AND COALESCE(task_scope, 'primary') = 'daily_enrichment'
+              AND status IN ('pending', 'running')
+            LIMIT 1
+        """), {
+            "user_id": row.user_id,
+            "config_id": int(row.id),
+            "data_source": DEFAULT_DAILY_ENRICHMENT_DATA_SOURCE,
+        }).fetchone()
+        if existing_running is not None:
+            return False
+
+        watermark = db.execute(text("""
+            SELECT *
+            FROM backtest_data_watermarks
+            WHERE user_id = :user_id
+              AND config_id = :config_id
+              AND data_type = 'daily_kline_enrichment'
+              AND COALESCE(data_source, '') = :data_source
+              AND scope_key = :scope_key
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+        """), {
+            "user_id": row.user_id,
+            "config_id": int(row.id),
+            "data_source": DEFAULT_DAILY_ENRICHMENT_DATA_SOURCE,
+            "scope_key": scope_key,
+        }).fetchone()
+        if watermark is None:
+            return True
+        if getattr(watermark, "last_data_date", None) and watermark.last_data_date >= target_data_date and str(watermark.last_status or "") == "completed":
+            return False
+        if str(watermark.last_status or "") in {"running", "failed"}:
+            retry_minutes = max(int(os.getenv("BACKTEST_AUTO_UPDATE_RETRY_MINUTES", "30") or 30), 5)
+            last_run = _ensure_utc(getattr(watermark, "last_run_started_at", None))
+            if last_run is not None and (now - last_run) < timedelta(minutes=retry_minutes):
+                return False
+        return True
+
+
+def _create_daily_enrichment_task(row, now: datetime) -> list[int]:
+    timezone_name = str(getattr(row, "timezone", None) or "Asia/Shanghai").strip() or "Asia/Shanghai"
+    schedule_time = _parse_schedule_time(os.getenv("BACKTEST_DAILY_ENRICHMENT_TIME", "20:05")) or DEFAULT_DAILY_ENRICHMENT_SCHEDULE
+    target_data_date = _resolve_target_data_date_for_time(row, now, schedule_time=schedule_time)
+    scope_key = _scope_key(getattr(row, "default_symbols", None) or [])
+    with SessionLocal() as db:
+        _touch_watermark(
+            db,
+            user_id=str(row.user_id),
+            config_id=int(row.id),
+            data_type="daily_kline_enrichment",
+            data_source=DEFAULT_DAILY_ENRICHMENT_DATA_SOURCE,
+            scope_key=scope_key,
+            last_run_started_at=now,
+            last_status="running",
+            last_error=None,
+        )
+        result = db.execute(text("""
+            INSERT INTO backtest_data_tasks
+            (user_id, task_type, data_source, date_range_start, date_range_end, symbols, status, error_message, subscription_config_id, trigger_mode, task_scope)
+            VALUES (:user_id, 'daily_kline', :data_source, :date_range_start, :date_range_end, :symbols, 'pending', :error_message, :subscription_config_id, 'scheduled_enrichment', 'daily_enrichment')
+            RETURNING id
+        """), {
+            "user_id": row.user_id,
+            "data_source": DEFAULT_DAILY_ENRICHMENT_DATA_SOURCE,
+            "date_range_start": target_data_date,
+            "date_range_end": target_data_date,
+            "symbols": getattr(row, "default_symbols", None) or [],
+            "error_message": f"量化课堂富字段补充任务已创建（目标日 {target_data_date.isoformat()}，调度时区 {timezone_name}）",
+            "subscription_config_id": int(row.id),
+        })
+        task_id = int(result.fetchone()[0])
+        db.commit()
+
+    thread = threading.Thread(
+        target=_launch_download_worker,
+        args=([task_id], str(row.user_id)),
+        daemon=True,
+        name=f"backtest-daily-enrichment-{row.id}",
+    )
+    thread.start()
+    logger.info("[backtest-auto-update] daily enrichment config=%s task=%s target=%s", row.id, task_id, target_data_date)
+    return [task_id]
+
+
 def _launch_download_worker(task_ids: list[int], user_id: str) -> None:
     from api.backtest_data_api import _process_batch_download
 
@@ -288,6 +428,14 @@ def _resolve_incremental_date_range(
     target_date: date | None = None,
 ) -> tuple[date, date] | None:
     target_date = target_date or _resolve_target_data_date(datetime.now().date())
+    coverage = _target_coverage_snapshot(
+        db,
+        data_type=data_type,
+        target_date=target_date,
+        symbols=None if scope_key == "all" else _symbols_from_scope_key(scope_key),
+    )
+    if coverage.get("complete"):
+        return None
     actual_data_end = _resolve_actual_data_end(db, data_type=data_type, symbols=None if scope_key == "all" else _symbols_from_scope_key(scope_key))
     watermark = db.execute(text("""
         SELECT *
@@ -308,13 +456,13 @@ def _resolve_incremental_date_range(
     }).fetchone()
     if actual_data_end is not None:
         if actual_data_end >= target_date:
-            return None
+            return target_date, target_date
         return actual_data_end + timedelta(days=1), target_date
 
     if watermark is not None and getattr(watermark, "last_data_date", None):
         last_data_date = watermark.last_data_date
         if last_data_date >= target_date:
-            return None
+            return target_date, target_date
         return last_data_date + timedelta(days=1), target_date
 
     stat = db.execute(text("""
@@ -332,13 +480,13 @@ def _resolve_incremental_date_range(
     last_updated_date = stat.last_updated_date
     if data_type in {"minute_kline", "index_minute_kline"}:
         if last_updated_date == target_date and existing_end == target_date:
-            return None
+            return target_date, target_date
         if existing_end and existing_end < target_date:
             return existing_end + timedelta(days=1), target_date
         return target_date, target_date
 
     if last_updated_date == target_date and existing_end and existing_end >= target_date:
-        return None
+        return target_date, target_date
     if existing_end and existing_end < target_date:
         return existing_end + timedelta(days=1), target_date
     return target_date, target_date
@@ -354,7 +502,13 @@ def _resolve_target_data_date(today: date) -> date:
 def _resolve_target_data_date_for_config(row, now: datetime) -> date:
     timezone_name = str(getattr(row, "timezone", None) or "Asia/Shanghai").strip() or "Asia/Shanghai"
     local_now = now.astimezone(_safe_zoneinfo(timezone_name))
-    schedule_time = _parse_schedule_time(str(getattr(row, "schedule_time", None) or "18:30")) or (18, 30)
+    schedule_time = _parse_schedule_time(str(getattr(row, "schedule_time", None) or "15:05")) or DEFAULT_MARKET_CLOSE_SCHEDULE
+    return _resolve_target_data_date_for_time(row, now, schedule_time=schedule_time)
+
+
+def _resolve_target_data_date_for_time(row, now: datetime, *, schedule_time: tuple[int, int]) -> date:
+    timezone_name = str(getattr(row, "timezone", None) or "Asia/Shanghai").strip() or "Asia/Shanghai"
+    local_now = now.astimezone(_safe_zoneinfo(timezone_name))
     target = local_now.date()
     if (local_now.hour, local_now.minute) < schedule_time:
         target -= timedelta(days=1)
@@ -371,7 +525,7 @@ def _is_likely_cn_trading_day(value: date) -> bool:
 def _resolve_actual_data_end(db, *, data_type: str, symbols: list[str] | None) -> date | None:
     table_mapping = {
         "daily_kline": (preferred_daily_kline_table(), "trade_date"),
-        "index_data": ("index_daily_data", "trade_date"),
+        "index_data": ("index_daily_kline", "trade_date"),
         "minute_kline": (preferred_minute_kline_table(), "trade_time"),
         "index_minute_kline": ("index_minute_kline", "trade_time"),
     }
@@ -381,7 +535,7 @@ def _resolve_actual_data_end(db, *, data_type: str, symbols: list[str] | None) -
     table_name, date_column = table_info
     if data_type == "daily_kline" and table_name == "market_stock_daily_kline":
         return _resolve_market_daily_actual_end(db, symbols=symbols)
-    date_expr = date_column if date_column == "trade_date" else f"DATE({date_column})"
+    date_expr = date_column if date_column == "trade_date" else date_column
     if symbols:
         row = db.execute(text(f"""
             SELECT MAX({date_expr}) AS max_date
@@ -393,7 +547,98 @@ def _resolve_actual_data_end(db, *, data_type: str, symbols: list[str] | None) -
             SELECT MAX({date_expr}) AS max_date
             FROM {table_name}
         """)).fetchone()
-    return row.max_date if row and getattr(row, "max_date", None) else None
+    value = row.max_date if row and getattr(row, "max_date", None) else None
+    if value is not None and date_column != "trade_date" and hasattr(value, "date"):
+        return value.date()
+    return value
+
+
+def _target_coverage_snapshot(
+    db,
+    *,
+    data_type: str,
+    target_date: date,
+    symbols: list[str] | None,
+) -> dict:
+    if data_type == "daily_kline":
+        return _daily_coverage_snapshot(db, table_name=preferred_daily_kline_table(), target_date=target_date, symbols=symbols)
+    if data_type == "minute_kline":
+        return _minute_coverage_snapshot(db, table_name=preferred_minute_kline_table(), target_date=target_date, symbols=symbols)
+    if data_type == "index_data":
+        return _daily_coverage_snapshot(db, table_name="index_daily_kline", target_date=target_date, symbols=symbols, min_symbols=_INDEX_MIN_SYMBOLS)
+    if data_type == "index_minute_kline":
+        return _minute_coverage_snapshot(db, table_name="index_minute_kline", target_date=target_date, symbols=symbols, min_symbols=_INDEX_MIN_SYMBOLS)
+    return {"complete": False}
+
+
+def _daily_coverage_snapshot(
+    db,
+    *,
+    table_name: str,
+    target_date: date,
+    symbols: list[str] | None,
+    min_symbols: int | None = None,
+) -> dict:
+    if not _relation_exists(db, table_name):
+        return {"complete": False, "symbol_count": 0}
+    params: dict[str, object] = {"target_date": target_date}
+    filters = ["trade_date = :target_date"]
+    expected_min = int(min_symbols or (len(symbols) if symbols else _FULL_MARKET_DAILY_MIN_SYMBOLS))
+    if symbols:
+        filters.append("symbol = ANY(:symbols)")
+        params["symbols"] = symbols
+    row = db.execute(text(f"""
+        SELECT COUNT(DISTINCT symbol) AS symbol_count
+        FROM {table_name}
+        WHERE {" AND ".join(filters)}
+    """), params).fetchone()
+    symbol_count = int(row.symbol_count or 0) if row else 0
+    return {
+        "complete": symbol_count >= max(expected_min, 1),
+        "symbol_count": symbol_count,
+        "expected_min": max(expected_min, 1),
+    }
+
+
+def _minute_coverage_snapshot(
+    db,
+    *,
+    table_name: str,
+    target_date: date,
+    symbols: list[str] | None,
+    min_symbols: int | None = None,
+) -> dict:
+    if not _relation_exists(db, table_name):
+        return {"complete": False, "symbol_count": 0, "qualified_symbol_count": 0}
+    start_time = datetime.combine(target_date, datetime.min.time())
+    end_time = start_time + timedelta(days=1)
+    params: dict[str, object] = {
+        "start_time": start_time,
+        "end_time": end_time,
+        "min_bars": _MINUTE_MIN_BARS,
+    }
+    filters = ["trade_time >= :start_time", "trade_time < :end_time"]
+    expected_min = int(min_symbols or (len(symbols) if symbols else _FULL_MARKET_MINUTE_MIN_SYMBOLS))
+    if symbols:
+        filters.append("symbol = ANY(:symbols)")
+        params["symbols"] = symbols
+    row = db.execute(text(f"""
+        SELECT COUNT(*) AS qualified_symbol_count
+        FROM (
+            SELECT symbol, COUNT(*) AS bar_count
+            FROM {table_name}
+            WHERE {" AND ".join(filters)}
+            GROUP BY symbol
+            HAVING COUNT(*) >= :min_bars
+        ) t
+    """), params).fetchone()
+    qualified = int(row.qualified_symbol_count or 0) if row else 0
+    return {
+        "complete": qualified >= max(expected_min, 1),
+        "qualified_symbol_count": qualified,
+        "expected_min": max(expected_min, 1),
+        "min_bars": _MINUTE_MIN_BARS,
+    }
 
 
 def _resolve_market_daily_actual_end(db, *, symbols: list[str] | None) -> date | None:
@@ -444,11 +689,27 @@ def _scope_key(symbols: list[str]) -> str:
 
 
 def _effective_subscription_data_source(data_type: str, preferred: str | None) -> str:
-    # Daily K-line subscriptions are backed by QuantClass. Keep alternate
-    # daily sources available only for explicit one-off download tasks.
-    if str(data_type or "").strip() == "daily_kline":
+    normalized_type = str(data_type or "").strip()
+    preferred_source = str(preferred or DEFAULT_MARKET_CLOSE_DATA_SOURCE).strip().lower() or DEFAULT_MARKET_CLOSE_DATA_SOURCE
+    compatibility = {
+        "daily_kline": {"tdx", "quantclass", "akshare", "baostock", "tencent"},
+        "minute_kline": {"tdx", "qmt", "akshare"},
+        "index_data": {"tdx", "qmt", "akshare", "quantclass", "baostock", "tushare", "eastmoney"},
+        "index_minute_kline": {"tdx", "qmt", "akshare"},
+        "chip_data": {"quantclass"},
+        "financial_data": {"quantclass"},
+        "research_reports": {"eastmoney"},
+    }
+    allowed = compatibility.get(normalized_type)
+    if allowed and preferred_source in allowed:
+        return preferred_source
+    if normalized_type in {"daily_kline", "minute_kline", "index_data", "index_minute_kline"}:
+        return DEFAULT_MARKET_CLOSE_DATA_SOURCE
+    if normalized_type == "research_reports":
+        return "eastmoney"
+    if normalized_type in {"chip_data", "financial_data"}:
         return "quantclass"
-    return str(preferred or "akshare").strip() or "akshare"
+    return preferred_source
 
 
 def _build_status_payload(db, row, now: datetime) -> dict:
@@ -474,16 +735,11 @@ def _build_status_payload(db, row, now: datetime) -> dict:
         FROM backtest_data_tasks
         WHERE user_id = :user_id
           AND COALESCE(subscription_config_id, 0) = :config_id
-          AND COALESCE(data_source, '') = :data_source
         ORDER BY created_at DESC, id DESC
         LIMIT 1
     """), {
         "user_id": row.user_id,
         "config_id": int(row.id),
-        "data_source": _effective_subscription_data_source(
-            "daily_kline" if "daily_kline" in (getattr(row, "enabled_data_types", None) or []) else "",
-            getattr(row, "data_source_preference", None),
-        ),
     }).fetchone()
     running_task_count = db.execute(text("""
         SELECT COUNT(*)
@@ -504,6 +760,7 @@ def _build_status_payload(db, row, now: datetime) -> dict:
     watermarks: list[dict] = []
     latest_watermark_date: date | None = None
     intraday_capture: dict | None = None
+    daily_enrichment: dict | None = None
     for item in watermark_rows:
         payload = {
             "data_type": item.data_type,
@@ -518,6 +775,9 @@ def _build_status_payload(db, row, now: datetime) -> dict:
         }
         if str(item.data_type) == "minute_kline_intraday":
             intraday_capture = payload
+            continue
+        if str(item.data_type) == "daily_kline_enrichment":
+            daily_enrichment = payload
             continue
         watermarks.append(payload)
         if getattr(item, "last_data_date", None) and (latest_watermark_date is None or item.last_data_date > latest_watermark_date):
@@ -539,6 +799,7 @@ def _build_status_payload(db, row, now: datetime) -> dict:
         "watermarks": watermarks,
         "latest_watermark_date": latest_watermark_date.isoformat() if latest_watermark_date else None,
         "intraday_capture": intraday_capture,
+        "daily_enrichment": daily_enrichment,
     }
 
 
@@ -548,11 +809,17 @@ def _compute_next_run_at(row, now: datetime) -> datetime | None:
     timezone_name = str(getattr(row, "timezone", None) or "Asia/Shanghai").strip() or "Asia/Shanghai"
     local_zone = _safe_zoneinfo(timezone_name)
     local_now = now.astimezone(local_zone)
-    schedule_time = _parse_schedule_time(str(getattr(row, "schedule_time", None) or "18:30")) or (18, 30)
+    schedule_time = _parse_schedule_time(str(getattr(row, "schedule_time", None) or "15:05")) or DEFAULT_MARKET_CLOSE_SCHEDULE
     frequency = str(getattr(row, "update_frequency", None) or "daily").strip().lower() or "daily"
     candidate = local_now.replace(hour=schedule_time[0], minute=schedule_time[1], second=0, microsecond=0)
     last_run = _ensure_utc(getattr(row, "last_run_at", None))
+    last_success = _ensure_utc(getattr(row, "last_success_at", None))
     last_run_local_date = last_run.astimezone(local_zone).date() if last_run else None
+    if last_run is not None and (last_success is None or last_success < last_run):
+        retry_minutes = max(int(os.getenv("BACKTEST_AUTO_UPDATE_RETRY_MINUTES", "30") or 30), 5)
+        retry_candidate = last_run.astimezone(local_zone) + timedelta(minutes=retry_minutes)
+        if retry_candidate > local_now:
+            return retry_candidate.astimezone(timezone.utc)
 
     if frequency == "weekly":
         if candidate <= local_now or last_run_local_date == local_now.date():
@@ -611,7 +878,7 @@ def recover_stale_running_tasks(
         "stale_minutes": effective_stale_minutes,
         "error_message": f"任务超过 {effective_stale_minutes} 分钟未更新，已自动标记失败；可重新触发订阅。",
     }
-    filters = ["status IN ('pending', 'running')", "updated_at < (NOW() - (:stale_minutes * INTERVAL '1 minute'))"]
+    filters = ["status = 'running'", "updated_at < (NOW() - (:stale_minutes * INTERVAL '1 minute'))"]
     if user_id is not None:
         filters.append("user_id = :user_id")
         params["user_id"] = str(user_id)

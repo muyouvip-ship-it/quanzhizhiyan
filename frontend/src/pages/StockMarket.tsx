@@ -1,7 +1,6 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from 'react'
 import { Loader2, RefreshCw, Search, TrendingDown, TrendingUp } from 'lucide-react'
 
-import DataSourceGovernanceCard, { type DataSourceGovernanceItem } from '@/components/DataSourceGovernanceCard'
 import { usePolling } from '@/hooks/usePolling'
 import { api } from '@/services/api'
 import type { MarketOverviewResponse, MarketSectorItem, MarketTickerItem, StockSearchResult } from '@/types'
@@ -247,56 +246,8 @@ export default function StockMarket() {
     ].find(item => item.symbol === selectedSymbol) || null,
     [overview?.indices, overview?.top_gainers, overview?.top_losers, selectedSymbol],
   )
-  const backendGovernance = overview?.data_governance || null
   const marketStats = overview?.market_stats || {}
   const marketBehavior = overview?.market_behavior_labels || {}
-  const governanceItems = useMemo<DataSourceGovernanceItem[]>(() => {
-    if (backendGovernance?.items?.length) return backendGovernance.items
-    const indexSources = Array.from(new Set((overview?.indices || []).map(item => item.source).filter(Boolean)))
-    const rankingSources = Array.from(
-      new Set([...(overview?.top_gainers || []), ...(overview?.top_losers || [])].map(item => item.source).filter(Boolean)),
-    )
-    const sectorSources = Array.from(
-      new Set([
-        ...(overview?.sector_gainers || []),
-        ...(overview?.sector_losers || []),
-        ...(overview?.sector_fund_inflows || []),
-        ...(overview?.sector_fund_outflows || []),
-      ].map(item => item.source).filter(Boolean)),
-    )
-    return [
-      {
-        label: '页面主数据源',
-        value: overview?.source || '--',
-        detail: overview?.fallback ? '当前页面已经退回前端或后端回退链路' : '当前使用市场总览接口返回结果',
-        tone: overview?.fallback ? 'warn' : 'good',
-      },
-      {
-        label: '指数行情',
-        value: indexSources.join(' / ') || '--',
-        detail: '三大指数与主要宽基指数的实时或近实时来源',
-        tone: indexSources.some(item => String(item).includes('qmt')) ? 'good' : 'neutral',
-      },
-      {
-        label: '个股与榜单',
-        value: rankingSources.join(' / ') || '--',
-        detail: '涨跌榜、搜索结果与个股卡片使用的来源集合',
-        tone: rankingSources.some(item => String(item).includes('qmt')) ? 'good' : 'neutral',
-      },
-      {
-        label: '板块与资金流',
-        value: sectorSources.join(' / ') || '--',
-        detail: '板块热度与资金流一般是独立来源，不等同于实时逐笔行情',
-        tone: sectorSources.some(item => String(item).includes('akshare')) ? 'info' : 'neutral',
-      },
-      {
-        label: '页面更新时间',
-        value: formatDateTime(overview?.updated_at),
-        detail: '这是市场总览接口给出的最近更新时间，不代表每个子模块完全同频',
-        tone: 'info',
-      },
-    ]
-  }, [backendGovernance?.items, overview])
   const marketBehaviorCards = useMemo(() => {
     const labels = marketBehavior as Record<string, { label?: string; detail?: string }>
     return [
@@ -309,18 +260,6 @@ export default function StockMarket() {
       labels.risk_pressure,
     ].filter(Boolean)
   }, [marketBehavior])
-  const governanceWarnings = useMemo(() => {
-    if (backendGovernance?.warnings?.length) {
-      const merged = [...backendGovernance.warnings]
-      if (error && !merged.includes(error)) merged.push(error)
-      return merged
-    }
-    const warnings: string[] = []
-    if (overview?.fallback) warnings.push('当前市场页已进入 fallback 链路，指数、榜单和板块数据可能来自不同回退源。')
-    if (error) warnings.push(error)
-    return warnings
-  }, [backendGovernance?.warnings, error, overview?.fallback])
-
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-3 xl:flex-row xl:items-end xl:justify-between">
@@ -398,13 +337,6 @@ export default function StockMarket() {
           {error}
         </div>
       )}
-
-      <DataSourceGovernanceCard
-        title="数据源治理"
-        description={backendGovernance?.description || '股票市场页同时混合指数行情、个股榜单、板块热度和资金流来源，必须明确区分。'}
-        items={governanceItems}
-        warnings={governanceWarnings}
-      />
 
       <div className="grid gap-4 xl:grid-cols-4">
         <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950/50">

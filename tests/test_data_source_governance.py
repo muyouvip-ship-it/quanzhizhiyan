@@ -65,7 +65,12 @@ def test_news_source_links_expose_fetch_names_and_urls():
     sources = list_news_source_links()
     names = {item["name"] for item in sources}
     assert "财联社电报" in names
+    assert "巨潮资讯公告" in names
+    assert "上交所公告" in names
+    assert "深交所公告" in names
     assert "东方财富全球快讯" in names
+    official = [item for item in sources if item.get("tier") == "一级"]
+    assert [item["name"] for item in official[:3]] == ["巨潮资讯公告", "上交所公告", "深交所公告"]
     assert all(item["url"].startswith("https://") for item in sources)
 
 

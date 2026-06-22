@@ -48,6 +48,11 @@ async def parse_position_image_endpoint(file: UploadFile = File(...), current_us
 
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="只支持图片文件")
+    allowed_extensions = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+    if file.filename:
+        ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+        if ext and f".{ext}" not in allowed_extensions:
+            raise HTTPException(status_code=400, detail=f"不支持的图片格式: {ext}")
     image_bytes = await file.read()
     if len(image_bytes) > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="图片不能超过 10MB")

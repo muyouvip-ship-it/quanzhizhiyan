@@ -12,7 +12,13 @@ from sqlalchemy import text
 
 import api.database as database_module
 import api.core.strategy_db as strategy_db_module
-from api.services import auth_service, catalyst_selection_service, news_eye_service, news_theme_service
+from api.services import (
+    auth_service,
+    catalyst_selection_service,
+    news_eye_service,
+    news_theme_service,
+    realtime_monitor_service,
+)
 from api.services import market_data_pipeline_service
 from api.services.strategy_platform_repository import save_platform_strategy
 from api.routes.strategy_platform import _default_dsl
@@ -1145,12 +1151,40 @@ def test_catalyst_selection_auto_maintains_monitor_only_realtime_monitor(db, mon
         },
         user_id=user_id,
     )
+    next_day = catalyst_selection_service.maintain_realtime_monitor_from_selection(
+        db,
+        selection={
+            **selection,
+            "trade_date": "2026-06-01",
+        },
+        user_id=user_id,
+    )
+    stale_update = catalyst_selection_service.maintain_realtime_monitor_from_selection(
+        db,
+        selection={
+            **selection,
+            "trade_date": "2026-05-28",
+            "items": [
+                {
+                    **selection["items"][0],
+                    "symbol": "000001.SZ",
+                    "name": "平安银行",
+                }
+            ],
+        },
+        user_id=user_id,
+    )
     monitors = db.query(RealtimeMonitorDB).filter(RealtimeMonitorDB.user_id == user_id).all()
 
     assert created["status"] == "created_running"
     assert created["monitor_symbol_count"] == 1
     assert updated["status"] == "updated_running"
     assert updated["monitor_id"] == created["monitor_id"]
+    assert next_day["status"] == "updated_running"
+    assert next_day["monitor_id"] == created["monitor_id"]
+    assert stale_update["status"] == "skipped_stale_selection"
+    assert stale_update["monitor_id"] == created["monitor_id"]
+    assert stale_update["kept_trade_date"] == "2026-06-01"
     assert updated["pool_changed"] is True
     assert updated["signal_clock_reset"] is True
     assert len(monitors) == 1
@@ -1158,12 +1192,14 @@ def test_catalyst_selection_auto_maintains_monitor_only_realtime_monitor(db, mon
     assert monitors[0].execution_mode == "monitor_only"
     assert monitors[0].auto_trade_enabled is False
     assert monitors[0].monitor_pool_json["source"] == "catalyst-selection"
-    assert monitors[0].monitor_pool_json["watch_symbols"] == ["688041.SH"]
-    assert monitors[0].monitor_pool_json["tradable_symbols"] == ["688041.SH"]
-    assert monitors[0].monitor_pool_json["manual_symbols"] == ["688041.SH"]
+    assert monitors[0].monitor_pool_json["trade_date"] == "2026-06-01"
+    assert monitors[0].monitor_pool_json["watch_symbols"] == ["603019.SH"]
+    assert monitors[0].monitor_pool_json["tradable_symbols"] == ["603019.SH"]
+    assert monitors[0].monitor_pool_json["manual_symbols"] == ["603019.SH"]
     assert monitors[0].monitor_pool_json["gate_counts"] == {"allow": 1}
     assert monitors[0].risk_config_json["gate_counts"] == {"allow": 1}
     assert "signal_clock" not in (monitors[0].state_json or {})
+    assert realtime_monitor_service.list_monitors(db, user_id) == []
 
 
 def test_realtime_monitor_feedback_is_captured_and_merged_into_profiles(db):

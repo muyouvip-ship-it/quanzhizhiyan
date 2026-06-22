@@ -174,7 +174,7 @@ def main():
         
         if not strategies:
             print("\n❌ 没有策略，请先创建策略")
-            print("   运行: python scripts/test_strategy_api.py")
+            print("   可先通过前端策略管理创建，或运行: python scripts/verify_strategy_workflows.py")
             return
         
         print(f"\n📋 找到 {len(strategies)} 个策略:")

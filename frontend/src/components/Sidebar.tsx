@@ -13,19 +13,19 @@ export default function Sidebar() {
 
     return (
         <aside
-            className={`fixed left-0 top-0 h-screen overflow-hidden bg-slate-900/95 backdrop-blur-md border-r border-slate-700 flex flex-col z-50 transition-all duration-300 ${isExpanded ? 'w-48' : 'w-16'
+            className={`fixed left-0 top-0 z-50 flex h-screen flex-col overflow-hidden border-r border-[var(--skin-border)] bg-[var(--skin-panel)] backdrop-blur-md transition-all duration-300 ${isExpanded ? 'w-52' : 'w-16'
                 }`}
             onMouseEnter={() => setIsExpanded(true)}
             onMouseLeave={() => setIsExpanded(false)}
         >
             {/* Logo */}
-            <div className="h-16 shrink-0 flex items-center justify-center border-b border-slate-700 px-2">
+            <div className="flex h-14 shrink-0 items-center justify-center border-b border-[var(--skin-border)] px-2">
                 <div className="flex items-center gap-3">
-                    <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-amber-400 via-orange-500 to-red-500 flex items-center justify-center shadow-lg shadow-orange-500/30 flex-shrink-0">
-                        <Crown className="w-5 h-5 text-white" />
+                    <div className="flex h-9 w-9 shrink-0 items-center justify-center border border-[var(--skin-accent)] bg-[var(--skin-accent-soft)]">
+                        <Crown className="h-5 w-5 text-[var(--skin-accent)]" />
                     </div>
                     {isExpanded && (
-                        <span className="font-bold text-base bg-gradient-to-r from-amber-300 via-orange-300 to-red-300 bg-clip-text text-transparent whitespace-nowrap">
+                        <span className="skin-display whitespace-nowrap text-base font-bold tracking-[0.12em] text-[var(--skin-accent)]">
                             量化之神
                         </span>
                     )}
@@ -33,37 +33,37 @@ export default function Sidebar() {
             </div>
 
             {/* Navigation */}
-            <nav className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden py-3 px-2 space-y-1.5 overscroll-contain">
+            <nav className="min-h-0 flex-1 space-y-1 overflow-y-auto overflow-x-hidden px-2 py-3 overscroll-contain">
                 {navItems.map((item) => (
                     <NavLink
                         key={item.path}
                         to={item.path}
                         className={({ isActive }) =>
-                            `flex items-center gap-3 px-3 py-3 rounded-xl transition-all duration-200 ${isActive
-                                ? 'bg-gradient-to-r from-blue-500/20 to-purple-500/20 text-blue-400 border border-blue-500/30'
-                                : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'
+                            `flex items-center gap-3 border px-3 py-2.5 text-[13px] transition-all duration-200 ${isActive
+                                ? 'border-[var(--skin-accent)] bg-[var(--skin-accent-soft)] text-[var(--skin-accent)]'
+                                : 'border-transparent text-[var(--skin-muted)] hover:border-[var(--skin-border)] hover:bg-[var(--skin-card)] hover:text-[var(--skin-text)]'
                             }`
                         }
                     >
-                        <item.icon className="w-5 h-5 flex-shrink-0" />
+                        <item.icon className="h-5 w-5 shrink-0" />
                         {isExpanded && (
-                            <span className="font-medium text-sm whitespace-nowrap">{item.label}</span>
+                            <span className="whitespace-nowrap font-medium">{item.label}</span>
                         )}
                     </NavLink>
                 ))}
             </nav>
 
             {/* Footer */}
-            <div className="shrink-0 p-3 border-t border-slate-700">
+            <div className="shrink-0 border-t border-[var(--skin-border)] p-3">
                 {isExpanded ? (
-                    <div className="text-xs text-slate-500 text-center">
-                        <p className="text-slate-300 text-sm font-medium">量化之神</p>
+                    <div className="text-center text-xs text-[var(--skin-dim)]">
+                        <p className="text-sm font-medium text-[var(--skin-text)]">量化之神</p>
                         <p className="mt-0.5">多智能体量化研究台</p>
-                        <p className="mt-1 font-mono text-[11px] text-slate-400">{buildVersion}</p>
-                        <p className="mt-0.5 text-[10px] text-slate-500">{buildDate} · {buildCommit}</p>
+                        <p className="mt-1 font-mono text-[11px] text-[var(--skin-muted)]">{buildVersion}</p>
+                        <p className="mt-0.5 text-[10px] text-[var(--skin-dim)]">{buildDate} · {buildCommit}</p>
                     </div>
                 ) : (
-                    <div className="text-[10px] text-slate-500 text-center font-mono">{buildCommit}</div>
+                    <div className="text-center font-mono text-[10px] text-[var(--skin-dim)]">{buildCommit}</div>
                 )}
             </div>
         </aside>
