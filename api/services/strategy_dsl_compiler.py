@@ -136,7 +136,7 @@ def compile_strategy_dsl(dsl: dict[str, Any]) -> CompiledStrategy:
         if weight <= 0:
             warnings.append(f"因子 {name} 的权重 <= 0，回测时会被忽略。")
         if catalog is None:
-            warnings.append(f"因子 {name} 暂未映射到原生编译器，当前按自定义占位因子处理。")
+            warnings.append(f"因子 {name} 尚未注册到因子目录，当前按自定义因子处理，请补充字段映射或计算实现。")
             pending_confirmations.append(
                 {
                     "kind": "unknown_factor",

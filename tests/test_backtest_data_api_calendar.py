@@ -16,7 +16,7 @@ def test_daily_kline_subscription_config_normalizes_hidden_tencent_source() -> N
         }
     )
 
-    assert payload["data_source_preference"] == "quantclass"
+    assert payload["data_source_preference"] == "tdx"
 
 
 def test_daily_kline_calendar_min_max_uses_physical_tables(monkeypatch) -> None:

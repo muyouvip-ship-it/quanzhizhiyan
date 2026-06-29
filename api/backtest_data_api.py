@@ -46,6 +46,10 @@ _TABLE_STATS_MAPPING = {
     "index_data": ("index_daily_kline", "trade_date"),
     "minute_kline": ("stock_minute_kline", "trade_time"),
     "index_minute_kline": ("index_minute_kline", "trade_time"),
+    "chip_data": ("stock_chip_distribution", "trade_date"),
+    "money_flow": ("stock_money_flow", "trade_date"),
+    "financial_data": ("stock_financial_snapshots", "report_date"),
+    "research_reports": ("market_news_items", "published_at"),
 }
 _ALLOWED_TABLE_NAMES = frozenset({
     *(name for name, _ in _TABLE_STATS_MAPPING.values()),
@@ -916,6 +920,23 @@ def _parse_optional_date(value) -> date | None:
     return date.fromisoformat(str(value))
 
 
+def _resolve_research_report_symbols(db: Session, symbols: Optional[list[str]], *, limit: int = 80) -> list[str]:
+    explicit = [str(symbol).strip().upper() for symbol in (symbols or []) if str(symbol).strip()]
+    if explicit:
+        return list(dict.fromkeys(explicit))[:limit]
+    if not _relation_exists(db, "stock_daily_kline"):
+        return []
+    rows = db.execute(text("""
+        SELECT symbol
+        FROM stock_daily_kline
+        WHERE trade_date = (SELECT MAX(trade_date) FROM stock_daily_kline)
+          AND symbol IS NOT NULL
+        ORDER BY amount DESC NULLS LAST, symbol
+        LIMIT :limit
+    """), {"limit": limit}).scalars().all()
+    return [str(symbol).strip().upper() for symbol in rows if str(symbol).strip()]
+
+
 def _normalized_symbol_sql(column_name: str = "symbol") -> str:
     return (
         f"regexp_replace("
@@ -932,6 +953,7 @@ DATA_SOURCE_COMPATIBILITY = {
     'index_minute_kline': ['tdx', 'qmt', 'akshare'],
     'chip_data': ['quantclass'],  # 只有量化课堂支持
     'financial_data': ['quantclass'],  # 只有量化课堂支持
+    'money_flow': ['quantclass'],
     'research_reports': ['eastmoney']  # 只有东方财富支持
 }
 
@@ -2414,8 +2436,44 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                             logger.error(f"筹码数据下载异常: {e}")
                     else:
                         logger.warning("AKShare不支持筹码数据下载")
+                        specific_error_message = "当前筹码数据仅支持量化课堂 quantclass 数据源"
                         error_count = 1
-                
+
+                elif task.task_type == 'money_flow':
+                    if task.data_source == 'quantclass':
+                        logger.info("使用量化课堂数据源下载资金流数据")
+                        try:
+                            quantclass_api_key = os.getenv("QUANTCLASS_API_KEY", "2HUTNZYOSRA8X5Z7TY2VZGKNTX5UN28B")
+                            quantclass_hid = os.getenv("QUANTCLASS_HID", "1ad9e296ad8d3816b9bce5cba86b1ff6")
+
+                            qc_downloader = QuantClassDownloader(quantclass_api_key, quantclass_hid)
+                            download_result = qc_downloader.download_product('stock-money-flow')
+
+                            if download_result['success']:
+                                from api.generic_importer import import_generic_data
+                                import_result = import_generic_data(db, download_result['data_path'], 'money_flow')
+
+                                if import_result['success']:
+                                    total_records = import_result['records_imported']
+                                    success_count = 1
+                                    logger.info(f"资金流数据导入成功: {total_records}条记录")
+                                else:
+                                    error_count = 1
+                                    specific_error_message = import_result.get('error') or "资金流数据导入失败"
+                                    logger.error(f"资金流数据导入失败: {specific_error_message}")
+                            else:
+                                error_count = 1
+                                specific_error_message = download_result.get('error') or "资金流数据下载失败"
+                                logger.error(f"资金流数据下载失败: {specific_error_message}")
+                        except Exception as e:
+                            error_count = 1
+                            specific_error_message = str(e)
+                            logger.error(f"资金流数据下载异常: {e}")
+                    else:
+                        specific_error_message = "当前资金流数据仅支持量化课堂 quantclass 数据源"
+                        logger.warning(specific_error_message)
+                        error_count = 1
+
                 elif task.task_type == 'financial_data':
                     # 财务数据
                     if task.data_source == 'quantclass':
@@ -2438,21 +2496,62 @@ async def _process_batch_download(task_ids: List[int], user_id: str):
                                     logger.info(f"财务数据导入成功: {total_records}条记录")
                                 else:
                                     error_count = 1
-                                    logger.error(f"财务数据导入失败: {import_result.get('error')}")
+                                    specific_error_message = import_result.get('error') or "财务数据导入失败"
+                                    logger.error(f"财务数据导入失败: {specific_error_message}")
                             else:
                                 error_count = 1
-                                logger.error(f"财务数据下载失败: {download_result.get('error')}")
+                                specific_error_message = download_result.get('error') or "财务数据下载失败"
+                                logger.error(f"财务数据下载失败: {specific_error_message}")
                         except Exception as e:
                             error_count = 1
+                            specific_error_message = str(e)
                             logger.error(f"财务数据下载异常: {e}")
                     else:
-                        logger.warning("AKShare财务数据下载功能待实现")
+                        specific_error_message = "当前财务数据仅支持量化课堂 quantclass 数据源"
+                        logger.warning(specific_error_message)
                         error_count = 1
-                
+
                 elif task.task_type == 'research_reports':
-                    # 研报数据
-                    logger.warning("研报数据下载功能待实现")
-                    error_count = 1
+                    if task.data_source == 'eastmoney':
+                        logger.info("使用资讯之眼/东方财富数据源同步个股研报")
+                        try:
+                            from api.services import news_eye_service
+
+                            research_symbols = _resolve_research_report_symbols(db, list(task.symbols or []), limit=80)
+                            if not research_symbols:
+                                error_count = 1
+                                specific_error_message = "研报同步没有可用股票池，请指定股票或先同步日K数据"
+                            else:
+                                refresh_result = news_eye_service.refresh_news_cache(
+                                    db,
+                                    limit=max(20, min(240, len(research_symbols) * 4)),
+                                    symbols=research_symbols,
+                                    trigger=f"backtest-data-research:{task_id}",
+                                    user_id=user_id,
+                                    async_event_driven_selection=False,
+                                )
+                                total_records = int(refresh_result.get("saved") or 0)
+                                active_sources = [str(item) for item in (refresh_result.get("active_sources") or [])]
+                                if total_records > 0 or any("研报" in source for source in active_sources):
+                                    success_count = 1
+                                    logger.info(
+                                        "东方财富研报同步完成: saved=%s symbols=%s sources=%s",
+                                        total_records,
+                                        len(research_symbols),
+                                        ",".join(active_sources),
+                                    )
+                                else:
+                                    error_count = 1
+                                    warnings_text = "；".join(str(item) for item in (refresh_result.get("warnings") or [])[:5])
+                                    specific_error_message = warnings_text or "东方财富研报源未返回有效数据"
+                        except Exception as e:
+                            error_count = 1
+                            specific_error_message = str(e)
+                            logger.error(f"研报数据同步异常: {e}")
+                    else:
+                        specific_error_message = "当前研报数据仅支持东方财富 eastmoney 数据源"
+                        logger.warning(specific_error_message)
+                        error_count = 1
                 
                 else:
                     logger.warning(f"未知的数据类型: {task.task_type}")

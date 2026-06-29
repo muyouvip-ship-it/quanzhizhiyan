@@ -10,7 +10,7 @@ from datetime import date, datetime
 # 数据下载任务模型
 class BacktestDataTaskCreate(BaseModel):
     """创建回测数据下载任务的请求"""
-    task_type: str = Field(..., description="数据类型: daily_kline, minute_kline, index_data, index_minute_kline, chip_data, financial_data, research_reports")
+    task_type: str = Field(..., description="数据类型: daily_kline, minute_kline, index_data, index_minute_kline, chip_data, money_flow, financial_data, research_reports")
     data_source: Optional[str] = Field("tdx", description="数据源")
     date_range_start: date = Field(..., description="开始日期")
     date_range_end: date = Field(..., description="结束日期")

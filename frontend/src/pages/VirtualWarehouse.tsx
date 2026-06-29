@@ -390,6 +390,10 @@ interface WarehousePageProps {
   pageDescription?: string
 }
 
+export function shouldShowBulkSellControl(roleFilter?: 'paper' | 'live') {
+  return roleFilter !== 'live'
+}
+
 function parseSseBlock(block: string): { event: string; data: Record<string, unknown> } | null {
   const lines = block.split('\n').map(line => line.trim()).filter(Boolean)
   if (!lines.length) return null
@@ -416,6 +420,7 @@ export function WarehousePage({
   pageTitle = '虚拟仓',
   pageDescription = '对接 QMT 模拟账户，展示资产总览与实时持仓。',
 }: WarehousePageProps) {
+  const bulkSellEnabled = shouldShowBulkSellControl(roleFilter)
   const [payload, setPayload] = useState<VirtualWarehouseOverviewResponse | null>(null)
   const [statusPayload, setStatusPayload] = useState<VirtualWarehouseOverviewResponse | null>(null)
   const [returnStats, setReturnStats] = useState<QmtReturnStatsResponse | null>(null)
@@ -670,6 +675,7 @@ export function WarehousePage({
 
   useEffect(() => {
     if (typeof window === 'undefined') return undefined
+    if (!bulkSellEnabled) return undefined
     const taskId = window.localStorage.getItem(bulkSellStorageKey)
     if (!taskId) return undefined
     let cancelled = false
@@ -690,7 +696,7 @@ export function WarehousePage({
       }
     })()
     return () => { cancelled = true }
-  }, [bulkSellStorageKey, connectBulkSellStream])
+  }, [bulkSellEnabled, bulkSellStorageKey, connectBulkSellStream])
 
   useEffect(() => () => stopBulkSellStream(), [stopBulkSellStream])
 
@@ -778,6 +784,10 @@ export function WarehousePage({
   )
 
   const handleSellAllPositions = useCallback(async () => {
+    if (!bulkSellEnabled) {
+      setError('实盘账户不支持一键卖出全部持仓。')
+      return
+    }
     if (!sellablePositions.length) {
       setError('当前没有可卖出的持仓。')
       return
@@ -807,7 +817,7 @@ export function WarehousePage({
       setBulkSelling(false)
       setError(err instanceof Error ? err.message : '一键卖出任务启动失败')
     }
-  }, [bulkSellStorageKey, connectBulkSellStream, orderForm.strategyName, payload?.active_account_key, selectedAccountKey, sellablePositions])
+  }, [bulkSellEnabled, bulkSellStorageKey, connectBulkSellStream, orderForm.strategyName, payload?.active_account_key, selectedAccountKey, sellablePositions])
 
   const accountCards = useMemo(() => (payload?.accounts || []).filter(item => item.role === roleFilter), [payload?.accounts, roleFilter])
   const statusAccountsByKey = useMemo(
@@ -924,7 +934,7 @@ export function WarehousePage({
             </p>
             {actionMessage ? <p className="text-sm text-emerald-600 dark:text-emerald-300">{actionMessage}</p> : null}
             {error ? <p className="text-sm text-rose-600 dark:text-rose-300">{error}</p> : null}
-            {bulkSellTask ? (
+            {bulkSellEnabled && bulkSellTask ? (
               <div className="rounded-2xl border border-amber-200 bg-amber-50/80 px-4 py-3 text-sm text-amber-800 dark:border-amber-900/60 dark:bg-amber-500/10 dark:text-amber-200">
                 <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
                   <span>清仓进度 {bulkSellTask.processed}/{bulkSellTask.total}</span>
@@ -1249,15 +1259,17 @@ export function WarehousePage({
               <p className="text-sm text-slate-500 dark:text-slate-400">展示 QMT 仓位快照，持股天数按首次同步时间持续跟踪。</p>
           </div>
           <div className="flex items-center gap-3">
-            <button
-              type="button"
-              onClick={() => void handleSellAllPositions()}
-              disabled={bulkSelling || !sellablePositions.length}
-              className="inline-flex items-center gap-2 rounded-xl border border-rose-200 px-3 py-2 text-xs font-medium text-rose-600 disabled:opacity-50 dark:border-rose-900 dark:text-rose-300"
-            >
-              <Send className="h-3.5 w-3.5" />
-              {bulkSelling ? '清仓提交中...' : '一键卖出全部持仓'}
-            </button>
+            {bulkSellEnabled ? (
+              <button
+                type="button"
+                onClick={() => void handleSellAllPositions()}
+                disabled={bulkSelling || !sellablePositions.length}
+                className="inline-flex items-center gap-2 rounded-xl border border-rose-200 px-3 py-2 text-xs font-medium text-rose-600 disabled:opacity-50 dark:border-rose-900 dark:text-rose-300"
+              >
+                <Send className="h-3.5 w-3.5" />
+                {bulkSelling ? '清仓提交中...' : '一键卖出全部持仓'}
+              </button>
+            ) : null}
             <span className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500 dark:bg-slate-800 dark:text-slate-300">
               共 {positions.length} 只
             </span>

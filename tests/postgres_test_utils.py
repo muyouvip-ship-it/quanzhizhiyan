@@ -6,7 +6,6 @@ from contextlib import contextmanager
 from uuid import uuid4
 
 import pytest
-from dotenv import find_dotenv, load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import Session, sessionmaker
@@ -17,20 +16,26 @@ _POSTGRES_PREFIXES = ("postgresql://", "postgresql+", "postgres://")
 
 def require_postgres_database_url() -> str:
     test_database_url = os.getenv("TEST_DATABASE_URL")
-    if test_database_url:
-        os.environ["DATABASE_URL"] = test_database_url
-        database_url = test_database_url
-    else:
-        env_path = find_dotenv(usecwd=True)
-        if env_path:
-            load_dotenv(env_path, override=False)
-        database_url = os.getenv("DATABASE_URL", "")
+    if not test_database_url:
+        pytest.skip("TEST_DATABASE_URL is required for PostgreSQL-backed tests.", allow_module_level=True)
+    os.environ["DATABASE_URL"] = test_database_url
+    database_url = test_database_url
 
     if not database_url:
-        pytest.skip("DATABASE_URL is required for PostgreSQL-backed tests.", allow_module_level=True)
+        pytest.skip("TEST_DATABASE_URL is required for PostgreSQL-backed tests.", allow_module_level=True)
     if not database_url.startswith(_POSTGRES_PREFIXES):
-        pytest.skip("PostgreSQL DATABASE_URL is required for database tests.", allow_module_level=True)
+        pytest.skip("PostgreSQL TEST_DATABASE_URL is required for database tests.", allow_module_level=True)
+    if _looks_like_production_database(database_url):
+        pytest.fail("TEST_DATABASE_URL must not point at the production trading_agents database.")
     return database_url
+
+
+def _looks_like_production_database(database_url: str) -> bool:
+    try:
+        database_name = make_url(database_url).database or ""
+    except Exception:
+        return False
+    return database_name in {"trading_agents", "trading_agents_prod"}
 
 
 def database_url_for_schema(database_url: str, schema: str) -> str:

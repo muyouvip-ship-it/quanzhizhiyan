@@ -209,7 +209,7 @@ def test_backtest_stats_reports_final_minute_table_without_view_estimate(isolate
     assert stat.total_records == 1
     assert stat.date_range_start == trade_time.date()
     assert stat.date_range_end == trade_time.date()
-    assert stat.coverage_source == "postgresql_estimate"
+    assert stat.coverage_source == "postgresql_fast"
 
 
 def test_market_data_status_summarizes_final_minute_table(isolated_market_data_db) -> None:

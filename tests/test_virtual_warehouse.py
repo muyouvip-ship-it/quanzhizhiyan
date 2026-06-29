@@ -1637,6 +1637,68 @@ def test_qmt_submit_order_allows_live_account(monkeypatch):
     assert called["submit"] is True
 
 
+def test_qmt_bulk_sell_rejects_live_account_even_when_trading_allowed(monkeypatch):
+    called = {"overview": False, "thread": False}
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._runtime_configs",
+        lambda: [
+            QmtRuntimeConfig(
+                key="live_real",
+                enabled=True,
+                host="192.168.10.1",
+                port=58610,
+                account_id="8886186680",
+                account_type="STOCK",
+                account_name="QMT 实盘仓",
+                userdata_path="",
+                role="live",
+                bridge_base_url="http://127.0.0.1:8711",
+                bridge_token="bridge-token",
+                refresh_interval_seconds=10,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service._fetch_qmt_bridge_health",
+        lambda config, timeout=2.0: {"role": "live", "account_key": "live_real", "trading_allowed": True},
+    )
+
+    def fake_overview(*args, **kwargs):
+        called["overview"] = True
+        return {
+            "positions": [{"symbol": "000001.SZ", "name": "平安银行", "available_position": 100}],
+        }
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            called["thread"] = True
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(
+        "api.services.qmt_virtual_account_service.get_qmt_virtual_account_overview",
+        fake_overview,
+    )
+    monkeypatch.setattr("api.services.qmt_virtual_account_service.threading.Thread", FakeThread)
+
+    with get_db_ctx() as db:
+        try:
+            qmt_virtual_account_service.create_qmt_bulk_sell_task(
+                db,
+                "user-live-bulk-sell",
+                account_key="live_real",
+                strategy_name="test",
+            )
+        except RuntimeError as exc:
+            assert "实盘账户不支持一键卖出全部持仓" in str(exc)
+        else:
+            raise AssertionError("live account bulk sell should be rejected")
+
+    assert called["overview"] is False
+    assert called["thread"] is False
+
+
 def test_qmt_submit_order_rejects_readonly_bridge(monkeypatch):
     client = _get_client()
     token = _auth(client)

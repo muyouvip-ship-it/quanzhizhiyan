@@ -466,10 +466,13 @@ def _compute_first_day_band(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return frame
     frame = frame.sort_values("bar_end").reset_index(drop=True)
+    for column in ("open", "high", "low", "close", "volume", "amount"):
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
     typical = (2 * frame["close"] + frame["high"] + frame["low"]) / 4
     low_min = frame["low"].rolling(window=9, min_periods=9).min()
     high_max = frame["high"].rolling(window=9, min_periods=9).max()
-    denominator = (high_max - low_min).replace(0, pd.NA)
+    denominator = (high_max - low_min).where((high_max - low_min) != 0)
     normalized = ((typical - low_min) / denominator) * 100
     band = normalized.ewm(span=8, adjust=False, min_periods=8).mean()
     b1_seed = 0.667 * band.shift(1) + 0.333 * band

@@ -72,6 +72,9 @@ def create_qmt_bulk_sell_task(
 ) -> dict[str, Any]:
     config = _resolve_runtime_config(account_key, db=db, user_id=user_id)
     request_id = uuid4().hex
+    if str(config.role or "").strip().lower() == "live":
+        _audit_qmt_action("bulk_sell.reject", config, request_id, status="live_bulk_sell_disabled")
+        raise RuntimeError("实盘账户不支持一键卖出全部持仓。请逐笔核对后手动提交卖出委托。")
     _ensure_qmt_trading_allowed(config, request_id=request_id, action="bulk_sell")
     overview = get_qmt_virtual_account_overview(db, user_id, account_key=config.key)
     positions = overview.get("positions") or []

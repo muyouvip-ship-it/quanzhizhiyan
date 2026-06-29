@@ -7,6 +7,10 @@ const DEV_ACCESS_TOKEN = (import.meta.env.VITE_TA_DEV_ACCESS_TOKEN as string) ||
 const DEV_USER_ID = (import.meta.env.VITE_TA_DEV_USER_ID as string) || 'test-user-001'
 const DEV_USER_EMAIL = (import.meta.env.VITE_TA_DEV_USER_EMAIL as string) || 'test@example.com'
 
+function isDevAuthFallbackEnabled(): boolean {
+    return import.meta.env.DEV === true
+}
+
 function createDevUser(): AuthUser {
     const now = new Date().toISOString()
     return {
@@ -60,7 +64,7 @@ export const useAuthStore = create<AuthState>((set) => ({
         }
 
         // 开发模式下允许直接回退到本地测试用户，避免后端短暂不可用时整站卡死。
-        if (!token) {
+        if (!token && isDevAuthFallbackEnabled()) {
             token = DEV_ACCESS_TOKEN
             try {
                 localStorage.setItem('ta-access-token', token)
@@ -75,13 +79,13 @@ export const useAuthStore = create<AuthState>((set) => ({
             } catch {}
             set({ token, user, hydrated: true, loading: false })
         } catch {
-            if (import.meta.env.DEV) {
+            if (isDevAuthFallbackEnabled()) {
                 const devUser = createDevUser()
                 try {
-                    localStorage.setItem('ta-access-token', token)
+                    localStorage.setItem('ta-access-token', token || DEV_ACCESS_TOKEN)
                     localStorage.setItem('ta-user', JSON.stringify(devUser))
                 } catch {}
-                set({ token, user: devUser, hydrated: true, loading: false })
+                set({ token: token || DEV_ACCESS_TOKEN, user: devUser, hydrated: true, loading: false })
                 return
             }
             try {

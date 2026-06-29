@@ -9,6 +9,7 @@ const Dashboard = lazy(() => import('./pages/Dashboard'))
 const NewsEye = lazy(() => import('./pages/NewsEye'))
 const SelectionCenter = lazy(() => import('./pages/SelectionCenter'))
 const StockMarket = lazy(() => import('./pages/StockMarket'))
+const StockPool = lazy(() => import('./pages/StockPool'))
 const Analysis = lazy(() => import('./pages/Analysis'))
 const Reports = lazy(() => import('./pages/Reports'))
 const DailyReview = lazy(() => import('./pages/DailyReview'))
@@ -71,6 +72,7 @@ function App() {
                     <Route path="/selection-center" element={<SelectionCenter />} />
                     <Route path="/selection-center/results/:taskId" element={<SelectionCenter />} />
                     <Route path="/stock-market" element={<StockMarket />} />
+                    <Route path="/stock-pool" element={<StockPool />} />
                     <Route path="/tracking-board" element={<TrackingBoard />} />
                     <Route path="/analysis" element={<Analysis />} />
                     <Route path="/reports" element={<Reports />} />

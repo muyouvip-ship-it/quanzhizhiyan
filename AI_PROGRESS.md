@@ -2,6 +2,62 @@
 
 本文件记录最近交接进度。每次任务收尾时更新，保持最新内容在最上方。
 
+## 2026-06-22 实时监控/数据链路/旧流程清理收口
+
+### 本次做了什么
+
+- 修复实时监控收益统计口径：成交事件缺少券商 `trade_time` 时，不再因为系统写入时间不匹配而漏算当日买入/卖出现金流。
+- 补齐回测数据链路：新增筹码分布、资金流、财务快照表结构与通用导入；资金流/财务导入会回填日 K 富字段；研报更新接入资讯之眼东方财富研报源。
+- 同步设置页与接口统计：回测数据任务统计纳入筹码、资金流、财务、研报；设置页数据类型加入资金流；自动更新服务新增资金流下载任务。
+- 清理实时监控人工审批活跃流程：运行态统计不再输出 `approvals`，QMT 检查脚本改查收益对照；历史审批表仅保留归档兼容与自动清理。
+- 清理开发态残留：前端生产环境不再自动写入 `dev-test-token-001`，`/auth/me` 未登录也不再返回模拟用户；删除设置页下载任务 `console.log`。
+- 修复策略 DSL 文案：未知因子继续作为自定义因子待实现/待映射处理，但不再显示“占位因子”误导。
+- 修复日 K Parquet 导出脚本连接泄漏：`export_daily_kline_to_parquet()` 与 `_resolve_bounds()` 现在正确关闭连接并释放 engine，避免测试和导出清理时锁表。
+- 更新 README 和产品文档：催化选股入口归入选股中心，新策略管理/实时监控/实盘仓/数据源/人工审批历史状态说明同步到当前口径。
+- 补齐测试环境：pytest 默认关闭接口限流，避免完整测试套件中验证码接口被全局限流污染。
+
+### 改动文件
+
+- `api/services/realtime_monitor_service.py`
+- `api/generic_importer.py`
+- `api/database.py`
+- `api/backtest_data_api.py`
+- `api/backtest_data_models.py`
+- `api/services/backtest_data_auto_update_service.py`
+- `api/services/catalyst_selection_service.py`
+- `api/services/strategy_dsl_compiler.py`
+- `frontend/src/services/api.ts`
+- `frontend/src/stores/authStore.ts`
+- `frontend/src/pages/Settings.tsx`
+- `frontend/src/pages/CatalystSelection.tsx`
+- `frontend/src/types/index.ts`
+- `scripts/export_daily_kline_to_parquet.py`
+- `scripts/qmt_realtime_monitor_check.py`
+- `tests/conftest.py`
+- `tests/test_generic_importer.py`
+- `frontend/src/stores/authStore.test.ts`
+- `README.md`
+- `产品文档.md`
+- 以及相关既有测试断言同步。
+
+### 验证结果
+
+- `.venv/bin/python -m py_compile api/services/realtime_monitor_service.py api/generic_importer.py api/backtest_data_api.py api/database.py api/services/backtest_data_auto_update_service.py api/services/catalyst_selection_service.py api/services/strategy_dsl_compiler.py`：通过。
+- `.venv/bin/python -m py_compile scripts/export_daily_kline_to_parquet.py`：通过。
+- `.venv/bin/python -m pytest tests/test_realtime_monitor.py tests/test_generic_importer.py tests/test_backtest_data_auto_update_service.py tests/test_news_eye_service.py::test_fetch_external_news_collects_research_reports_for_focus_symbols -q`：`50 passed`。
+- `.venv/bin/python -m pytest tests/test_selection_center_service.py tests/test_strategy_platform_true_engine.py tests/test_strategy_platform_extensions.py -q`：`44 passed`。
+- `.venv/bin/python -m pytest -q`：`583 passed, 9 skipped`。
+- `cd frontend && npm test -- src/stores/authStore.test.ts src/pages/RealtimeMonitorV2.test.ts src/pages/settingsQmtStatus.test.ts src/components/sidebarNav.test.ts`：`17 passed`。
+- `cd frontend && npm test`：`26 passed`。
+- `cd frontend && npm run build`：通过。
+- `git diff --check`：通过。
+
+### 当前风险或未完成事项
+
+- `realtime_approvals` 模型和归档清理函数仍保留，用于兼容历史数据并自动清理旧 pending 审批；当前实时监控主流程和前端类型已不再暴露人工审批队列。
+- 完整 pytest 仍有 `catalyst_selection_service.py` 中 `datetime.utcnow()` 的弃用 warning，暂不影响运行，但后续可统一改为 timezone-aware UTC。
+- 研报、公告、筹码和资金流链路已经接入导入/统计框架；真实覆盖率仍取决于后续定时任务和外部数据源可用性。
+
 ## 2026-06-03 AI量化闭环最终版使用说明
 
 ### 本次做了什么

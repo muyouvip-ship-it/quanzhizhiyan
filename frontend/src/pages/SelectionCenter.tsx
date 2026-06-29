@@ -24,6 +24,7 @@ import { api } from "@/services/api";
 import type {
   SelectionCenterCandidate,
   SelectionCenterMode,
+  SelectionConfirmationResponse,
   SelectionCenterTask,
   SelectionCenterTaskCreateRequest,
   StrategyDefinition,
@@ -38,6 +39,17 @@ type CandidateSortDirection = "asc" | "desc";
 interface CandidateSortState {
   key: CandidateSortKey | null;
   direction: CandidateSortDirection;
+}
+
+export interface ResultFilterState {
+  noImmediateDeadCross: boolean;
+  breakPreviousHigh: boolean;
+  standOnMa60: boolean;
+  ma20Launch: boolean;
+  moderateVolume: boolean;
+  notOverheated: boolean;
+  healthyPosition: boolean;
+  midFloatCap: boolean;
 }
 
 interface SectorStat {
@@ -125,6 +137,65 @@ const defaultFilterConfig: SelectionFilterConfig = {
   minEventHeat: "",
 };
 
+export const defaultResultFilters: ResultFilterState = {
+  noImmediateDeadCross: false,
+  breakPreviousHigh: false,
+  standOnMa60: false,
+  ma20Launch: false,
+  moderateVolume: false,
+  notOverheated: false,
+  healthyPosition: false,
+  midFloatCap: false,
+};
+
+type ResultFilterOption = { key: keyof ResultFilterState; label: string; description: string; requiresConfirmation?: boolean };
+
+export const confirmationTimeframeOptions = [
+  { value: "5m", label: "5分钟", timing: "当日" },
+  { value: "15m", label: "15分钟", timing: "当日" },
+  { value: "30m", label: "30分钟", timing: "当日" },
+  { value: "60m", label: "60分钟", timing: "当日" },
+  { value: "1d", label: "日线", timing: "次日" },
+] as const;
+
+export const resultFilterGroups: Array<{ title: string; description: string; options: ResultFilterOption[] }> = [
+  {
+    title: "当日可判定",
+    description: "用入选日已经落地的趋势、位置、量能和分钟结构，先缩小明日观察池。",
+    options: [
+      { key: "standOnMa60", label: "站上MA60", description: "入选日收盘价站上60日线，过滤仍在中期趋势线下方的票。" },
+      { key: "ma20Launch", label: "贴近MA20启动", description: "入选日收盘相对20日线在0%到8%之间，避免短线偏离太高。" },
+      { key: "moderateVolume", label: "量能温和", description: "入选日成交额约为20日均额的0.75到2.5倍，排除缩量和过热放量。" },
+      {
+        key: "noImmediateDeadCross",
+        label: "下一根不立刻反叉",
+        description: "按确认周期看首日波段金叉后的下一根K线；分钟周期当日可确认，日线会等下一交易日。",
+        requiresConfirmation: true,
+      },
+    ],
+  },
+  {
+    title: "尾盘增强确认",
+    description: "尽量排除当日已经透支或位置不舒服的票，保留更适合隔日观察的形态。",
+    options: [
+      { key: "notOverheated", label: "短线不过热", description: "入选涨幅不超过15%，近3日涨幅不超过18%。" },
+      { key: "healthyPosition", label: "60日区间健康", description: "入选日价格处于60日区间25%到85%，避开过低修复和过高追涨。" },
+      { key: "midFloatCap", label: "流通市值适中", description: "流通市值在30亿到300亿之间，兼顾弹性和流动性。" },
+    ],
+  },
+  {
+    title: "次日跟踪确认",
+    description: "这些条件要等下一交易日数据入库，适合盘后复盘和验证策略质量。",
+    options: [
+      {
+        key: "breakPreviousHigh",
+        label: "次日突破前高",
+        description: "入选后第一个交易日最高价突破入选日最高价；未入库时会显示待确认。",
+        requiresConfirmation: true,
+      },
+    ],
+  },
+];
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
@@ -424,6 +495,67 @@ function compareCandidateValues(left: string | number | null, right: string | nu
   return direction === "asc" ? raw : -raw;
 }
 
+function hasActiveResultFilters(filters: ResultFilterState) {
+  return Object.values(filters).some(Boolean);
+}
+
+function needsConfirmationFilters(filters: ResultFilterState) {
+  return filters.noImmediateDeadCross || filters.breakPreviousHigh;
+}
+
+export function confirmationItemMap(response: SelectionConfirmationResponse | null) {
+  const map = new Map<string, SelectionConfirmationResponse["items"][number]>();
+  for (const item of response?.items || []) {
+    map.set(item.symbol, item);
+  }
+  return map;
+}
+
+function confirmationStatusPasses(
+  item: SelectionCenterCandidate,
+  confirmationBySymbol: Map<string, SelectionConfirmationResponse["items"][number]>,
+  checkKey: string,
+) {
+  const confirmation = confirmationBySymbol.get(item.symbol);
+  return confirmation?.checks?.[checkKey]?.status === "pass";
+}
+
+export function candidatePassesResultFilters(
+  item: SelectionCenterCandidate,
+  filters: ResultFilterState,
+  confirmationBySymbol: Map<string, SelectionConfirmationResponse["items"][number]>,
+) {
+  if (filters.noImmediateDeadCross && !confirmationStatusPasses(item, confirmationBySymbol, "no_immediate_dead_cross")) return false;
+  if (filters.breakPreviousHigh && !confirmationStatusPasses(item, confirmationBySymbol, "break_previous_high")) return false;
+
+  const closeToMa60 = metricNumber(item, "selected_close_to_ma60_pct");
+  if (filters.standOnMa60 && (closeToMa60 == null || closeToMa60 < 0)) return false;
+
+  const closeToMa20 = metricNumber(item, "selected_close_to_ma20_pct");
+  if (filters.ma20Launch && (closeToMa20 == null || closeToMa20 < 0 || closeToMa20 > 8)) return false;
+
+  const amountRatio = metricNumber(item, "selected_amount_ratio20");
+  if (filters.moderateVolume && (amountRatio == null || amountRatio < 0.75 || amountRatio > 2.5)) return false;
+
+  const selectedChange = metricNumber(item, "change_pct");
+  const ret3 = metricNumber(item, "selected_ret3_pct");
+  if (filters.notOverheated) {
+    if (selectedChange == null || selectedChange > 15) return false;
+    if (ret3 != null && ret3 > 18) return false;
+  }
+
+  const position60d = metricNumber(item, "selected_position_60d");
+  if (filters.healthyPosition && (position60d == null || position60d < 0.25 || position60d > 0.85)) return false;
+
+  const floatCap = metricNumber(item, "float_market_cap_yi");
+  if (filters.midFloatCap && (floatCap == null || floatCap < 30 || floatCap > 300)) return false;
+  return true;
+}
+
+function resultFilterCount(filters: ResultFilterState) {
+  return Object.values(filters).filter(Boolean).length;
+}
+
 export default function SelectionCenter() {
   const navigate = useNavigate();
   const { taskId } = useParams<{ taskId?: string }>();
@@ -711,29 +843,30 @@ function SelectionTaskTable({
 }) {
   return (
     <div className="overflow-x-auto">
-      <table className="w-full min-w-[1160px] border-collapse text-sm">
+      <table className="w-full min-w-[1120px] border-collapse text-sm">
         <thead>
           <tr className="border-b border-[var(--skin-border)] bg-[var(--skin-panel)] text-left text-xs text-[var(--skin-muted)]">
             <th className="w-[170px] px-4 py-3 font-semibold">创建时间</th>
-            <th className="px-4 py-3 font-semibold">任务名称</th>
-            <th className="w-[120px] px-4 py-3 font-semibold">状态</th>
-            <th className="w-[150px] px-4 py-3 font-semibold">股票池</th>
+            <th className="w-[160px] px-4 py-3 font-semibold">任务名称</th>
+            <th className="w-[100px] px-4 py-3 font-semibold">状态</th>
+            <th className="w-[140px] px-4 py-3 font-semibold">股票池</th>
             <th className="px-4 py-3 font-semibold">规则</th>
-            <th className="w-[120px] px-4 py-3 font-semibold">候选数</th>
-            <th className="w-[170px] px-4 py-3 font-semibold">完成时间</th>
-            <th className="w-[170px] px-4 py-3 font-semibold">操作</th>
+            <th className="w-[118px] px-4 py-3 font-semibold">过滤条件</th>
+            <th className="w-[96px] px-4 py-3 font-semibold">候选数</th>
+            <th className="w-[160px] px-4 py-3 font-semibold">完成时间</th>
+            <th className="w-[130px] px-4 py-3 font-semibold">操作</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-[var(--skin-border)]">
           {loading ? (
             <tr className="bg-[var(--skin-card)]">
-              <td colSpan={8}>
+              <td colSpan={9}>
                 <EmptyState text="正在加载选股任务。" icon={<Loader2 className="h-5 w-5 animate-spin" />} />
               </td>
             </tr>
           ) : tasks.length === 0 ? (
             <tr className="bg-[var(--skin-card)]">
-              <td colSpan={8}>
+              <td colSpan={9}>
                 <EmptyState text="当前模块还没有选股任务。" icon={<AlertCircle className="h-5 w-5" />} />
               </td>
             </tr>
@@ -748,7 +881,7 @@ function SelectionTaskTable({
               >
                 <td className="px-4 py-4 font-mono text-xs text-[var(--skin-muted)]">{formatDateTime(task.created_at)}</td>
                 <td className="px-4 py-4">
-                  <div className="font-semibold text-[var(--skin-text)]">{task.name}</div>
+                  <div className="break-keep font-semibold leading-5 text-[var(--skin-text)]">{task.name}</div>
                   <div className="mt-1 text-xs text-[var(--skin-muted)]">{modeLabels[task.mode]}</div>
                 </td>
                 <td className="px-4 py-4">
@@ -756,6 +889,9 @@ function SelectionTaskTable({
                 </td>
                 <td className="px-4 py-4 text-[var(--skin-muted)]">{task.universe}</td>
                 <td className="px-4 py-4 text-[var(--skin-muted)]">{task.rule}</td>
+                <td className="px-4 py-4">
+                  <TaskFilterBadges filters={task.filters} compact />
+                </td>
                 <td className="px-4 py-4">
                   <span className="font-mono text-lg font-bold text-[var(--skin-accent-strong)]">{task.candidate_count ?? task.candidates.length}</span>
                 </td>
@@ -819,6 +955,18 @@ function TaskStatusCell({ task }: { task: SelectionCenterTask }) {
     <Badge tone={task.status === "completed" ? "green" : "red"}>
       {statusLabels[task.status]}
     </Badge>
+  );
+}
+
+function TaskFilterBadges({ filters, compact = false }: { filters: string[]; compact?: boolean }) {
+  const visibleFilters = filters.map((item) => item.trim()).filter(Boolean);
+  if (!visibleFilters.length) {
+    return <Badge>无额外过滤</Badge>;
+  }
+  return (
+    <div className={`flex ${compact ? "flex-col items-start" : "flex-wrap"} gap-1.5`}>
+      {visibleFilters.map((filter) => <Badge key={filter}>{filter}</Badge>)}
+    </div>
   );
 }
 
@@ -1145,6 +1293,11 @@ function SelectionResultPage({
   onRerun?: () => void;
 }) {
   const [activeSector, setActiveSector] = useState<string | null>(null);
+  const [resultFilters, setResultFilters] = useState<ResultFilterState>(defaultResultFilters);
+  const [confirmationTimeframe, setConfirmationTimeframe] = useState("30m");
+  const [confirmation, setConfirmation] = useState<SelectionConfirmationResponse | null>(null);
+  const [confirmationLoading, setConfirmationLoading] = useState(false);
+  const [confirmationError, setConfirmationError] = useState("");
   const summary = useMemo(() => {
     const items = task?.candidates || [];
     return {
@@ -1152,12 +1305,31 @@ function SelectionResultPage({
     };
   }, [task]);
   const sectorStats = useMemo(() => buildSectorStats(task?.candidates || []), [task]);
-  const visibleCandidates = useMemo(() => {
+  const sectorCandidates = useMemo(() => {
     const items = task?.candidates || [];
     if (!activeSector) return items;
     return items.filter((item) => candidateSectorName(item) === activeSector);
   }, [activeSector, task]);
-  const activeSectorCount = activeSector ? visibleCandidates.length : summary.total;
+  const confirmationBySymbol = useMemo(() => confirmationItemMap(confirmation), [confirmation]);
+  const visibleCandidates = useMemo(
+    () => sectorCandidates.filter((item) => candidatePassesResultFilters(item, resultFilters, confirmationBySymbol)),
+    [confirmationBySymbol, resultFilters, sectorCandidates],
+  );
+  const activeSectorCount = activeSector ? sectorCandidates.length : summary.total;
+  const activeFilterCount = resultFilterCount(resultFilters);
+  const loadConfirmationFilters = useCallback(async () => {
+    if (!task?.id) return;
+    setConfirmationLoading(true);
+    setConfirmationError("");
+    try {
+      const response = await api.getSelectionCenterConfirmationFilters(task.id, confirmationTimeframe);
+      setConfirmation(response);
+    } catch (error) {
+      setConfirmationError(error instanceof Error ? error.message : "二次确认指标加载失败。");
+    } finally {
+      setConfirmationLoading(false);
+    }
+  }, [confirmationTimeframe, task?.id]);
 
   useEffect(() => {
     if (!activeSector) return;
@@ -1165,6 +1337,18 @@ function SelectionResultPage({
       setActiveSector(null);
     }
   }, [activeSector, sectorStats]);
+
+  useEffect(() => {
+    setActiveSector(null);
+    setResultFilters(defaultResultFilters);
+    setConfirmation(null);
+    setConfirmationError("");
+  }, [task?.id]);
+
+  useEffect(() => {
+    if (!task?.id || !needsConfirmationFilters(resultFilters)) return;
+    void loadConfirmationFilters();
+  }, [loadConfirmationFilters, resultFilters, task?.id]);
 
   if (loading) {
     return (
@@ -1240,9 +1424,12 @@ function SelectionResultPage({
             <DetailLine label="创建时间" value={formatDateTime(task.created_at)} />
             <DetailLine label="执行时间" value={formatDateTime(task.completed_at)} />
           </div>
-          <div className="mt-4 flex flex-wrap items-center gap-2">
-            <Filter className="h-4 w-4 text-[var(--skin-muted)]" />
-            {task.filters.map((filter) => <Badge key={filter}>{filter}</Badge>)}
+          <div className="mt-3 border border-[var(--skin-border)] bg-[var(--skin-panel)] px-3 py-2">
+            <div className="mb-2 flex items-center gap-1.5 text-xs text-[var(--skin-muted)]">
+              <Filter className="h-4 w-4" />
+              过滤条件
+            </div>
+            <TaskFilterBadges filters={task.filters} />
           </div>
         </div>
       </section>
@@ -1267,6 +1454,7 @@ function SelectionResultPage({
           </button>
           <Badge tone="green">合计 {summary.total} 只</Badge>
           {activeSector && <Badge tone="blue">当前 {activeSector} {activeSectorCount} 只</Badge>}
+          {activeFilterCount > 0 && <Badge tone="amber">二次筛选 {visibleCandidates.length} 只</Badge>}
         </div>
         <SectorRatioPanel
           stats={sectorStats}
@@ -1281,9 +1469,204 @@ function SelectionResultPage({
           <Eye className="h-4 w-4 text-[var(--skin-accent)]" />
           选出股票
           <Badge>{activeSector ? `${activeSector} ${activeSectorCount} 只` : `全部 ${summary.total} 只`}</Badge>
+          {activeFilterCount > 0 && <Badge tone="amber">筛选后 {visibleCandidates.length} 只</Badge>}
         </div>
+        <ResultFilterPanel
+          filters={resultFilters}
+          confirmation={confirmation}
+          confirmationLoading={confirmationLoading}
+          confirmationError={confirmationError}
+          confirmationTimeframe={confirmationTimeframe}
+          sourceCount={sectorCandidates.length}
+          visibleCount={visibleCandidates.length}
+          onChange={setResultFilters}
+          onTimeframeChange={setConfirmationTimeframe}
+          onRefresh={() => void loadConfirmationFilters()}
+        />
         <CandidateTable items={visibleCandidates} />
       </section>
+    </div>
+  );
+}
+
+function ResultFilterPanel({
+  filters,
+  confirmation,
+  confirmationLoading,
+  confirmationError,
+  confirmationTimeframe,
+  sourceCount,
+  visibleCount,
+  onChange,
+  onTimeframeChange,
+  onRefresh,
+}: {
+  filters: ResultFilterState;
+  confirmation: SelectionConfirmationResponse | null;
+  confirmationLoading: boolean;
+  confirmationError: string;
+  confirmationTimeframe: string;
+  sourceCount: number;
+  visibleCount: number;
+  onChange: (filters: ResultFilterState) => void;
+  onTimeframeChange: (timeframe: string) => void;
+  onRefresh: () => void;
+}) {
+  const confirmationEnabled = needsConfirmationFilters(filters);
+  const toggleFilter = (key: keyof ResultFilterState) => {
+    onChange({ ...filters, [key]: !filters[key] });
+  };
+  const clearFilters = () => onChange(defaultResultFilters);
+  const applyBalancedPreset = () => onChange({
+    ...defaultResultFilters,
+    standOnMa60: true,
+    ma20Launch: true,
+    moderateVolume: true,
+  });
+  const applyTrendPreset = () => onChange({
+    ...defaultResultFilters,
+    standOnMa60: true,
+    notOverheated: true,
+    healthyPosition: true,
+  });
+  const confirmationSummary = useMemo(() => {
+    const summary: Record<string, Record<string, number>> = {};
+    for (const item of confirmation?.items || []) {
+      for (const [key, check] of Object.entries(item.checks || {})) {
+        const status = check.status || "missing";
+        summary[key] = summary[key] || {};
+        summary[key][status] = (summary[key][status] || 0) + 1;
+      }
+    }
+    return summary;
+  }, [confirmation]);
+
+  return (
+    <div className="border-b border-[var(--skin-border)] bg-[var(--skin-card)] p-4">
+      <div className="mb-3 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div>
+          <div className="flex flex-wrap items-center gap-2 text-sm font-semibold text-[var(--skin-text)]">
+            <Filter className="h-4 w-4 text-[var(--skin-accent)]" />
+            二次确认筛选
+            <Badge tone={hasActiveResultFilters(filters) ? "amber" : "blue"}>{visibleCount} / {sourceCount} 只</Badge>
+            {confirmationLoading && <Loader2 className="h-4 w-4 animate-spin text-[var(--skin-muted)]" />}
+          </div>
+          <p className="mt-1 text-xs text-[var(--skin-muted)]">
+            先不改原始选股结果，只在当前页面用确认条件缩小明日观察池。
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={applyBalancedPreset}
+            className="btn-secondary inline-flex items-center gap-1.5 text-xs"
+            title="应用站上MA60、贴近MA20启动、量能温和组合"
+          >
+            <Check className="h-3.5 w-3.5" />
+            高胜率组合
+          </button>
+          <button
+            type="button"
+            onClick={applyTrendPreset}
+            className="btn-secondary inline-flex items-center gap-1.5 text-xs"
+            title="应用站上MA60、短线不过热、60日区间健康组合"
+          >
+            <Check className="h-3.5 w-3.5" />
+            趋势健康组合
+          </button>
+          <label className="flex items-center gap-2 text-xs text-[var(--skin-muted)]">
+            确认周期
+            <select
+              value={confirmationTimeframe}
+              onChange={(event) => onTimeframeChange(event.target.value)}
+              className="input h-9 w-24 text-xs"
+              title="首日波段确认周期"
+            >
+              {confirmationTimeframeOptions.map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+          </label>
+          {confirmationTimeframe === "1d" && (
+            <Badge tone="amber">日线需等下一交易日</Badge>
+          )}
+          <button
+            type="button"
+            onClick={onRefresh}
+            disabled={!confirmationEnabled || confirmationLoading}
+            className="btn-secondary inline-flex items-center gap-1.5 text-xs"
+            title="刷新二次确认指标"
+          >
+            {confirmationLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />}
+            刷新确认
+          </button>
+          <button
+            type="button"
+            onClick={clearFilters}
+            disabled={!hasActiveResultFilters(filters)}
+            className="btn-secondary inline-flex items-center gap-1.5 text-xs"
+            title="清空二次确认筛选"
+          >
+            <X className="h-3.5 w-3.5" />
+            清空
+          </button>
+        </div>
+      </div>
+
+      <div className="grid gap-3 xl:grid-cols-3">
+        {resultFilterGroups.map((group) => (
+          <div key={group.title} className="border border-[var(--skin-border)] bg-[var(--skin-panel)]">
+            <div className="border-b border-[var(--skin-border)] px-3 py-2">
+              <div className="text-sm font-semibold text-[var(--skin-text)]">{group.title}</div>
+              <div className="mt-1 text-xs leading-5 text-[var(--skin-muted)]">{group.description}</div>
+            </div>
+            <div className="grid gap-2 p-3">
+              {group.options.map((option) => {
+                const checked = filters[option.key];
+                const apiKey = option.key === "noImmediateDeadCross"
+                  ? "no_immediate_dead_cross"
+                  : option.key === "breakPreviousHigh"
+                    ? "break_previous_high"
+                    : "";
+                const summary = apiKey ? confirmationSummary[apiKey] : null;
+                return (
+                  <button
+                    key={option.key}
+                    type="button"
+                    onClick={() => toggleFilter(option.key)}
+                    className={`min-h-[82px] border p-3 text-left transition ${
+                      checked
+                        ? "border-[var(--skin-accent)] bg-[var(--skin-accent-soft)] text-[var(--skin-accent-strong)]"
+                        : "border-[var(--skin-border)] bg-[var(--skin-card)] text-[var(--skin-muted)] hover:text-[var(--skin-text)]"
+                    }`}
+                    title={option.description}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <span className="text-sm font-semibold">{option.label}</span>
+                      {checked && <Check className="h-4 w-4 shrink-0" />}
+                    </div>
+                    <div className="mt-1 text-xs leading-5">{option.description}</div>
+                    {summary && (
+                      <div className="mt-2 flex flex-wrap gap-1">
+                        <Badge tone="green">过 {summary.pass || 0}</Badge>
+                        <Badge tone="red">否 {summary.fail || 0}</Badge>
+                        <Badge tone="amber">待 {summary.pending || 0}</Badge>
+                        <Badge>{confirmation?.timeframe || confirmationTimeframe}</Badge>
+                      </div>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {confirmationError && (
+        <div className="mt-3 border border-[color-mix(in_srgb,var(--skin-red)_34%,transparent)] bg-[color-mix(in_srgb,var(--skin-red)_8%,transparent)] px-3 py-2 text-xs text-[var(--skin-red)]">
+          {confirmationError}
+        </div>
+      )}
     </div>
   );
 }
@@ -1570,5 +1953,5 @@ function Badge({ children, tone = "neutral" }: { children: ReactNode; tone?: "ne
     red: "border-[color-mix(in_srgb,var(--skin-red)_34%,transparent)] bg-[color-mix(in_srgb,var(--skin-red)_10%,transparent)] text-[var(--skin-red)]",
   }[tone];
 
-  return <span className={`inline-flex items-center gap-1 border px-2 py-0.5 text-[11px] font-semibold ${toneClass}`}>{children}</span>;
+  return <span className={`inline-flex whitespace-nowrap items-center gap-1 border px-2 py-0.5 text-[11px] font-semibold ${toneClass}`}>{children}</span>;
 }

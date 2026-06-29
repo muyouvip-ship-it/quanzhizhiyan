@@ -4,6 +4,7 @@ import {
     CandlestickData,
     CandlestickSeries,
     ColorType,
+    HistogramSeries,
     IChartApi,
     ISeriesMarkersPluginApi,
     ISeriesApi,
@@ -21,6 +22,13 @@ import { usePolling } from '@/hooks/usePolling'
 import { api } from '@/services/api'
 import type { ChanlunOverlayResponse, KlineCandle, MarketQuote } from '@/types'
 import { useAnalysisStore } from '@/stores/analysisStore'
+import {
+    MOVING_AVERAGE_PERIODS,
+    buildMovingAverageSeries,
+    buildVolumeHistogramData,
+    type MovingAveragePeriod,
+    type TimedCandle,
+} from './klineIndicators'
 
 interface KlinePanelProps {
     symbol: string
@@ -41,6 +49,7 @@ interface KlinePanelProps {
 
 type ViewMode = 'daily' | 'intraday'
 type IntradayPeriod = '1m' | '5m' | '15m' | '30m' | '60m'
+type OverlayMode = 'ma' | 'chanlun'
 
 function normalizeDateKey(value?: string | null): string {
     return value ? value.slice(0, 10) : ''
@@ -223,18 +232,29 @@ const INTRADAY_PERIOD_OPTIONS: Array<{ value: IntradayPeriod; label: string }> =
 
 const INTRADAY_LOOKBACK_SESSIONS = 20
 const INTRADAY_DEFAULT_VISIBLE_BARS = 240
+const VOLUME_PANE_INDEX = 1
+const MA_COLORS: Record<MovingAveragePeriod, string> = {
+    5: '#38bdf8',
+    10: '#a78bfa',
+    20: '#f59e0b',
+    30: '#22c55e',
+    60: '#ef4444',
+}
 
 export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay = true, focusDate, markers = [] }: KlinePanelProps) {
     const currentAnalysisSymbol = useAnalysisStore((state) => state.currentSymbol)
     const containerRef = useRef<HTMLDivElement | null>(null)
     const chartRef = useRef<IChartApi | null>(null)
     const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
+    const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null)
     const markersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null)
+    const maSeriesRef = useRef<Partial<Record<MovingAveragePeriod, ISeriesApi<'Line'>>>>({})
     const [loading, setLoading] = useState(false)
     const [error, setError] = useState<string | null>(null)
     const [isDark, setIsDark] = useState(document.documentElement.classList.contains('dark'))
     const [viewMode, setViewMode] = useState<ViewMode>('daily')
     const [intradayPeriod, setIntradayPeriod] = useState<IntradayPeriod>('5m')
+    const [overlayMode, setOverlayMode] = useState<OverlayMode>('ma')
     const [candles, setCandles] = useState<KlineCandle[]>([])
     const [activeCandle, setActiveCandle] = useState<KlineCandle | null>(null)
     const [quote, setQuote] = useState<MarketQuote | null>(null)
@@ -256,6 +276,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
         buySell: true,
     })
     const candlesRef = useRef<KlineCandle[]>([])
+    const timedCandlesRef = useRef<TimedCandle[]>([])
     const overlaySeriesRef = useRef<Array<ISeriesApi<'Line'>>>([])
 
     const range = useMemo(() => {
@@ -312,6 +333,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
 
         let chart: IChartApi
         let series: ISeriesApi<'Candlestick'>
+        let volumeSeries: ISeriesApi<'Histogram'>
         let seriesMarkers: ISeriesMarkersPluginApi<Time>
         try {
             chart = createChart(containerRef.current, {
@@ -319,6 +341,11 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                     background: { type: ColorType.Solid, color: bgColor },
                     textColor: textColor,
                     attributionLogo: false,
+                    panes: {
+                        separatorColor: isDark ? 'rgba(51,65,85,0.8)' : 'rgba(203,213,225,0.85)',
+                        separatorHoverColor: isDark ? 'rgba(34,211,238,0.35)' : 'rgba(14,165,233,0.24)',
+                        enableResize: false,
+                    },
                 },
                 localization: {
                     locale: 'zh-CN',
@@ -332,7 +359,9 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                 },
                 rightPriceScale: {
                     borderColor: isDark ? '#334155' : '#cbd5e1',
+                    scaleMargins: { top: 0.08, bottom: 0.04 },
                 },
+                leftPriceScale: { visible: false },
                 timeScale: {
                     borderColor: isDark ? '#334155' : '#cbd5e1',
                     timeVisible: true,
@@ -364,6 +393,29 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                 wickDownColor: '#22c55e',
                 borderVisible: false,
             })
+            volumeSeries = chart.addSeries(HistogramSeries, {
+                priceFormat: { type: 'volume' },
+                priceScaleId: 'right',
+                lastValueVisible: false,
+                priceLineVisible: false,
+            }, VOLUME_PANE_INDEX)
+            chart.panes()[0]?.setStretchFactor(4)
+            chart.panes()[VOLUME_PANE_INDEX]?.setStretchFactor(1)
+            volumeSeries.priceScale().applyOptions({
+                scaleMargins: { top: 0.12, bottom: 0.02 },
+                borderVisible: false,
+            })
+            MOVING_AVERAGE_PERIODS.forEach((period) => {
+                maSeriesRef.current[period] = chart.addSeries(LineSeries, {
+                    color: MA_COLORS[period],
+                    lineWidth: period <= 20 ? 2 : 1,
+                    lastValueVisible: false,
+                    priceLineVisible: false,
+                    crosshairMarkerVisible: false,
+                    visible: true,
+                    title: `MA${period}`,
+                })
+            })
             seriesMarkers = createSeriesMarkers(series, [])
         } catch (chartError) {
             setError(chartError instanceof Error ? `K线图初始化失败：${chartError.message}` : 'K线图初始化失败')
@@ -372,11 +424,16 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
 
         chartRef.current = chart
         seriesRef.current = series
+        volumeSeriesRef.current = volumeSeries
         markersRef.current = seriesMarkers
         if (candlesRef.current.length) {
             const { data: existingData } = normalizeChartCandles(candlesRef.current)
             try {
                 series.setData(existingData)
+                volumeSeries.setData(buildVolumeHistogramData(timedCandlesRef.current))
+                buildMovingAverageSeries(timedCandlesRef.current).forEach(({ period, data }) => {
+                    maSeriesRef.current[period]?.setData(data)
+                })
                 applyDefaultVisibleRange(existingData.length)
             } catch (chartDataError) {
                 setError(chartDataError instanceof Error ? `K线数据渲染失败：${chartDataError.message}` : 'K线数据渲染失败')
@@ -418,7 +475,9 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
             chartRef.current?.remove()
             chartRef.current = null
             seriesRef.current = null
+            volumeSeriesRef.current = null
             markersRef.current = null
+            maSeriesRef.current = {}
             overlaySeriesRef.current = []
         }
     }, [isDark, viewMode])
@@ -444,6 +503,10 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                 if (cancelled) return
                 setCandles(validCandles)
                 candlesRef.current = validCandles
+                timedCandlesRef.current = data.flatMap((item, index) => {
+                    const candle = validCandles[index]
+                    return candle ? [{ ...candle, chartTime: item.time }] : []
+                })
                 setActiveCandle(validCandles.length ? validCandles[validCandles.length - 1] : null)
                 if (intradayResponse?.latest_quote) setQuote(intradayResponse.latest_quote)
                 setIntradayMeta(intradayResponse ? {
@@ -454,6 +517,10 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                     source: intradayResponse.source,
                 } : null)
                 seriesRef.current?.setData(data)
+                volumeSeriesRef.current?.setData(buildVolumeHistogramData(timedCandlesRef.current))
+                buildMovingAverageSeries(timedCandlesRef.current).forEach(({ period, data: maData }) => {
+                    maSeriesRef.current[period]?.setData(maData)
+                })
                 applyDefaultVisibleRange(data.length)
                 if (!data.length) {
                     setError(viewMode === 'daily' ? '暂无可用K线数据' : intradayEmptyMessage(tradeDate, intradayPeriod, intradayResponse?.source))
@@ -463,9 +530,12 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                 setError(e instanceof Error ? e.message : (viewMode === 'daily' ? '加载K线失败' : '加载分时失败'))
                 setCandles([])
                 candlesRef.current = []
+                timedCandlesRef.current = []
                 setActiveCandle(null)
                 setIntradayMeta(null)
                 seriesRef.current?.setData([])
+                volumeSeriesRef.current?.setData([])
+                MOVING_AVERAGE_PERIODS.forEach((period) => maSeriesRef.current[period]?.setData([]))
             } finally {
                 if (!cancelled) setLoading(false)
             }
@@ -577,7 +647,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
             }]
         })
         const overlayMarkers: SeriesMarker<Time>[] = []
-        if (showChanlunOverlay && overlayToggles.fractals && overlayData) {
+        if (showChanlunOverlay && overlayMode === 'chanlun' && overlayToggles.fractals && overlayData) {
             overlayMarkers.push(...asArray(overlayData.fractals).flatMap((point) => {
                 const time = toChartTime(point.date || '')
                 if (!time) return []
@@ -606,7 +676,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                 }))
             }
         }
-        if (showChanlunOverlay && overlayToggles.buySell && overlayData) {
+        if (showChanlunOverlay && overlayMode === 'chanlun' && overlayToggles.buySell && overlayData) {
             overlayMarkers.push(...asArray(overlayData.buy_sell_points).flatMap((point) => {
                 const time = toChartTime(point.date || '')
                 if (!time) return []
@@ -625,7 +695,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
         } catch (markerError) {
             setOverlayMessage(markerError instanceof Error ? `K线标注渲染失败：${markerError.message}` : 'K线标注渲染失败')
         }
-    }, [markers, overlayData, overlayToggles.buySell, overlayToggles.fractals, showChanlunOverlay, viewMode])
+    }, [markers, overlayData, overlayMode, overlayToggles.buySell, overlayToggles.fractals, showChanlunOverlay, viewMode])
 
     useEffect(() => {
         if (!chartRef.current) return
@@ -635,7 +705,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
             setOverlayMessage('缠论线条刷新失败，请切换周期重试')
         }
         overlaySeriesRef.current = []
-        if (!showChanlunOverlay || !overlayData) return
+        if (!showChanlunOverlay || overlayMode !== 'chanlun' || !overlayData) return
 
         const pushLineSeries = (data: LineData<Time>[], options: Record<string, unknown>) => {
             const normalizedData = data
@@ -723,7 +793,13 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                 )
             })
         }
-    }, [isDark, overlayData, overlayToggles.bi, overlayToggles.segments, overlayToggles.zhongshu, showChanlunOverlay, viewMode])
+    }, [isDark, overlayData, overlayMode, overlayToggles.bi, overlayToggles.segments, overlayToggles.zhongshu, showChanlunOverlay, viewMode])
+
+    useEffect(() => {
+        MOVING_AVERAGE_PERIODS.forEach((period) => {
+            maSeriesRef.current[period]?.applyOptions({ visible: overlayMode === 'ma' })
+        })
+    }, [overlayMode])
 
     const panelCandle = activeCandle ?? (candles.length ? candles[candles.length - 1] : null)
     const panelPrice = quote?.price ?? panelCandle?.close
@@ -813,34 +889,6 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                             ))}
                         </div>
                     )}
-                    {showChanlunOverlay && (
-                    <div className="hidden flex-wrap items-center gap-1 rounded-xl border border-slate-200 px-2 py-1 dark:border-slate-700 xl:flex">
-                        <Layers3 className="h-3.5 w-3.5 text-violet-500" />
-                        {[
-                            ['fractals', '分型'],
-                            ['bi', '笔'],
-                            ['segments', '线段'],
-                            ['zhongshu', '中枢'],
-                            ['buySell', '买卖点'],
-                        ].map(([key, label]) => {
-                            const active = overlayToggles[key as keyof typeof overlayToggles]
-                            return (
-                                <button
-                                    key={key}
-                                    type="button"
-                                    onClick={() => setOverlayToggles((prev) => ({ ...prev, [key]: !prev[key as keyof typeof prev] }))}
-                                    className={`rounded-lg px-2 py-1 text-[11px] font-medium transition ${
-                                        active
-                                            ? 'bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-300'
-                                            : 'text-slate-500 dark:text-slate-400'
-                                    }`}
-                                >
-                                    {label}
-                                </button>
-                            )
-                        })}
-                    </div>
-                    )}
                     {showCurrentSymbolButton && (
                         <button
                             type="button"
@@ -867,16 +915,76 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
             </div>
             <div className="relative flex-1 min-h-0 rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/50 overflow-hidden">
                 <div ref={containerRef} className="absolute inset-0" />
-                {viewMode === 'intraday' && !error && (
-                    <div
-                        title={intradayMeta?.start && intradayMeta?.end ? `${intradayMeta.start} ~ ${intradayMeta.end}` : undefined}
-                        className="absolute left-3 top-3 z-10 rounded-lg bg-white/90 px-2 py-1 text-[11px] font-medium text-amber-700 shadow-sm ring-1 ring-amber-200 backdrop-blur dark:bg-slate-900/90 dark:text-amber-300 dark:ring-amber-900/50"
-                    >
-                        分时周期：{intradayPeriodLabel}
-                        {intradayLoadedSessions ? ` · ${intradayLoadedSessions}日` : ''}
-                        {candles.length ? ` · ${candles.length}根` : ''}
+                <div className="absolute left-3 top-3 z-10 flex max-w-[calc(100%-1.5rem)] flex-wrap items-center gap-2">
+                    <div className="flex overflow-hidden rounded-full border border-slate-200 bg-white/92 shadow-sm backdrop-blur dark:border-slate-700 dark:bg-slate-900/92">
+                        <button
+                            type="button"
+                            aria-pressed={overlayMode === 'ma'}
+                            onClick={() => setOverlayMode('ma')}
+                            className={`px-3 py-1.5 text-[11px] font-semibold transition ${overlayMode === 'ma' ? 'bg-cyan-100 text-cyan-700 dark:bg-cyan-900/40 dark:text-cyan-200' : 'text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800'}`}
+                        >
+                            均线
+                        </button>
+                        {showChanlunOverlay && (
+                            <button
+                                type="button"
+                                aria-pressed={overlayMode === 'chanlun'}
+                                onClick={() => setOverlayMode('chanlun')}
+                                className={`border-l border-slate-200 px-3 py-1.5 text-[11px] font-semibold transition dark:border-slate-700 ${overlayMode === 'chanlun' ? 'bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-200' : 'text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800'}`}
+                            >
+                                缠论
+                            </button>
+                        )}
                     </div>
-                )}
+                    {overlayMode === 'ma' && (
+                        <div className="hidden flex-wrap items-center gap-2 rounded-full border border-slate-200 bg-white/88 px-3 py-1.5 text-[11px] shadow-sm backdrop-blur dark:border-slate-700 dark:bg-slate-900/88 sm:flex">
+                            {MOVING_AVERAGE_PERIODS.map((period) => (
+                                <span key={period} className="inline-flex items-center gap-1 font-medium text-slate-500 dark:text-slate-300">
+                                    <span className="h-0.5 w-4 rounded-full" style={{ background: MA_COLORS[period] }} />
+                                    MA{period}
+                                </span>
+                            ))}
+                        </div>
+                    )}
+                    {showChanlunOverlay && overlayMode === 'chanlun' && (
+                        <div className="hidden flex-wrap items-center gap-1 rounded-full border border-slate-200 bg-white/88 px-2 py-1 shadow-sm backdrop-blur dark:border-slate-700 dark:bg-slate-900/88 xl:flex">
+                            <Layers3 className="h-3.5 w-3.5 text-violet-500" />
+                            {[
+                                ['fractals', '分型'],
+                                ['bi', '笔'],
+                                ['segments', '线段'],
+                                ['zhongshu', '中枢'],
+                                ['buySell', '买卖点'],
+                            ].map(([key, label]) => {
+                                const active = overlayToggles[key as keyof typeof overlayToggles]
+                                return (
+                                    <button
+                                        key={key}
+                                        type="button"
+                                        onClick={() => setOverlayToggles((prev) => ({ ...prev, [key]: !prev[key as keyof typeof prev] }))}
+                                        className={`rounded-lg px-2 py-1 text-[11px] font-medium transition ${
+                                            active
+                                                ? 'bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-300'
+                                                : 'text-slate-500 dark:text-slate-400'
+                                        }`}
+                                    >
+                                        {label}
+                                    </button>
+                                )
+                            })}
+                        </div>
+                    )}
+                    {viewMode === 'intraday' && !error && (
+                        <div
+                            title={intradayMeta?.start && intradayMeta?.end ? `${intradayMeta.start} ~ ${intradayMeta.end}` : undefined}
+                            className="rounded-full bg-white/90 px-2.5 py-1.5 text-[11px] font-medium text-amber-700 shadow-sm ring-1 ring-amber-200 backdrop-blur dark:bg-slate-900/90 dark:text-amber-300 dark:ring-amber-900/50"
+                        >
+                            分时周期：{intradayPeriodLabel}
+                            {intradayLoadedSessions ? ` · ${intradayLoadedSessions}日` : ''}
+                            {candles.length ? ` · ${candles.length}根` : ''}
+                        </div>
+                    )}
+                </div>
                 <div className="absolute bottom-3 right-3 z-10 flex overflow-hidden rounded-full border border-slate-200 bg-white/90 shadow-sm backdrop-blur dark:border-slate-700 dark:bg-slate-900/90">
                     <button
                         type="button"
@@ -903,7 +1011,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                         加载中
                     </div>
                 )}
-                {showChanlunOverlay && overlayLoading && (
+                {showChanlunOverlay && overlayMode === 'chanlun' && overlayLoading && (
                     <div className="absolute right-3 top-12 text-xs px-2 py-1 rounded bg-white/90 dark:bg-slate-800/90 text-violet-600 dark:text-violet-300 flex items-center gap-1">
                         <Layers3 className="w-3 h-3 animate-pulse" />
                         缠论计算中
@@ -937,7 +1045,7 @@ export default function KlinePanel({ symbol, onSymbolChange, showChanlunOverlay 
                         </div>
                     </div>
                 )}
-                {showChanlunOverlay && overlayMessage && !error && (
+                {showChanlunOverlay && overlayMode === 'chanlun' && overlayMessage && !error && (
                     <div className="absolute left-3 top-12 text-xs px-2 py-1 rounded bg-white/90 dark:bg-slate-800/90 text-violet-600 dark:text-violet-300">
                         {overlayMessage}
                     </div>

@@ -1658,6 +1658,125 @@ export interface SelectionCenterTaskListResponse {
     items: SelectionCenterTask[]
 }
 
+export type SelectionConfirmationStatus = 'pass' | 'fail' | 'pending' | 'missing'
+
+export interface SelectionConfirmationCheck {
+    status: SelectionConfirmationStatus
+    reason: string
+    selected_date?: string | null
+    selected_high?: number | null
+    next_trade_date?: string | null
+    next_high?: number | null
+    timeframe?: string | null
+    signal_bar_end?: string | null
+    next_bar_end?: string | null
+}
+
+export interface SelectionConfirmationItem {
+    symbol: string
+    name: string
+    selected_date?: string | null
+    checks: Record<string, SelectionConfirmationCheck>
+}
+
+export interface SelectionConfirmationResponse {
+    task_id: string
+    timeframe: string
+    total: number
+    criteria: Array<{ key: string; name: string; description: string }>
+    items: SelectionConfirmationItem[]
+}
+
+export type StockPoolGroupType = 'market' | 'watchlist' | 'custom' | 'selection'
+
+export interface StockPoolGroup {
+    id: string
+    name: string
+    group_type: StockPoolGroupType
+    readonly: boolean
+    is_default?: boolean
+    sort_order?: number
+    item_count?: number
+    candidate_count?: number
+    source_task_id?: string
+    created_at?: string | null
+    updated_at?: string | null
+}
+
+export interface StockPoolItem {
+    id: string
+    group_id?: string
+    symbol: string
+    name: string
+    price?: number | null
+    change_pct?: number | null
+    open?: number | null
+    high?: number | null
+    low?: number | null
+    pre_close?: number | null
+    volume?: number | null
+    amount?: number | null
+    turnover_rate?: number | null
+    float_market_cap?: number | null
+    total_market_cap?: number | null
+    net_profit_ttm?: number | null
+    sector?: string | null
+    industry_l1?: string | null
+    industry_l2?: string | null
+    industry_l3?: string | null
+    source?: string
+    joined_at?: string | null
+    trade_date?: string | null
+    readonly?: boolean
+}
+
+export interface StockPoolGroupListResponse {
+    total: number
+    groups: StockPoolGroup[]
+}
+
+export interface StockPoolItemListResponse {
+    group?: StockPoolGroup
+    total: number
+    page: number
+    page_size: number
+    items: StockPoolItem[]
+}
+
+export interface StockPoolItemAddResponse {
+    status: 'added' | 'duplicate'
+    message: string
+    item?: StockPoolItem
+}
+
+export interface StockPoolSelectionCopyResponse {
+    group: StockPoolGroup
+    added: number
+    duplicates: number
+}
+
+export interface StockPoolStrategyMarker {
+    date: string
+    side: 'buy' | 'sell'
+    timestamp?: string
+    quantity?: number
+    price?: number
+    reason?: string
+    text?: string
+    color?: string
+}
+
+export interface StockPoolStrategyPreviewResponse {
+    symbol: string
+    strategy_id: string
+    period: string
+    start_date: string
+    end_date: string
+    markers: StockPoolStrategyMarker[]
+    source: string
+    message?: string | null
+}
+
 export type StrategyTier = 'aggressive' | 'stable' | 'defensive'
 
 export interface OfficialStrategyPackItem {
@@ -2530,7 +2649,6 @@ export interface RealtimeMonitor {
             signals?: number
             orders?: number
             rejections?: number
-            approvals?: number
         }
     }
     circuit_breaker?: {

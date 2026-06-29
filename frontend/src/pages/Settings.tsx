@@ -774,7 +774,6 @@ export default function Settings() {
                     data_source: dataSource
                 })
             })
-            console.log('下载任务创建成功:', result)
             const createdTaskIds = Array.isArray(result.task_ids) ? result.task_ids : []
             setActiveDownloadTaskIds(createdTaskIds)
             
@@ -880,6 +879,7 @@ export default function Settings() {
         'index_data': ['tdx', 'qmt', 'akshare', 'quantclass', 'baostock', 'tushare', 'eastmoney'],
         'index_minute_kline': ['tdx', 'qmt', 'akshare'],
         'chip_data': ['quantclass'],  // 只有量化课堂支持
+        'money_flow': ['quantclass'],  // 只有量化课堂支持
         'financial_data': ['quantclass'],  // 只有量化课堂支持
         'research_reports': ['eastmoney']  // 只有东方财富支持
     }
@@ -921,6 +921,7 @@ export default function Settings() {
             'index_daily_kline': '指数日K线',
             'index_minute_kline': '指数1分钟K线',
             'chip_data': '筹码数据',
+            'money_flow': '资金流数据',
             'financial_data': '财务数据',
             'research_reports': '研报数据'
         }
@@ -1014,6 +1015,7 @@ export default function Settings() {
             'index_daily_kline': TrendingUp,
             'index_minute_kline': LineChart,
             'chip_data': Database,
+            'money_flow': DollarSign,
             'financial_data': DollarSign,
             'research_reports': FileText
         }
@@ -2399,7 +2401,7 @@ export default function Settings() {
                             数据类型选择（可多选）
                         </label>
                         <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
-                            {['daily_kline', 'minute_kline', 'index_data', 'index_minute_kline', 'chip_data', 'financial_data', 'research_reports'].map(type => {
+                            {['daily_kline', 'minute_kline', 'index_data', 'index_minute_kline', 'chip_data', 'money_flow', 'financial_data', 'research_reports'].map(type => {
                                 const Icon = getDataTypeIcon(type)
                                 const isSelected = selectedDataTypes.includes(type)
                                 return (

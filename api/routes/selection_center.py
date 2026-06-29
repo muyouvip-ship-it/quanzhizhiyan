@@ -89,6 +89,24 @@ def get_selection_center_task(
     return task
 
 
+@router.get("/tasks/{task_id}/confirmation-filters")
+def get_selection_center_task_confirmation_filters(
+    task_id: str,
+    timeframe: str = Query(default="30m"),
+    current_user=Depends(require_api_user),
+    strategy_db: Session = Depends(get_strategy_db),
+) -> dict[str, Any]:
+    task = selection_center_service.get_task_confirmation_filters(
+        strategy_db,
+        current_user.id,
+        task_id,
+        timeframe=timeframe,
+    )
+    if task is None:
+        raise HTTPException(status_code=404, detail="选股任务不存在")
+    return task
+
+
 @router.post("/tasks/{task_id}/rerun")
 def rerun_selection_center_task(
     task_id: str,

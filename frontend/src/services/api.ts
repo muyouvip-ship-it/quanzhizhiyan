@@ -1,4 +1,4 @@
-import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, IntradayResponse, KlineResponse, LatestAnnouncementResponse, MarketQuoteResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse, RuntimeLogSource, RuntimeLogsResponse, StrategyDefinition, StrategyDraftResponse, StrategyListResponseV2, StrategyCompileResponse, StrategyDsl, SelectionCenterTask, SelectionCenterTaskCreateRequest, SelectionCenterTaskListResponse, BacktestRun, BacktestMetrics, BacktestTradeRecord, BacktestEquityPoint, BacktestWatchlistItem, BacktestMinuteConfirmationItem, BacktestTradeSnapshot, BacktestSignalItem, BacktestPositionItem, BacktestOrderItem, EvolutionExperiment, EvolutionCandidate, BacktestCompareResponse, OfficialStrategyPackListResponse, OfficialStrategyPackCloneResponse, OfficialStrategyPackItem, StrategyPlatformBacktestRequest, VirtualWarehouseOverviewResponse, VirtualWarehouseDiagnosticsResponse, QmtReturnStatsResponse, QmtSyncProfile, PaperAccount, QmtOrderSubmitRequest, QmtOrderSubmitResponse, QmtOrderCancelResponse, QmtBulkSellTask, VirtualWarehouseOrder, VirtualWarehouseTrade, RealtimeMonitor, RealtimeEvent, RealtimeMonitorCreateRequest, RealtimeMonitorUpdateRequest, RealtimeMonitorPositionsResponse, RealtimeMonitorPerformanceResponse, BacktestDataConfigItem, BacktestDataSubscriptionStatus, DailyKlineGovernanceSummaryResponse, ChanlunOverlayResponse, MarketOverviewResponse, NewsEyeAnalyzeRequest, NewsEyeAnalyzeResponse, NewsEyeListResponse, NewsEyeRefreshResponse, NewsThemePerformanceResponse, NewsThemeRankingResponse, NewsThemeSnapshotResponse, NewsThemeWindow, CatalystSelectionRankResponse, CatalystSelectionHistoryResponse, CatalystOpportunityEventResponse, CatalystMonitorPoolResponse, CatalystClosedLoopAuditResponse, CatalystEventRefreshRunResponse, CatalystLearningReplayResponse, CatalystSelectionSettlementResponse, DailyReview, DailyReviewConfig, DailyReviewHistoryItem, QmtBackgroundRefreshResponse, SystemDataSourceRegistryResponse } from '@/types'
+import type { AnalysisRequest, AnalysisResponse, Announcement, AuthUser, AuthVerifyResponse, JobStatus, AnalysisReport, IntradayResponse, KlineResponse, LatestAnnouncementResponse, MarketQuoteResponse, PortfolioImportState, PortfolioOverviewResponse, PortfolioPositionInput, Report, ReportDetail, ReportListResponse, RuntimeConfig, RuntimeConfigUpdate, RuntimeConfigUpdateResponse, RuntimeWarmupRequest, RuntimeWarmupResponse, WatchlistItem, WatchlistBatchResponse, ScheduledAnalysis, ScheduledBatchTriggerResponse, StockSearchResult, TrackingBoardResponse, UserToken, UserTokenCreateRequest, WecomWarmupRequest, WecomWarmupResponse, FeedbackItem, FeedbackListResponse, FeedbackUnreadResponse, RuntimeLogSource, RuntimeLogsResponse, StrategyDefinition, StrategyDraftResponse, StrategyListResponseV2, StrategyCompileResponse, StrategyDsl, SelectionCenterTask, SelectionCenterTaskCreateRequest, SelectionCenterTaskListResponse, SelectionConfirmationResponse, StockPoolGroup, StockPoolGroupListResponse, StockPoolItemAddResponse, StockPoolItemListResponse, StockPoolSelectionCopyResponse, StockPoolStrategyPreviewResponse, BacktestRun, BacktestMetrics, BacktestTradeRecord, BacktestEquityPoint, BacktestWatchlistItem, BacktestMinuteConfirmationItem, BacktestTradeSnapshot, BacktestSignalItem, BacktestPositionItem, BacktestOrderItem, EvolutionExperiment, EvolutionCandidate, BacktestCompareResponse, OfficialStrategyPackListResponse, OfficialStrategyPackCloneResponse, OfficialStrategyPackItem, StrategyPlatformBacktestRequest, VirtualWarehouseOverviewResponse, VirtualWarehouseDiagnosticsResponse, QmtReturnStatsResponse, QmtSyncProfile, PaperAccount, QmtOrderSubmitRequest, QmtOrderSubmitResponse, QmtOrderCancelResponse, QmtBulkSellTask, VirtualWarehouseOrder, VirtualWarehouseTrade, RealtimeMonitor, RealtimeEvent, RealtimeMonitorCreateRequest, RealtimeMonitorUpdateRequest, RealtimeMonitorPositionsResponse, RealtimeMonitorPerformanceResponse, BacktestDataConfigItem, BacktestDataSubscriptionStatus, DailyKlineGovernanceSummaryResponse, ChanlunOverlayResponse, MarketOverviewResponse, NewsEyeAnalyzeRequest, NewsEyeAnalyzeResponse, NewsEyeListResponse, NewsEyeRefreshResponse, NewsThemePerformanceResponse, NewsThemeRankingResponse, NewsThemeSnapshotResponse, NewsThemeWindow, CatalystSelectionRankResponse, CatalystSelectionHistoryResponse, CatalystOpportunityEventResponse, CatalystMonitorPoolResponse, CatalystClosedLoopAuditResponse, CatalystEventRefreshRunResponse, CatalystLearningReplayResponse, CatalystSelectionSettlementResponse, DailyReview, DailyReviewConfig, DailyReviewHistoryItem, QmtBackgroundRefreshResponse, SystemDataSourceRegistryResponse } from '@/types'
 
 type ApiRequestOptions = RequestInit & {
     timeoutMs?: number
@@ -28,6 +28,20 @@ const BACKTEST_DETAIL_PAGE_SIZE = 5000
 const BACKTEST_DETAIL_MAX_ITEMS = 50000
 const DEV_USER_ID = (import.meta.env.VITE_TA_DEV_USER_ID as string) || 'test-user-001'
 const DEV_USER_EMAIL = (import.meta.env.VITE_TA_DEV_USER_EMAIL as string) || 'test@example.com'
+
+function isDevAuthFallbackEnabled(): boolean {
+    return import.meta.env.DEV === true
+}
+
+function createDevUser(): AuthUser {
+    const now = new Date().toISOString()
+    return {
+        id: DEV_USER_ID,
+        email: DEV_USER_EMAIL,
+        created_at: now,
+        last_login_at: now,
+    }
+}
 
 function isLoopbackHostname(hostname: string): boolean {
     const normalized = hostname.trim().toLowerCase()
@@ -893,6 +907,13 @@ class ApiService {
         return this.request<SelectionCenterTask>(`/v1/selection-center/tasks/${taskId}`)
     }
 
+    async getSelectionCenterConfirmationFilters(taskId: string, timeframe = '30m'): Promise<SelectionConfirmationResponse> {
+        const query = new URLSearchParams()
+        if (timeframe) query.append('timeframe', timeframe)
+        const suffix = query.toString() ? `?${query}` : ''
+        return this.request<SelectionConfirmationResponse>(`/v1/selection-center/tasks/${taskId}/confirmation-filters${suffix}`)
+    }
+
     async rerunSelectionCenterTask(taskId: string): Promise<SelectionCenterTask> {
         return this.request<SelectionCenterTask>(`/v1/selection-center/tasks/${taskId}/rerun`, {
             method: 'POST',
@@ -902,6 +923,86 @@ class ApiService {
     async deleteSelectionCenterTask(taskId: string): Promise<{ message: string }> {
         return this.request<{ message: string }>(`/v1/selection-center/tasks/${taskId}`, {
             method: 'DELETE',
+        })
+    }
+
+    async getStockPoolGroups(): Promise<StockPoolGroupListResponse> {
+        return this.request<StockPoolGroupListResponse>('/v1/stock-pool/groups')
+    }
+
+    async createStockPoolGroup(name: string): Promise<StockPoolGroup> {
+        return this.request<StockPoolGroup>('/v1/stock-pool/groups', {
+            method: 'POST',
+            body: JSON.stringify({ name }),
+        })
+    }
+
+    async updateStockPoolGroup(groupId: string, data: { name?: string; sort_order?: number }): Promise<StockPoolGroup> {
+        return this.request<StockPoolGroup>(`/v1/stock-pool/groups/${encodeURIComponent(groupId)}`, {
+            method: 'PATCH',
+            body: JSON.stringify(data),
+        })
+    }
+
+    async deleteStockPoolGroup(groupId: string): Promise<{ message: string }> {
+        return this.request<{ message: string }>(`/v1/stock-pool/groups/${encodeURIComponent(groupId)}`, {
+            method: 'DELETE',
+        })
+    }
+
+    async getStockPoolItems(groupId: string, params?: {
+        page?: number
+        page_size?: number
+        q?: string
+        sector?: string
+        sort_by?: string
+        sort_direction?: 'asc' | 'desc'
+    }): Promise<StockPoolItemListResponse> {
+        const query = new URLSearchParams()
+        if (params?.page) query.append('page', String(params.page))
+        if (params?.page_size) query.append('page_size', String(params.page_size))
+        if (params?.q) query.append('q', params.q)
+        if (params?.sector) query.append('sector', params.sector)
+        if (params?.sort_by) query.append('sort_by', params.sort_by)
+        if (params?.sort_direction) query.append('sort_direction', params.sort_direction)
+        const suffix = query.toString() ? `?${query}` : ''
+        return this.request<StockPoolItemListResponse>(`/v1/stock-pool/groups/${encodeURIComponent(groupId)}/items${suffix}`)
+    }
+
+    async addStockPoolItem(groupId: string, data: {
+        symbol: string
+        name?: string | null
+        source?: string
+    }): Promise<StockPoolItemAddResponse> {
+        return this.request<StockPoolItemAddResponse>(`/v1/stock-pool/groups/${encodeURIComponent(groupId)}/items`, {
+            method: 'POST',
+            body: JSON.stringify(data),
+        })
+    }
+
+    async deleteStockPoolItem(groupId: string, itemId: string): Promise<{ message: string }> {
+        return this.request<{ message: string }>(`/v1/stock-pool/groups/${encodeURIComponent(groupId)}/items/${encodeURIComponent(itemId)}`, {
+            method: 'DELETE',
+        })
+    }
+
+    async copySelectionTaskToStockPool(taskId: string, name?: string): Promise<StockPoolSelectionCopyResponse> {
+        return this.request<StockPoolSelectionCopyResponse>(`/v1/stock-pool/from-selection-task/${encodeURIComponent(taskId)}`, {
+            method: 'POST',
+            body: JSON.stringify(name ? { name } : {}),
+        })
+    }
+
+    async previewStockPoolStrategy(data: {
+        symbol: string
+        strategy_id: string
+        period?: string
+        start_date?: string | null
+        end_date?: string | null
+    }): Promise<StockPoolStrategyPreviewResponse> {
+        return this.request<StockPoolStrategyPreviewResponse>('/v1/stock-pool/strategy-preview', {
+            method: 'POST',
+            body: JSON.stringify(data),
         })
     }
 
@@ -1270,19 +1371,11 @@ class ApiService {
     }
 
     async getMe(): Promise<AuthUser> {
-        // 开发环境：如果后端返回未登录，返回模拟用户
         try {
             return await this.request('/v1/auth/me')
         } catch (error) {
-            if (error instanceof Error && error.message.includes('请先登录')) {
-                // 开发模式：返回模拟用户
-                console.log('开发模式：使用模拟用户')
-                return {
-                    id: DEV_USER_ID,
-                    email: DEV_USER_EMAIL,
-                    created_at: new Date().toISOString(),
-                    last_login_at: new Date().toISOString()
-                }
+            if (isDevAuthFallbackEnabled() && error instanceof Error && error.message.includes('请先登录')) {
+                return createDevUser()
             }
             throw error
         }

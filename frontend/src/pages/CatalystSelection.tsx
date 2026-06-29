@@ -241,7 +241,7 @@ function realtimeFeedbackEventLabel(value?: unknown) {
     order_submitted: '委托提交',
     order_rejected: '委托拒绝',
     order_error: '委托异常',
-    approval_created: '人工确认',
+    approval_created: '历史确认',
     trade_confirmed: '成交确认',
     position_changed: '持仓变化',
   }

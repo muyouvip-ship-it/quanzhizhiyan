@@ -10,6 +10,18 @@ import pandas as pd
 from api.services import selection_center_service as svc
 
 
+class _DummyDbContext:
+    def __enter__(self):
+        return object()
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+def _patch_dummy_db_ctx(monkeypatch):
+    monkeypatch.setattr(svc, "get_db_ctx", lambda: _DummyDbContext())
+
+
 def test_selection_task_summary_omits_candidate_payload():
     created_at = datetime(2026, 6, 15, 22, 10, 8)
     row = {
@@ -38,6 +50,215 @@ def test_selection_task_summary_omits_candidate_payload():
     assert summary["created_at"] == "2026-06-15T22:10:08"
 
 
+def test_selection_task_summary_derives_precise_filter_labels_from_config():
+    created_at = datetime(2026, 6, 22, 22, 21, 0)
+    row = {
+        "id": "task-1",
+        "user_id": "user-1",
+        "name": "首日波段",
+        "mode": "strategy",
+        "status": "completed",
+        "progress": 100,
+        "universe": "主板",
+        "rule": "首日波段 / 买点规则 1",
+        "filters_json": ["趋势向上"],
+        "config_json": {
+            "mode": "strategy",
+            "filter_config": {
+                "exclude_st": True,
+                "exclude_suspended": True,
+                "trend_up": True,
+                "trend_ma": 60,
+            },
+        },
+        "candidate_count": 12,
+        "error_message": None,
+        "created_at": created_at,
+        "started_at": created_at,
+        "completed_at": created_at,
+        "updated_at": created_at,
+    }
+
+    summary = svc._selection_task_summary(row)
+
+    assert summary["filters"] == ["非 ST", "排除停牌", "站上MA60"]
+
+
+def test_confirmation_daily_breakout_requires_next_day_high_above_selected_high():
+    candidates = [
+        {"symbol": "603118.SH", "metrics": {"selected_at": "2026-06-24"}},
+        {"symbol": "300650.SZ", "metrics": {"selected_at": "2026-06-24"}},
+        {"symbol": "000001.SZ", "metrics": {"selected_at": "2026-06-24"}},
+    ]
+    rows = [
+        {"symbol": "603118.SH", "trade_date": "2026-06-24", "high": Decimal("12.94")},
+        {"symbol": "603118.SH", "trade_date": "2026-06-25", "high": Decimal("12.80")},
+        {"symbol": "300650.SZ", "trade_date": "2026-06-24", "high": Decimal("12.77")},
+        {"symbol": "300650.SZ", "trade_date": "2026-06-25", "high": Decimal("14.86")},
+        {"symbol": "000001.SZ", "trade_date": "2026-06-24", "high": Decimal("10.00")},
+    ]
+
+    result = svc._evaluate_next_day_breakout(candidates, rows)
+
+    assert result["603118.SH"]["status"] == "fail"
+    assert result["603118.SH"]["selected_high"] == 12.94
+    assert result["300650.SZ"]["status"] == "pass"
+    assert result["300650.SZ"]["next_trade_date"] == "2026-06-25"
+    assert result["000001.SZ"]["status"] == "pending"
+
+
+def test_confirmation_intraday_rejects_immediate_next_bar_dead_cross(monkeypatch):
+    candidates = [
+        {"symbol": "603118.SH", "metrics": {"selected_at": "2026-06-24"}},
+        {"symbol": "300650.SZ", "metrics": {"selected_at": "2026-06-24"}},
+        {"symbol": "000001.SZ", "metrics": {"selected_at": "2026-06-24"}},
+    ]
+    frame = pd.DataFrame(
+        [
+            {"symbol": "603118.SH", "bar_end": pd.Timestamp("2026-06-24 13:30"), "bar_start": pd.Timestamp("2026-06-24 13:00"), "first_day_band": 20, "first_day_band_b1": 30},
+            {"symbol": "603118.SH", "bar_end": pd.Timestamp("2026-06-24 14:00"), "bar_start": pd.Timestamp("2026-06-24 13:30"), "first_day_band": 35, "first_day_band_b1": 30},
+            {"symbol": "603118.SH", "bar_end": pd.Timestamp("2026-06-24 14:30"), "bar_start": pd.Timestamp("2026-06-24 14:00"), "first_day_band": 25, "first_day_band_b1": 30},
+            {"symbol": "300650.SZ", "bar_end": pd.Timestamp("2026-06-24 13:30"), "bar_start": pd.Timestamp("2026-06-24 13:00"), "first_day_band": 20, "first_day_band_b1": 30},
+            {"symbol": "300650.SZ", "bar_end": pd.Timestamp("2026-06-24 14:00"), "bar_start": pd.Timestamp("2026-06-24 13:30"), "first_day_band": 35, "first_day_band_b1": 30},
+            {"symbol": "300650.SZ", "bar_end": pd.Timestamp("2026-06-24 14:30"), "bar_start": pd.Timestamp("2026-06-24 14:00"), "first_day_band": 40, "first_day_band_b1": 32},
+            {"symbol": "000001.SZ", "bar_end": pd.Timestamp("2026-06-24 14:00"), "bar_start": pd.Timestamp("2026-06-24 13:30"), "first_day_band": 20, "first_day_band_b1": 30},
+            {"symbol": "000001.SZ", "bar_end": pd.Timestamp("2026-06-24 14:30"), "bar_start": pd.Timestamp("2026-06-24 14:00"), "first_day_band": 35, "first_day_band_b1": 30},
+        ]
+    )
+    monkeypatch.setattr(svc, "_aggregate_minute_frame", lambda raw, timeframe: raw)
+    monkeypatch.setattr(svc, "_compute_first_day_band", lambda group: group)
+
+    result = svc._evaluate_intraday_no_immediate_dead_cross(candidates, frame, "30m")
+
+    assert result["603118.SH"]["status"] == "fail"
+    assert result["603118.SH"]["next_bar_end"] == "2026-06-24T14:30:00"
+    assert result["300650.SZ"]["status"] == "pass"
+    assert result["000001.SZ"]["status"] == "pending"
+
+
+def test_confirmation_intraday_handles_decimal_minute_columns(monkeypatch):
+    frame = pd.DataFrame([
+        {
+            "symbol": "300650.SZ",
+            "bar_end": pd.Timestamp("2026-06-24 09:35") + pd.Timedelta(minutes=5 * i),
+            "bar_start": pd.Timestamp("2026-06-24 09:30") + pd.Timedelta(minutes=5 * i),
+            "open": Decimal("12.00") + Decimal(str(i)) / Decimal("100"),
+            "high": Decimal("12.10") + Decimal(str(i)) / Decimal("100"),
+            "low": Decimal("11.90") + Decimal(str(i)) / Decimal("100"),
+            "close": Decimal("12.05") + Decimal(str(i)) / Decimal("100"),
+            "volume": Decimal("1000") + Decimal(str(i * 10)),
+            "amount": Decimal("12050") + Decimal(str(i * 100)),
+        }
+        for i in range(20)
+    ])
+
+    computed = svc._compute_first_day_band(frame.copy())
+
+    assert not computed.empty
+    assert computed["first_day_band"].notna().any()
+
+
+def test_confirmation_intraday_handles_flat_minute_window_without_error():
+    frame = pd.DataFrame([
+        {
+            "symbol": "300650.SZ",
+            "bar_end": pd.Timestamp("2026-06-24 09:35") + pd.Timedelta(minutes=5 * i),
+            "bar_start": pd.Timestamp("2026-06-24 09:30") + pd.Timedelta(minutes=5 * i),
+            "open": Decimal("12.00"),
+            "high": Decimal("12.00"),
+            "low": Decimal("12.00"),
+            "close": Decimal("12.00"),
+            "volume": Decimal("1000"),
+            "amount": Decimal("12000"),
+        }
+        for i in range(20)
+    ])
+
+    computed = svc._compute_first_day_band(frame.copy())
+
+    assert computed.empty or computed["first_day_band"].isna().all()
+
+
+def test_confirmation_intraday_marks_single_symbol_missing_when_compute_fails(monkeypatch):
+    candidates = [
+        {"symbol": "300650.SZ", "metrics": {"selected_at": "2026-06-24"}},
+        {"symbol": "000001.SZ", "metrics": {"selected_at": "2026-06-24"}},
+    ]
+    frame = pd.DataFrame(
+        [
+            {"symbol": "300650.SZ", "bar_end": pd.Timestamp("2026-06-24 13:30"), "bar_start": pd.Timestamp("2026-06-24 13:00"), "first_day_band": 20, "first_day_band_b1": 30},
+            {"symbol": "300650.SZ", "bar_end": pd.Timestamp("2026-06-24 14:00"), "bar_start": pd.Timestamp("2026-06-24 13:30"), "first_day_band": 35, "first_day_band_b1": 30},
+            {"symbol": "300650.SZ", "bar_end": pd.Timestamp("2026-06-24 14:30"), "bar_start": pd.Timestamp("2026-06-24 14:00"), "first_day_band": 40, "first_day_band_b1": 32},
+            {"symbol": "000001.SZ", "bar_end": pd.Timestamp("2026-06-24 13:30"), "bar_start": pd.Timestamp("2026-06-24 13:00"), "first_day_band": 20, "first_day_band_b1": 30},
+        ]
+    )
+
+    def fake_compute(group):
+        if str(group.iloc[0]["symbol"]) == "000001.SZ":
+            raise RuntimeError("bad minute rows")
+        return group
+
+    monkeypatch.setattr(svc, "_aggregate_minute_frame", lambda raw, timeframe: raw)
+    monkeypatch.setattr(svc, "_compute_first_day_band", fake_compute)
+
+    result = svc._evaluate_intraday_no_immediate_dead_cross(candidates, frame, "30m")
+
+    assert result["300650.SZ"]["status"] == "pass"
+    assert result["000001.SZ"]["status"] == "missing"
+
+
+def test_confirmation_timeframe_accepts_daily_aliases():
+    assert svc._normalize_confirmation_timeframe("1d") == "1d"
+    assert svc._normalize_confirmation_timeframe("日线") == "1d"
+    assert svc._normalize_confirmation_timeframe("日K") == "1d"
+
+
+def test_confirmation_daily_rejects_next_day_dead_cross(monkeypatch):
+    candidates = [
+        {"symbol": "603118.SH", "metrics": {"selected_at": "2026-06-24"}},
+        {"symbol": "300650.SZ", "metrics": {"selected_at": "2026-06-24"}},
+        {"symbol": "000001.SZ", "metrics": {"selected_at": "2026-06-24"}},
+    ]
+    rows = [
+        {"symbol": "603118.SH", "trade_date": "2026-06-23"},
+        {"symbol": "603118.SH", "trade_date": "2026-06-24"},
+        {"symbol": "603118.SH", "trade_date": "2026-06-25"},
+        {"symbol": "300650.SZ", "trade_date": "2026-06-23"},
+        {"symbol": "300650.SZ", "trade_date": "2026-06-24"},
+        {"symbol": "300650.SZ", "trade_date": "2026-06-25"},
+        {"symbol": "000001.SZ", "trade_date": "2026-06-23"},
+        {"symbol": "000001.SZ", "trade_date": "2026-06-24"},
+    ]
+
+    def fake_compute(group):
+        dates = list(group["bar_end"])
+        symbol = str(group.iloc[0]["symbol"])
+        if symbol == "603118.SH":
+            band = [20, 35, 25]
+            b1 = [30, 30, 30]
+        elif symbol == "300650.SZ":
+            band = [20, 35, 40]
+            b1 = [30, 30, 32]
+        else:
+            band = [20, 35]
+            b1 = [30, 30]
+        return pd.DataFrame({
+            "symbol": symbol,
+            "bar_end": dates,
+            "first_day_band": band[:len(dates)],
+            "first_day_band_b1": b1[:len(dates)],
+        })
+
+    monkeypatch.setattr(svc, "_compute_first_day_band", fake_compute)
+
+    result = svc._evaluate_daily_no_immediate_dead_cross(candidates, rows)
+
+    assert result["603118.SH"]["status"] == "fail"
+    assert result["603118.SH"]["next_bar_end"] == "2026-06-25T00:00:00"
+    assert result["300650.SZ"]["status"] == "pass"
+    assert result["000001.SZ"]["status"] == "pending"
+
+
 def test_latest_rows_query_uses_distinct_on_for_indexed_lookup():
     sql = svc._latest_rows_for_symbols_sql()
 
@@ -46,6 +267,7 @@ def test_latest_rows_query_uses_distinct_on_for_indexed_lookup():
 
 
 def test_candidate_metric_enrichment_refreshes_since_selected_change_when_display_fields_complete(monkeypatch):
+    _patch_dummy_db_ctx(monkeypatch)
     task = {
         "id": "task-ready",
         "candidates": [
@@ -205,6 +427,55 @@ def test_strategy_selection_requires_signal_match(monkeypatch):
     assert "命中买点规则 1" in candidates[0]["reason"]
 
 
+def test_trend_filter_requires_full_ma_window(monkeypatch):
+    config = {
+        "mode": "catalyst",
+        "include_boards": ["主板"],
+        "catalyst_rule": "事件热度",
+        "filter_config": {
+            "exclude_st": False,
+            "exclude_suspended": False,
+            "trend_up": True,
+            "trend_ma": 60,
+            "amount_enabled": False,
+            "market_cap_enabled": False,
+            "volume_up": False,
+            "event_heat_enabled": False,
+        },
+    }
+    latest_rows = [
+        {
+            "symbol": "000001.SZ",
+            "trade_date": "2026-06-22",
+            "close": Decimal("12.00"),
+            "pre_close": Decimal("11.80"),
+            "amount": Decimal("120000000"),
+            "amount_ma20": Decimal("100000000"),
+            "total_market_cap": Decimal("10000000000"),
+            "ma60": Decimal("11.50"),
+            "ma60_window_count": 42,
+        },
+        {
+            "symbol": "000002.SZ",
+            "trade_date": "2026-06-22",
+            "close": Decimal("12.00"),
+            "pre_close": Decimal("11.80"),
+            "amount": Decimal("120000000"),
+            "amount_ma20": Decimal("100000000"),
+            "total_market_cap": Decimal("10000000000"),
+            "ma60": Decimal("11.50"),
+            "ma60_window_count": 60,
+        },
+    ]
+
+    monkeypatch.setattr(svc, "_load_latest_market_rows", lambda db, **kwargs: latest_rows)
+    monkeypatch.setattr(svc, "get_reverse_stock_map", lambda: {"000001.SZ": "短样本", "000002.SZ": "完整样本"})
+
+    candidates = svc._generate_candidates(None, config, "事件热度")
+
+    assert [item["symbol"] for item in candidates] == ["000002.SZ"]
+
+
 def test_selected_signal_rules_accepts_legacy_buy_sell_ids():
     rules = [
         {"rule_key": "cross_above", "params": {"left": "a", "right": "b"}},
@@ -221,6 +492,7 @@ def test_selected_signal_rules_accepts_legacy_buy_sell_ids():
 
 
 def test_enrich_candidate_recalculates_selected_day_change_pct(monkeypatch):
+    _patch_dummy_db_ctx(monkeypatch)
     task = {
         "id": "task-1",
         "candidates": [
@@ -282,6 +554,7 @@ def test_enrich_candidate_recalculates_selected_day_change_pct(monkeypatch):
 
 
 def test_enrich_candidate_assigns_recommendation_rank_from_selected_day_features(monkeypatch):
+    _patch_dummy_db_ctx(monkeypatch)
     task = {
         "id": "task-rank",
         "candidates": [

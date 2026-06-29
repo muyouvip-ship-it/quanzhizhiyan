@@ -13,6 +13,11 @@ from api.models.strategy_models import (
     EvolutionCandidateDB,
     EvolutionExperimentDB,
     PaperOrderDB,
+    RealtimeApprovalDB,
+    RealtimeEventDB,
+    RealtimeMonitorDB,
+    RealtimeSignalExecutionDB,
+    BacktestResultDB,
     StrategyDB,
     StrategyStatus,
     StrategyType,
@@ -25,6 +30,12 @@ _REALTIME_TEST_STRATEGY_NAME_RE = re.compile(
     r"^(实时测试策略|实盘监控策略|审批策略|单轮执行策略|同K线去重策略|同K线延迟信号策略|"
     r"不可卖卖出策略|非交易时段策略|禁用缓存快照策略|撤单补单策略|首日波段回补策略)-[0-9a-f]{6}$"
 )
+_KNOWN_TEST_STRATEGY_NAMES = {
+    "模板策略保存测试",
+    "克隆策略测试",
+    "仓储测试策略",
+    "进化仓储测试策略",
+}
 
 
 def list_platform_strategies(
@@ -132,9 +143,19 @@ def delete_platform_strategy(db: Session, strategy_id: str) -> bool:
     if row is None or not _is_platform_strategy(row):
         return False
 
+    backtest_ids = [
+        item.id
+        for item in db.query(BacktestJobDB.id).filter(BacktestJobDB.strategy_id == strategy_id).all()
+    ]
+    if backtest_ids:
+        db.query(BacktestResultDB).filter(BacktestResultDB.job_id.in_(backtest_ids)).delete(synchronize_session=False)
     db.query(PaperOrderDB).filter(PaperOrderDB.strategy_id == strategy_id).delete()
     db.query(TradeRecordDB).filter(TradeRecordDB.strategy_id == strategy_id).delete()
     db.query(BacktestJobDB).filter(BacktestJobDB.strategy_id == strategy_id).delete()
+    db.query(RealtimeApprovalDB).filter(RealtimeApprovalDB.strategy_id == strategy_id).delete()
+    db.query(RealtimeSignalExecutionDB).filter(RealtimeSignalExecutionDB.strategy_id == strategy_id).delete()
+    db.query(RealtimeEventDB).filter(RealtimeEventDB.strategy_id == strategy_id).delete()
+    db.query(RealtimeMonitorDB).filter(RealtimeMonitorDB.strategy_id == strategy_id).delete()
 
     experiments = (
         db.query(EvolutionExperimentDB)
@@ -446,16 +467,21 @@ def _is_platform_strategy(row: StrategyDB) -> bool:
 
 
 def _is_test_strategy(item: dict[str, Any]) -> bool:
+    name = str(item.get("name") or "")
     if item.get("source") == "test":
+        return True
+    if name in _KNOWN_TEST_STRATEGY_NAMES:
         return True
     tags = set(item.get("tags") or [])
     if "测试污染已归档" in tags:
+        return True
+    if "测试" in tags:
         return True
     if not {"AI创建", "待回测"}.issubset(tags):
         return False
     if int(item.get("run_count") or 0) != 0:
         return False
-    return bool(_REALTIME_TEST_STRATEGY_NAME_RE.match(str(item.get("name") or "")))
+    return bool(_REALTIME_TEST_STRATEGY_NAME_RE.match(name))
 
 
 def _is_platform_backtest(row: BacktestJobDB) -> bool:

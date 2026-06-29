@@ -202,7 +202,7 @@ def main() -> int:
     orders_payload = _get_json(f"{base_url}/v1/realtime/monitors/{monitor_id}/orders", token=token)
     trades_payload = _get_json(f"{base_url}/v1/realtime/monitors/{monitor_id}/trades", token=token)
     positions_payload = _get_json(f"{base_url}/v1/realtime/monitors/{monitor_id}/positions", token=token)
-    approvals_payload = _get_json(f"{base_url}/v1/realtime/approvals", token=token, params={"monitor_id": monitor_id})
+    performance_payload = _get_json(f"{base_url}/v1/realtime/monitors/{monitor_id}/performance", token=token)
 
     _print_step(
         "6. 联调结果汇总",
@@ -219,7 +219,11 @@ def main() -> int:
             "orders": len(orders_payload.get("items") or []),
             "trades": len(trades_payload.get("items") or []),
             "positions": len(positions_payload.get("positions") or []),
-            "approvals": len(approvals_payload.get("items") or []),
+            "performance": {
+                "strategy_pnl": (performance_payload.get("strategy") or {}).get("pnl"),
+                "hold_pnl": (performance_payload.get("hold_baseline") or {}).get("pnl"),
+                "excess_pnl": (performance_payload.get("excess") or {}).get("pnl"),
+            },
         },
     )
 

@@ -61,7 +61,8 @@ def test_strategy_platform_repository_persists_strategy_payload(db):
     assert fetched is not None
     assert fetched["name"] == "仓储测试策略"
     assert fetched["current_version"]["id"] == "version_1"
-    assert len(items) == 1
+    assert items == []
+    assert len(list_platform_strategies(db, include_test=True)) == 1
 
 
 def test_strategy_platform_repository_hides_test_strategies_by_default(db):
@@ -93,6 +94,51 @@ def test_strategy_platform_repository_hides_test_strategies_by_default(db):
 
     assert list_platform_strategies(db) == []
     assert len(list_platform_strategies(db, include_test=True)) == 1
+
+
+def test_strategy_platform_repository_hides_named_test_artifacts_by_default(db):
+    base_payload = {
+        "strategy_type": "portfolio",
+        "status": "draft",
+        "description": "策略平台接口测试数据",
+        "current_version_id": "version_1",
+        "version": 1,
+        "is_active": False,
+        "run_count": 0,
+        "performance": None,
+        "current_version": {
+            "id": "version_1",
+            "strategy_id": "strategy_repo_named_test",
+            "version": 1,
+            "dsl": {"schema_version": "1.0", "strategy_type": "portfolio"},
+            "compile_status": "passed",
+            "compiled_hash": "abc123",
+            "change_summary": "init",
+            "created_at": "2026-04-20T00:00:00+00:00",
+        },
+        "tags": ["AI创建", "待回测", "模板策略"],
+    }
+    save_platform_strategy(
+        db,
+        {
+            **base_payload,
+            "id": "strategy_repo_template_test",
+            "name": "模板策略保存测试",
+            "source": "template",
+        },
+    )
+    save_platform_strategy(
+        db,
+        {
+            **base_payload,
+            "id": "strategy_repo_clone_test",
+            "name": "克隆策略测试",
+            "source": "manual",
+        },
+    )
+
+    assert list_platform_strategies(db) == []
+    assert len(list_platform_strategies(db, include_test=True)) == 2
 
 
 def test_strategy_platform_repository_persists_backtest_and_updates_metrics(db):

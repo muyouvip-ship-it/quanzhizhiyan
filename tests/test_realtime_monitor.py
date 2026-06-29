@@ -262,37 +262,54 @@ def test_create_and_start_paper_monitor(monkeypatch):
     assert "monitor_started" in runtime_event_types
 
 
-def test_live_monitor_auto_trade_is_downgraded_to_monitor_only(monkeypatch):
-    client = _client()
-    token = _auth(client)
-    headers = {"Authorization": f"Bearer {token}"}
-    strategy_id = _create_strategy(client, f"实盘监控策略-{uuid4().hex[:6]}")
-    _mock_common(monkeypatch, account_key="live_real", role="live")
+def test_live_monitor_auto_trade_stays_auto_after_explicit_confirmation(monkeypatch):
+    strategy_id = f"strategy-live-{uuid4().hex[:8]}"
+    strategy = {
+        "id": strategy_id,
+        "name": "实盘监控策略",
+        "current_version_id": f"version-{uuid4().hex[:8]}",
+    }
+    compiled = SimpleNamespace(status="passed", errors=[], timeframes_required=[], minute_requirements={})
+    monkeypatch.setattr(realtime_monitor_service, "_require_strategy", lambda db, target_id: strategy)
+    monkeypatch.setattr(realtime_monitor_service, "_compile_strategy_payload", lambda item: compiled)
+    monkeypatch.setattr(realtime_monitor_service, "_account_role", lambda account_key, **kwargs: "live")
+    monkeypatch.setattr(realtime_monitor_service, "_resolve_monitor_symbols", lambda *args, **kwargs: ["600519.SH"])
 
-    created = client.post(
-        "/v1/realtime/monitors",
-        headers=headers,
-        json={
-            "name": "实盘只读监控",
+    user_id = f"user-live-start-{uuid4().hex[:8]}"
+    with get_strategy_db_ctx() as strategy_db, get_db_ctx() as main_db:
+        strategy_db.add(
+            StrategyDB(
+                id=strategy_id,
+                name=strategy["name"],
+                strategy_type=StrategyType.TRADING,
+                status=StrategyStatus.ACTIVE,
+                is_active=True,
+            )
+        )
+        created = realtime_monitor_service.create_monitor(strategy_db, main_db, user_id, {
+            "name": "实盘自动监控",
             "strategy_id": strategy_id,
             "account_key": "live_real",
             "execution_mode": "auto",
+            "live_trading_enabled": True,
+            "live_confirmed": True,
             "monitor_pool": {"symbols": ["600519.SH"]},
-        },
-    )
-    assert created.status_code == 200
-    monitor_id = created.json()["id"]
+        })
+        payload = realtime_monitor_service.start_monitor(strategy_db, user_id, created["id"])
 
-    started = client.post(f"/v1/realtime/monitors/{monitor_id}/start", headers=headers)
-    assert started.status_code == 200
-    payload = started.json()
     assert payload["status"] == "running"
-    assert payload["execution_mode"] == "monitor_only"
-    assert payload["auto_trade_enabled"] is False
+    assert payload["execution_mode"] == "auto"
+    assert payload["auto_trade_enabled"] is True
+    assert payload["live_trading_enabled"] is True
 
-    events = client.get(f"/v1/realtime/monitors/{monitor_id}/events", headers=headers)
-    event_types = [item["event_type"] for item in events.json()["items"]]
-    assert "live_readonly_guard" in event_types
+    with get_strategy_db_ctx() as strategy_db:
+        event_types = [
+            row.event_type
+            for row in strategy_db.query(RealtimeEventDB.event_type)
+            .filter(RealtimeEventDB.monitor_id == created["id"])
+            .all()
+        ]
+    assert "live_readonly_guard" not in event_types
 
 
 def test_obsolete_pending_approval_is_archived_and_does_not_block_auto_order(monkeypatch):
@@ -1056,6 +1073,134 @@ def test_risk_check_keeps_only_execution_hard_limits_after_signal():
     assert result["passed"] is True
 
 
+def test_live_auto_monitor_requires_explicit_trading_confirmation(monkeypatch):
+    strategy_id = f"strategy-live-{uuid4().hex[:8]}"
+    strategy = {
+        "id": strategy_id,
+        "name": "实盘自动交易确认策略",
+        "current_version_id": f"version-{uuid4().hex[:8]}",
+    }
+    compiled = SimpleNamespace(status="passed", errors=[], timeframes_required=[], minute_requirements={})
+    monkeypatch.setattr(realtime_monitor_service, "_require_strategy", lambda db, target_id: strategy)
+    monkeypatch.setattr(realtime_monitor_service, "_compile_strategy_payload", lambda item: compiled)
+    monkeypatch.setattr(realtime_monitor_service, "_account_role", lambda account_key, **kwargs: "live")
+    monkeypatch.setattr(realtime_monitor_service, "_resolve_monitor_symbols", lambda *args, **kwargs: ["300520.SZ"])
+
+    with get_strategy_db_ctx() as strategy_db, get_db_ctx() as main_db:
+        with pytest.raises(ValueError, match="实盘自动交易必须显式确认"):
+            realtime_monitor_service.create_monitor(strategy_db, main_db, "user-live", {
+                "name": "未确认实盘自动交易",
+                "strategy_id": strategy_id,
+                "account_key": "live_real",
+                "execution_mode": "auto",
+                "live_trading_enabled": False,
+                "live_confirmed": False,
+                "monitor_pool": {"mode": "manual_only", "symbols": ["300520.SZ"]},
+                "config": {"signal_mode": "intraday_confirmation", "signal_timeframe": "30m"},
+            })
+
+
+def test_live_auto_monitor_can_be_created_after_explicit_trading_confirmation(monkeypatch):
+    strategy_id = f"strategy-live-{uuid4().hex[:8]}"
+    strategy = {
+        "id": strategy_id,
+        "name": "实盘自动交易确认策略",
+        "current_version_id": f"version-{uuid4().hex[:8]}",
+    }
+    compiled = SimpleNamespace(status="passed", errors=[], timeframes_required=[], minute_requirements={})
+    monkeypatch.setattr(realtime_monitor_service, "_require_strategy", lambda db, target_id: strategy)
+    monkeypatch.setattr(realtime_monitor_service, "_compile_strategy_payload", lambda item: compiled)
+    monkeypatch.setattr(realtime_monitor_service, "_account_role", lambda account_key, **kwargs: "live")
+    monkeypatch.setattr(realtime_monitor_service, "_resolve_monitor_symbols", lambda *args, **kwargs: ["300520.SZ"])
+
+    with get_strategy_db_ctx() as strategy_db, get_db_ctx() as main_db:
+        strategy_db.add(
+            StrategyDB(
+                id=strategy_id,
+                name=strategy["name"],
+                strategy_type=StrategyType.TRADING,
+                status=StrategyStatus.ACTIVE,
+                is_active=True,
+            )
+        )
+        monitor = realtime_monitor_service.create_monitor(
+            strategy_db,
+            main_db,
+            "user-live-confirmed",
+            {
+                "name": "已确认实盘自动交易",
+                "strategy_id": strategy_id,
+                "account_key": "live_real",
+                "execution_mode": "auto",
+                "live_trading_enabled": True,
+                "live_confirmed": True,
+                "monitor_pool": {"mode": "manual_only", "symbols": ["300520.SZ"]},
+                "config": {"signal_mode": "intraday_confirmation", "signal_timeframe": "30m"},
+            },
+        )
+
+    assert monitor["account_key"] == "live_real"
+    assert monitor["account_role"] == "live"
+    assert monitor["execution_mode"] == "auto"
+    assert monitor["auto_trade_enabled"] is True
+    assert monitor["live_trading_enabled"] is True
+
+
+def test_live_enabled_monitor_submits_order_intent_to_qmt(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def submit_order(db, user_id, **kwargs):
+        captured.update({"user_id": user_id, **kwargs})
+        return {
+            "account_key": kwargs.get("account_key"),
+            "request_id": "live-request-1",
+            "order_result": {
+                "success": True,
+                "order_id": "live-order-1",
+                "bridge": {"account_key": kwargs.get("account_key")},
+            },
+            "overview": {"orders": [{"order_id": "live-order-1", "status": "submitted"}], "trades": []},
+        }
+
+    monkeypatch.setattr(
+        "api.services.realtime_monitor_service.qmt_virtual_account_service.submit_qmt_order",
+        submit_order,
+    )
+    monitor = SimpleNamespace(
+        id="monitor-live-order",
+        user_id="user-live-order",
+        account_key="live_real",
+        account_role="live",
+        live_trading_enabled=True,
+        auto_trade_enabled=True,
+    )
+
+    result = realtime_monitor_service._execute_order_intent(
+        None,
+        None,
+        monitor,
+        {
+            "symbol": "600519.SH",
+            "side": "sell",
+            "quantity": 100,
+            "price": None,
+            "price_type": "opponent",
+            "strategy_name": "RealtimeMonitor-live",
+            "order_remark": "live_auto_test",
+        },
+        reason="live_auto_test",
+    )
+
+    assert result["success"] is True
+    assert result["order_id"] == "live-order-1"
+    assert captured["user_id"] == "user-live-order"
+    assert captured["account_key"] == "live_real"
+    assert captured["symbol"] == "600519.SH"
+    assert captured["side"] == "sell"
+    assert captured["quantity"] == 100
+    assert captured["overview_allow_cache_fallback"] is False
+
+
 def test_realtime_route_notify_only_does_not_submit_order(monkeypatch):
     client = _client()
     token = _auth(client)
@@ -1158,6 +1303,56 @@ def test_realtime_route_reduce_position_uses_configured_pct():
     assert reduce_intent["quantity"] == 300
     assert reduce_intent["execution_action"] == "reduce_position"
     assert clear_intent["quantity"] == 1000
+
+
+def test_realtime_fixed_share_routes_override_percent_sizing():
+    monitor = SimpleNamespace(
+        id="monitor-fixed-share-test",
+        account_key="paper_sim",
+        config_json={"lot_size": 100, "price_type": "opponent", "buy_cash_buffer_pct": 0, "buy_price_buffer_pct": 0},
+        risk_config_json={"max_single_position_pct": 1.0},
+        strategy_id="strategy-1",
+        strategy_version_id="version-1",
+    )
+    overview = {
+        "account": {"total_asset": 1_000_000.0, "available_cash": 900_000.0},
+        "positions": [
+            {"symbol": "300520.SZ", "current_position": 2000, "available_position": 2000},
+        ],
+    }
+
+    buy_intent = realtime_monitor_service._build_order_intent(
+        monitor,
+        overview,
+        {
+            "symbol": "300520.SZ",
+            "side": "buy",
+            "price": 35.0,
+            "execution_action": "buy_quantity",
+            "share_quantity": 1200,
+            "buy_cash_pct": 0.2,
+            "target_position_pct": 0.2,
+            "route_id": "buy-fixed-shares",
+        },
+    )
+    sell_intent = realtime_monitor_service._build_order_intent(
+        monitor,
+        overview,
+        {
+            "symbol": "300520.SZ",
+            "side": "sell",
+            "price": 35.0,
+            "execution_action": "sell_quantity",
+            "share_quantity": 800,
+            "sell_position_pct": 0.35,
+            "route_id": "sell-fixed-shares",
+        },
+    )
+
+    assert buy_intent["quantity"] == 1200
+    assert buy_intent["sizing"]["mode"] == "fixed_share_quantity"
+    assert sell_intent["quantity"] == 800
+    assert sell_intent["execution_action"] == "sell_quantity"
 
 
 def test_realtime_buy_route_pct_uses_available_cash_not_total_asset():

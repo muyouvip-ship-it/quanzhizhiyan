@@ -33,63 +33,68 @@ def export_daily_kline_to_parquet(
 
     root = root or get_daily_kline_parquet_root()
     engine = create_engine(database_url)
-    bounds = _resolve_bounds(engine, start_date=start_date, end_date=end_date)
-    if bounds["start_date"] is None or bounds["end_date"] is None:
-        return {"row_count": 0, "file_count": 0, "root": str(root), "message": "stock_daily_kline 无可导出数据"}
+    try:
+        bounds = _resolve_bounds(engine, start_date=start_date, end_date=end_date)
+        if bounds["start_date"] is None or bounds["end_date"] is None:
+            return {"row_count": 0, "file_count": 0, "root": str(root), "message": "stock_daily_kline 无可导出数据"}
 
-    started = time.perf_counter()
-    total_rows = 0
-    written_paths: set[str] = set()
-    batch_days = max(int(batch_days), 1)
-    window_start = bounds["start_date"]
-    while window_start <= bounds["end_date"]:
-        window_end = min(
-            (pd.Timestamp(window_start) + pd.Timedelta(days=batch_days - 1)).date(),
-            bounds["end_date"],
-        )
-        frame = pd.read_sql_query(
-            text(
-                """
-                SELECT symbol, trade_date AS date, open, high, low, close, volume, amount,
-                       turnover_rate, pre_close, float_market_cap, total_market_cap, net_profit_ttm
-                FROM stock_daily_kline
-                WHERE trade_date >= :start_date
-                  AND trade_date <= :end_date
-                ORDER BY trade_date, symbol
-                """
-            ),
-            engine,
-            params={"start_date": window_start, "end_date": window_end},
-        )
-        if frame.empty:
+        started = time.perf_counter()
+        total_rows = 0
+        written_paths: set[str] = set()
+        batch_days = max(int(batch_days), 1)
+        window_start = bounds["start_date"]
+        while window_start <= bounds["end_date"]:
+            window_end = min(
+                (pd.Timestamp(window_start) + pd.Timedelta(days=batch_days - 1)).date(),
+                bounds["end_date"],
+            )
+            with engine.connect() as conn:
+                frame = pd.read_sql_query(
+                    text(
+                        """
+                        SELECT symbol, trade_date AS date, open, high, low, close, volume, amount,
+                               turnover_rate, pre_close, float_market_cap, total_market_cap, net_profit_ttm
+                        FROM stock_daily_kline
+                        WHERE trade_date >= :start_date
+                          AND trade_date <= :end_date
+                        ORDER BY trade_date, symbol
+                        """
+                    ),
+                    conn,
+                    params={"start_date": window_start, "end_date": window_end},
+                )
+            if frame.empty:
+                window_start = (pd.Timestamp(window_end) + pd.Timedelta(days=1)).date()
+                continue
+            total_rows += len(frame)
+            written = write_daily_kline_parquet_cache(frame, root=root)
+            if written:
+                written_paths.update(path for path in written.split(",") if path)
             window_start = (pd.Timestamp(window_end) + pd.Timedelta(days=1)).date()
-            continue
-        total_rows += len(frame)
-        written = write_daily_kline_parquet_cache(frame, root=root)
-        if written:
-            written_paths.update(path for path in written.split(",") if path)
-        window_start = (pd.Timestamp(window_end) + pd.Timedelta(days=1)).date()
 
-    return {
-        "row_count": total_rows,
-        "file_count": len(written_paths),
-        "root": str(root),
-        "start_date": str(bounds["start_date"]),
-        "end_date": str(bounds["end_date"]),
-        "elapsed_seconds": round(time.perf_counter() - started, 4),
-        "files": sorted(written_paths),
-    }
+        return {
+            "row_count": total_rows,
+            "file_count": len(written_paths),
+            "root": str(root),
+            "start_date": str(bounds["start_date"]),
+            "end_date": str(bounds["end_date"]),
+            "elapsed_seconds": round(time.perf_counter() - started, 4),
+            "files": sorted(written_paths),
+        }
+    finally:
+        engine.dispose()
 
 
 def _resolve_bounds(engine, *, start_date: str | None, end_date: str | None) -> dict[str, Any]:
-    row = engine.connect().execute(
-        text(
-            """
-            SELECT MIN(trade_date) AS min_date, MAX(trade_date) AS max_date
-            FROM stock_daily_kline
-            """
-        )
-    ).mappings().first()
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                """
+                SELECT MIN(trade_date) AS min_date, MAX(trade_date) AS max_date
+                FROM stock_daily_kline
+                """
+            )
+        ).mappings().first()
     if not row or row["min_date"] is None:
         return {"start_date": None, "end_date": None}
     return {

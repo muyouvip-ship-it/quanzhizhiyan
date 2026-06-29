@@ -27,7 +27,7 @@ import type { RealtimeEvent, RealtimeMonitor, RealtimeMonitorPerformanceResponse
 import { qmtAccountStatusFromConnection } from '@/utils/qmtStatus'
 
 type SignalSide = 'buy' | 'sell'
-type RouteAction = 'buy_or_add' | 'reduce_position' | 'clear_position' | 'notify_only'
+type RouteAction = 'buy_or_add' | 'buy_amount' | 'buy_quantity' | 'reduce_position' | 'sell_quantity' | 'clear_position' | 'notify_only'
 type AccountRole = 'paper' | 'live'
 
 interface AccountRoleOption {
@@ -61,6 +61,8 @@ interface SignalRouteDraft {
   signalId: string
   action: RouteAction
   positionPct: string
+  tradeAmount: string
+  shareQuantity: string
   priority: string
   enabled: boolean
 }
@@ -70,6 +72,7 @@ interface MonitorDraft {
   accountRole: AccountRole
   accountKey: string
   executionMode: 'auto' | 'monitor_only'
+  liveTradingConfirmed: boolean
   manualSymbols: string
   poolMode: string
   pollIntervalSeconds: string
@@ -94,6 +97,8 @@ interface SavedSignalRoute {
   signal_condition?: string
   action?: string
   position_pct?: number | string | null
+  trade_amount?: number | string | null
+  share_quantity?: number | string | null
   priority?: number | string | null
   enabled?: boolean
 }
@@ -152,11 +157,14 @@ const timeframeOptions = [
   { value: '1d', label: '日K' },
 ]
 
-const actionOptions: Array<{ value: RouteAction; label: string }> = [
-  { value: 'buy_or_add', label: '买入/加仓' },
-  { value: 'reduce_position', label: '减仓' },
-  { value: 'clear_position', label: '清仓' },
-  { value: 'notify_only', label: '只提醒' },
+const actionOptions: Array<{ value: RouteAction; label: string; side?: SignalSide; sizing: 'percent' | 'amount' | 'quantity' | 'none' }> = [
+  { value: 'buy_or_add', label: '按资金比例买入', side: 'buy', sizing: 'percent' },
+  { value: 'buy_amount', label: '按金额买入', side: 'buy', sizing: 'amount' },
+  { value: 'buy_quantity', label: '按股数买入', side: 'buy', sizing: 'quantity' },
+  { value: 'reduce_position', label: '按仓位比例卖出', side: 'sell', sizing: 'percent' },
+  { value: 'sell_quantity', label: '按股数卖出', side: 'sell', sizing: 'quantity' },
+  { value: 'clear_position', label: '清仓', side: 'sell', sizing: 'none' },
+  { value: 'notify_only', label: '只提醒', sizing: 'none' },
 ]
 
 const statusLabels: Record<string, string> = {
@@ -244,11 +252,90 @@ function defaultActionFor(side: SignalSide, timeframe = '30m'): RouteAction {
   return timeframe === '1d' ? 'clear_position' : 'reduce_position'
 }
 
+function defaultPositionPctForRoute(side: SignalSide, timeframe = '30m') {
+  if (side === 'buy') return '20'
+  return timeframe === '1d' ? '100' : '30'
+}
+
 function normalizeRouteAction(value: unknown, side: SignalSide, timeframe = '30m'): RouteAction {
   const text = String(value || '').trim()
-  return actionOptions.some((item) => item.value === text)
+  return actionOptions.some((item) => item.value === text && (!item.side || item.side === side))
     ? text as RouteAction
     : defaultActionFor(side, timeframe)
+}
+
+function actionOptionsForSide(side: SignalSide) {
+  return actionOptions.filter((item) => !item.side || item.side === side)
+}
+
+function routeSizingMode(action: RouteAction | string): 'percent' | 'amount' | 'quantity' | 'none' {
+  return actionOptions.find((item) => item.value === action)?.sizing || 'none'
+}
+
+function routeSizingLabel(action: RouteAction | string) {
+  const mode = routeSizingMode(action)
+  if (mode === 'amount') return '买入金额'
+  if (mode === 'quantity') return String(action) === 'sell_quantity' ? '卖出股数' : '买入股数'
+  if (mode === 'percent') return String(action) === 'reduce_position' ? '卖出仓位比例' : '买入资金比例'
+  return '无需设置'
+}
+
+function routeSizingValue(route: SignalRouteDraft) {
+  const mode = routeSizingMode(route.action)
+  if (mode === 'amount') return route.tradeAmount
+  if (mode === 'quantity') return route.shareQuantity
+  if (mode === 'percent') return route.positionPct
+  return ''
+}
+
+function routeSizingPlaceholder(action: RouteAction | string) {
+  const mode = routeSizingMode(action)
+  if (mode === 'amount') return '50000'
+  if (mode === 'quantity') return '1000'
+  if (mode === 'percent') return String(action) === 'reduce_position' ? '30' : '20'
+  return ''
+}
+
+function routeSizingInputMode(action: RouteAction | string): 'numeric' | 'decimal' {
+  return routeSizingMode(action) === 'quantity' ? 'numeric' : 'decimal'
+}
+
+function routeSizingUnit(action: RouteAction | string) {
+  const mode = routeSizingMode(action)
+  if (mode === 'amount') return '元'
+  if (mode === 'quantity') return '股'
+  if (mode === 'percent') return '%'
+  return ''
+}
+
+function formatSavedRouteSizing(route: SavedSignalRoute) {
+  const action = normalizeRouteAction(route.action, normalizeSide(route.side), normalizeTimeframe(route.timeframe))
+  const mode = routeSizingMode(action)
+  if (mode === 'amount') return route.trade_amount ? `买入金额 ${formatNumber(route.trade_amount)} 元` : '--'
+  if (mode === 'quantity') return route.share_quantity ? `${routeSizingLabel(action)} ${formatNumber(route.share_quantity)} 股` : '--'
+  if (mode === 'percent') {
+    const percent = routePositionPercent(route.position_pct)
+    return percent ? `${routeSizingLabel(action)} ${percent}%` : '--'
+  }
+  return '无需设置'
+}
+
+function routeSizingPatch(action: RouteAction, value: string): Partial<SignalRouteDraft> {
+  const mode = routeSizingMode(action)
+  if (mode === 'amount') return { tradeAmount: value }
+  if (mode === 'quantity') return { shareQuantity: value }
+  if (mode === 'percent') return { positionPct: value }
+  return {}
+}
+
+function syncRouteSizingDraft(route: SignalRouteDraft): SignalRouteDraft {
+  const mode = routeSizingMode(route.action)
+  return {
+    ...route,
+    positionPct: mode === 'percent' ? route.positionPct || defaultPositionPctForRoute(route.side, route.timeframe) : '',
+    tradeAmount: mode === 'amount' ? route.tradeAmount : '',
+    shareQuantity: mode === 'quantity' ? route.shareQuantity : '',
+  }
 }
 
 function sideLabel(side: SignalSide) {
@@ -761,6 +848,17 @@ function parsePercentInput(value: string) {
   return numberValue > 1 ? numberValue / 100 : numberValue
 }
 
+function parsePositiveInput(value: string) {
+  const numberValue = Number(value)
+  return Number.isFinite(numberValue) && numberValue > 0 ? numberValue : null
+}
+
+function parseShareQuantityInput(value: string) {
+  const numberValue = Number(value)
+  if (!Number.isFinite(numberValue) || numberValue <= 0) return null
+  return Math.floor(numberValue)
+}
+
 function getStudio(strategy: StrategyDefinition) {
   const params = isRecord(strategy.template_parameters) ? strategy.template_parameters : {}
   return isRecord(params.studio) ? params.studio : {}
@@ -866,18 +964,20 @@ function makeRouteDraft(
 ): SignalRouteDraft {
   const strategy = options.find((item) => item.signals.some((signal) => signal.side === side)) || options[0]
   const signal = strategy?.signals.find((item) => item.side === side) || strategy?.signals[0]
-  return {
+  return syncRouteSizingDraft({
     id: generateRouteId(),
     side,
     timeframe,
     strategyId: strategy?.id || '',
     signalId: signal?.id || '',
     action: defaultActionFor(side, timeframe),
-    positionPct: side === 'buy' ? '20' : timeframe === '1d' ? '100' : '30',
+    positionPct: defaultPositionPctForRoute(side, timeframe),
+    tradeAmount: '',
+    shareQuantity: '',
     priority: side === 'sell' ? (timeframe === '1d' ? '100' : '60') : '20',
     enabled: true,
     ...patch,
-  }
+  })
 }
 
 function makeDefaultDraft(options: StrategyOption[], accountOptions: AccountRoleOption[] = accountOptionsFromConfig()): MonitorDraft {
@@ -886,6 +986,7 @@ function makeDefaultDraft(options: StrategyOption[], accountOptions: AccountRole
     accountRole: 'paper',
     accountKey: defaultAccountKey(accountOptions, 'paper'),
     executionMode: 'monitor_only',
+    liveTradingConfirmed: false,
     manualSymbols: '',
     poolMode: 'strategy_positions_watchlist',
     pollIntervalSeconds: '20',
@@ -903,7 +1004,7 @@ function makeDefaultDraft(options: StrategyOption[], accountOptions: AccountRole
   }
 }
 
-function draftFromMonitor(
+export function draftFromMonitor(
   monitor: RealtimeMonitor,
   options: StrategyOption[],
   accountOptions: AccountRoleOption[] = accountOptionsFromConfig(),
@@ -918,7 +1019,8 @@ function draftFromMonitor(
     name: monitor.name || '',
     accountRole,
     accountKey: monitor.account_key || defaultAccountKey(accountOptions, accountRole),
-    executionMode: accountRole === 'live' ? 'monitor_only' : monitor.execution_mode === 'auto' ? 'auto' : 'monitor_only',
+    executionMode: monitor.execution_mode === 'auto' ? 'auto' : 'monitor_only',
+    liveTradingConfirmed: accountRole === 'live' && monitor.execution_mode === 'auto' && monitor.live_trading_enabled === true,
     manualSymbols: [
       ...((pool.manual_symbols as string[] | undefined) || []),
       ...((pool.symbols as string[] | undefined) || []),
@@ -945,6 +1047,8 @@ function draftFromMonitor(
         signalId: signal?.id || '',
         action: normalizeRouteAction(route.action, side, timeframe),
         positionPct: routePositionPercent(route.position_pct) || (side === 'buy' ? '20' : timeframe === '1d' ? '100' : '30'),
+        tradeAmount: route.trade_amount ? String(route.trade_amount) : '',
+        shareQuantity: route.share_quantity ? String(route.share_quantity) : '',
         priority: String(route.priority ?? (side === 'sell' ? '60' : '20')),
         enabled: route.enabled !== false,
       })
@@ -956,6 +1060,7 @@ function buildPayloadRoutes(draft: MonitorDraft, options: StrategyOption[]) {
   return draft.routes.map((route) => {
     const strategy = findStrategy(options, route.strategyId)
     const signal = strategy?.signals.find((item) => item.id === route.signalId) || firstSignal(options, route.strategyId, route.side)
+    const sizingMode = routeSizingMode(route.action)
     return {
       id: route.id,
       side: route.side,
@@ -970,7 +1075,10 @@ function buildPayloadRoutes(draft: MonitorDraft, options: StrategyOption[]) {
       signal_condition: signal?.condition || '',
       action: route.action,
       action_label: actionLabel(route.action),
-      position_pct: parsePercentInput(route.positionPct),
+      sizing_mode: sizingMode,
+      position_pct: sizingMode === 'percent' ? parsePercentInput(route.positionPct) : null,
+      trade_amount: sizingMode === 'amount' ? parsePositiveInput(route.tradeAmount) : null,
+      share_quantity: sizingMode === 'quantity' ? parseShareQuantityInput(route.shareQuantity) : null,
       priority: Math.round(asNumber(route.priority, route.side === 'sell' ? 60 : 20)),
       enabled: route.enabled,
       require_approval: false,
@@ -978,16 +1086,80 @@ function buildPayloadRoutes(draft: MonitorDraft, options: StrategyOption[]) {
   })
 }
 
-function validateDraft(draft: MonitorDraft, options: StrategyOption[]) {
+export function validateDraft(draft: MonitorDraft, options: StrategyOption[]) {
   if (!draft.name.trim()) return '请填写监控名称'
   if (!draft.accountKey.trim()) return '请选择账户或填写账户 Key'
   if (!draft.routes.length) return '至少需要配置一条买点或卖点路线'
   if (!options.length) return '请先在策略管理里维护可用策略'
+  if (draft.accountRole === 'live' && draft.executionMode === 'auto' && !draft.liveTradingConfirmed) {
+    return '实盘自动执行需要先确认实盘交易风险'
+  }
   for (const route of draft.routes) {
     if (!route.strategyId) return '每条路线都需要选择策略'
     if (!route.signalId) return '每条路线都需要选择买卖点'
+    const allowed = actionOptionsForSide(route.side).some((item) => item.value === route.action)
+    if (!allowed) return `${sideLabel(route.side)}路线的动作类型不匹配`
+    const sizingMode = routeSizingMode(route.action)
+    if (sizingMode === 'percent' && parsePercentInput(route.positionPct) == null) return `${actionLabel(route.action)}需要填写比例`
+    if (sizingMode === 'amount' && parsePositiveInput(route.tradeAmount) == null) return `${actionLabel(route.action)}需要填写金额`
+    if (sizingMode === 'quantity' && parseShareQuantityInput(route.shareQuantity) == null) return `${actionLabel(route.action)}需要填写股数`
   }
   return ''
+}
+
+export function buildRealtimeMonitorPayload(
+  draft: MonitorDraft,
+  strategyOptions: StrategyOption[],
+  accountOptions: AccountRoleOption[],
+) {
+  const routes = buildPayloadRoutes(draft, strategyOptions)
+  const primaryRoute = routes[0]
+  const manualSymbols = normalizeSymbols(draft.manualSymbols)
+  const primaryStrategy = strategyOptions.find((item) => item.id === primaryRoute.strategy_id)
+  const liveAutoTrading = draft.accountRole === 'live' && draft.executionMode === 'auto' && draft.liveTradingConfirmed
+  return {
+    name: draft.name.trim(),
+    account_key: draft.accountKey.trim() || defaultAccountKey(accountOptions, draft.accountRole),
+    strategy_id: primaryRoute.strategy_id,
+    strategy_version_id: primaryRoute.strategy_version_id || primaryStrategy?.versionId,
+    execution_mode: draft.executionMode,
+    live_trading_enabled: liveAutoTrading,
+    live_confirmed: liveAutoTrading,
+    monitor_pool: {
+      mode: draft.poolMode,
+      manual_symbols: manualSymbols,
+      symbols: manualSymbols,
+    },
+    config: {
+      schema_version: 'realtime_monitor_v2',
+      signal_model: 'multi_route',
+      signal_routes: routes,
+      signal_mode: 'multi_route',
+      signal_timeframe: primaryRoute.timeframe,
+      poll_interval_seconds: Math.max(5, Math.round(asNumber(draft.pollIntervalSeconds, 20))),
+      max_signals_per_cycle: Math.max(1, Math.round(asNumber(draft.maxSignalsPerCycle, 10))),
+      price_type: 'opponent',
+      lot_size: 100,
+      buy_cash_buffer_pct: 0.02,
+      buy_price_buffer_pct: 0.01,
+      allow_outside_session: false,
+      route_conflict_policy: {
+        sell_priority: true,
+        higher_timeframe_overrides: true,
+        daily_clear_overrides_intraday: true,
+      },
+      auto_resume: {
+        qmt_snapshot_unavailable: draft.autoResumeSnapshot,
+        realtime_quote_unavailable: draft.autoResumeQuote,
+        qmt_order_interface_error: draft.autoResumeOrderApi,
+      },
+      account_role: draft.accountRole,
+    },
+    risk_config: {
+      max_daily_orders: Math.max(1, Math.round(asNumber(draft.maxDailyOrders, 20))),
+      max_single_position_pct: parsePercentInput(draft.maxSinglePositionPct) || 0.2,
+    },
+  }
 }
 
 function primaryControl(status: string) {
@@ -1100,54 +1272,7 @@ export default function RealtimeMonitorV2() {
       setError(validation)
       return
     }
-    const routes = buildPayloadRoutes(draft, strategyOptions)
-    const primaryRoute = routes[0]
-    const manualSymbols = normalizeSymbols(draft.manualSymbols)
-    const primaryStrategy = strategyOptions.find((item) => item.id === primaryRoute.strategy_id)
-    const executionMode = draft.accountRole === 'live' ? 'monitor_only' : draft.executionMode
-    const payload = {
-      name: draft.name.trim(),
-      account_key: draft.accountKey.trim() || defaultAccountKey(accountOptions, draft.accountRole),
-      strategy_id: primaryRoute.strategy_id,
-      strategy_version_id: primaryRoute.strategy_version_id || primaryStrategy?.versionId,
-      execution_mode: executionMode,
-      live_trading_enabled: false,
-      live_confirmed: false,
-      monitor_pool: {
-        mode: draft.poolMode,
-        manual_symbols: manualSymbols,
-        symbols: manualSymbols,
-      },
-      config: {
-        schema_version: 'realtime_monitor_v2',
-        signal_model: 'multi_route',
-        signal_routes: routes,
-        signal_mode: 'multi_route',
-        signal_timeframe: primaryRoute.timeframe,
-        poll_interval_seconds: Math.max(5, Math.round(asNumber(draft.pollIntervalSeconds, 20))),
-        max_signals_per_cycle: Math.max(1, Math.round(asNumber(draft.maxSignalsPerCycle, 10))),
-        price_type: 'opponent',
-        lot_size: 100,
-        buy_cash_buffer_pct: 0.02,
-        buy_price_buffer_pct: 0.01,
-        allow_outside_session: false,
-        route_conflict_policy: {
-          sell_priority: true,
-          higher_timeframe_overrides: true,
-          daily_clear_overrides_intraday: true,
-        },
-        auto_resume: {
-          qmt_snapshot_unavailable: draft.autoResumeSnapshot,
-          realtime_quote_unavailable: draft.autoResumeQuote,
-          qmt_order_interface_error: draft.autoResumeOrderApi,
-        },
-        account_role: draft.accountRole,
-      },
-      risk_config: {
-        max_daily_orders: Math.max(1, Math.round(asNumber(draft.maxDailyOrders, 20))),
-        max_single_position_pct: parsePercentInput(draft.maxSinglePositionPct) || 0.2,
-      },
-    }
+    const payload = buildRealtimeMonitorPayload(draft, strategyOptions, accountOptions)
 
     setSubmitting(true)
     try {
@@ -1448,7 +1573,7 @@ function RouteTable({ routes, strategies }: { routes: SavedSignalRoute[]; strate
             <th className="px-4 py-3">策略</th>
             <th className="px-4 py-3">买卖点</th>
             <th className="px-4 py-3">动作</th>
-            <th className="px-4 py-3">仓位</th>
+            <th className="px-4 py-3">执行设置</th>
             <th className="px-4 py-3">优先级</th>
           </tr>
         </thead>
@@ -1461,7 +1586,7 @@ function RouteTable({ routes, strategies }: { routes: SavedSignalRoute[]; strate
               <td className="px-4 py-3">{routeStrategyName(route, strategies)}</td>
               <td className="px-4 py-3">{routeSignalName(route, strategies)}</td>
               <td className="px-4 py-3">{actionLabel(String(route.action || ''))}</td>
-              <td className="px-4 py-3 font-mono text-xs">{routePositionPercent(route.position_pct) || '--'}{route.position_pct ? '%' : ''}</td>
+              <td className="px-4 py-3 font-mono text-xs">{formatSavedRouteSizing(route)}</td>
               <td className="px-4 py-3 font-mono text-xs">{route.priority ?? '--'}</td>
             </tr>
           ))}
@@ -2067,15 +2192,14 @@ function MonitorEditorModal({
     updateDraft({
       accountRole: role,
       accountKey: defaultAccountKey(accountOptions, role),
-      executionMode: role === 'live' ? 'monitor_only' : draft.executionMode,
+      executionMode: draft.executionMode,
+      liveTradingConfirmed: false,
     })
   }
-  const executionOptions = draft.accountRole === 'live'
-    ? [{ value: 'monitor_only', label: '只监控提醒' }]
-    : [
-        { value: 'monitor_only', label: '只监控提醒' },
-        { value: 'auto', label: '自动执行' },
-      ]
+  const executionOptions = [
+    { value: 'monitor_only', label: '只监控提醒' },
+    { value: 'auto', label: draft.accountRole === 'live' ? '实盘自动执行' : '自动执行' },
+  ]
   const updateRoute = (routeId: string, patch: Partial<SignalRouteDraft>) => {
     updateDraft({
       routes: draft.routes.map((route) => {
@@ -2090,7 +2214,7 @@ function MonitorEditorModal({
           next.action = defaultActionFor(next.side, next.timeframe)
           next.positionPct = next.timeframe === '1d' ? '100' : next.positionPct
         }
-        return next
+        return syncRouteSizingDraft(next)
       }),
     })
   }
@@ -2177,8 +2301,11 @@ function MonitorEditorModal({
               <TextField label="账户 Key" value={draft.accountKey} onChange={(value) => updateDraft({ accountKey: value })} placeholder="paper_sim" />
               <SelectField
                 label="执行模式"
-                value={draft.accountRole === 'live' ? 'monitor_only' : draft.executionMode}
-                onChange={(value) => updateDraft({ executionMode: value as 'auto' | 'monitor_only' })}
+                value={draft.executionMode}
+                onChange={(value) => updateDraft({
+                  executionMode: value as 'auto' | 'monitor_only',
+                  liveTradingConfirmed: value === 'auto' ? draft.liveTradingConfirmed : false,
+                })}
                 options={executionOptions}
               />
               <SelectField
@@ -2192,6 +2319,19 @@ function MonitorEditorModal({
                 ]}
               />
             </div>
+            {draft.accountRole === 'live' && draft.executionMode === 'auto' && (
+              <div className="border-t border-[color-mix(in_srgb,var(--skin-red)_36%,var(--skin-border))] bg-[color-mix(in_srgb,var(--skin-red)_8%,transparent)] p-4">
+                <ToggleButton
+                  checked={draft.liveTradingConfirmed}
+                  onClick={() => updateDraft({ liveTradingConfirmed: !draft.liveTradingConfirmed })}
+                >
+                  我确认启用实盘自动交易，实时监控信号将直接提交到实盘QMT账户
+                </ToggleButton>
+                <div className="mt-2 text-xs leading-5 text-[var(--skin-muted)]">
+                  后端仍会校验 live_confirmed、实盘白名单、QMT bridge 账户身份和交易权限；未通过时不会下单。
+                </div>
+              </div>
+            )}
             <div className="border-t border-[var(--skin-border)] p-4">
               <label className="block space-y-2">
                 <span className="text-xs font-semibold text-[var(--skin-muted)]">手工股票池</span>
@@ -2307,7 +2447,7 @@ function EditableRouteTable({
             <th className="px-3 py-3">策略</th>
             <th className="px-3 py-3">买卖点</th>
             <th className="px-3 py-3">动作</th>
-            <th className="px-3 py-3">买入资金/卖出仓位 %</th>
+            <th className="px-3 py-3">执行设置</th>
             <th className="px-3 py-3">优先级</th>
             <th className="px-3 py-3 text-right">删除</th>
           </tr>
@@ -2349,12 +2489,26 @@ function EditableRouteTable({
                   </select>
                 </td>
                 <td className="px-3 py-3">
-                  <select value={route.action} onChange={(event) => onRouteChange(route.id, { action: event.target.value as RouteAction })} className="input w-32 text-sm">
-                    {actionOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                  <select value={route.action} onChange={(event) => onRouteChange(route.id, { action: event.target.value as RouteAction })} className="input w-40 text-sm">
+                    {actionOptionsForSide(route.side).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
                   </select>
                 </td>
                 <td className="px-3 py-3">
-                  <input value={route.positionPct} onChange={(event) => onRouteChange(route.id, { positionPct: event.target.value })} className="input w-24 text-sm" inputMode="decimal" placeholder="30" />
+                  {routeSizingMode(route.action) === 'none' ? (
+                    <span className="text-xs text-[var(--skin-muted)]">无需设置</span>
+                  ) : (
+                    <label className="flex items-center gap-2">
+                      <span className="w-24 whitespace-nowrap text-xs text-[var(--skin-muted)]">{routeSizingLabel(route.action)}</span>
+                      <input
+                        value={routeSizingValue(route)}
+                        onChange={(event) => onRouteChange(route.id, routeSizingPatch(route.action, event.target.value))}
+                        className="input w-24 text-sm"
+                        inputMode={routeSizingInputMode(route.action)}
+                        placeholder={routeSizingPlaceholder(route.action)}
+                      />
+                      <span className="text-xs text-[var(--skin-muted)]">{routeSizingUnit(route.action)}</span>
+                    </label>
+                  )}
                 </td>
                 <td className="px-3 py-3">
                   <input value={route.priority} onChange={(event) => onRouteChange(route.id, { priority: event.target.value })} className="input w-20 text-sm" inputMode="numeric" placeholder="60" />

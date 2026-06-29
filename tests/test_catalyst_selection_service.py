@@ -5044,7 +5044,7 @@ def test_refresh_event_driven_selection_dedupes_windows_and_reports_generated(db
     assert payload["generated"][0]["top_learning_impacts"][0]["profiles"]["symbol"] == "600584.SH"
     assert payload["generated"][0]["end_to_end_evidence"]["status"] == "active"
     assert payload["generated"][0]["end_to_end_evidence"]["trigger_source"] == "catalyst_selection_event_refresh"
-    assert payload["generated"][0]["monitor_activation"]["status"] == "skipped"
+    assert payload["generated"][0]["monitor_activation"]["status"] == "disabled"
     assert payload["closed_loop_audit"]["status"] == "completed"
     assert payload["closed_loop_audit"]["end_to_end_evidence"]["status"] == "active"
     assert payload["closed_loop_audit"]["end_to_end_evidence"]["active_window_count"] == 2

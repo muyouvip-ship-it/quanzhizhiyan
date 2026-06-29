@@ -214,11 +214,69 @@ def _ensure_market_data_schema() -> None:
                     updated_at TIMESTAMP DEFAULT NOW()
                 )
             """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS stock_chip_distribution (
+                    id BIGSERIAL PRIMARY KEY,
+                    symbol VARCHAR(20) NOT NULL,
+                    trade_date DATE NOT NULL,
+                    name VARCHAR(128),
+                    profit_ratio DOUBLE PRECISION,
+                    average_cost DOUBLE PRECISION,
+                    cost_concentration_90 DOUBLE PRECISION,
+                    cost_concentration_70 DOUBLE PRECISION,
+                    source VARCHAR(32) DEFAULT 'quantclass',
+                    raw_json TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS stock_money_flow (
+                    id BIGSERIAL PRIMARY KEY,
+                    symbol VARCHAR(20) NOT NULL,
+                    trade_date DATE NOT NULL,
+                    name VARCHAR(128),
+                    medium_buy DOUBLE PRECISION,
+                    medium_sell DOUBLE PRECISION,
+                    large_buy DOUBLE PRECISION,
+                    large_sell DOUBLE PRECISION,
+                    retail_buy DOUBLE PRECISION,
+                    retail_sell DOUBLE PRECISION,
+                    institution_buy DOUBLE PRECISION,
+                    institution_sell DOUBLE PRECISION,
+                    main_net_inflow DOUBLE PRECISION,
+                    source VARCHAR(32) DEFAULT 'quantclass',
+                    raw_json TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS stock_financial_snapshots (
+                    id BIGSERIAL PRIMARY KEY,
+                    symbol VARCHAR(20) NOT NULL,
+                    report_date DATE NOT NULL,
+                    name VARCHAR(128),
+                    net_profit_ttm DOUBLE PRECISION,
+                    cash_flow_ttm DOUBLE PRECISION,
+                    net_assets DOUBLE PRECISION,
+                    total_assets DOUBLE PRECISION,
+                    total_liabilities DOUBLE PRECISION,
+                    net_profit_quarter DOUBLE PRECISION,
+                    source VARCHAR(32) DEFAULT 'quantclass',
+                    raw_json TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
             conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_stock_daily_kline_symbol_date ON stock_daily_kline(symbol, trade_date)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_stock_daily_kline_trade_date ON stock_daily_kline(trade_date)"))
             conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_index_daily_kline_symbol_date ON index_daily_kline(symbol, trade_date)"))
             conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_index_minute_kline_symbol_time ON index_minute_kline(symbol, trade_time)"))
             conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS stock_minute_kline_symbol_trade_time_key ON stock_minute_kline(symbol, trade_time)"))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_stock_chip_distribution_symbol_date_source ON stock_chip_distribution(symbol, trade_date, source)"))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_stock_money_flow_symbol_date_source ON stock_money_flow(symbol, trade_date, source)"))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_stock_financial_snapshots_symbol_date_source ON stock_financial_snapshots(symbol, report_date, source)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_minute_symbol ON stock_minute_kline(symbol)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_minute_time ON stock_minute_kline(trade_time)"))
             current_inspector = inspect(conn)
@@ -1312,6 +1370,43 @@ class WatchlistItemDB(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (UniqueConstraint('user_id', 'symbol', name='uq_watchlist_user_symbol'),)
+
+
+class StockPoolGroupDB(Base):
+    """User-maintained stock pool groups."""
+    __tablename__ = "stock_pool_groups"
+
+    id = Column(String(36), primary_key=True)
+    user_id = Column(String(64), index=True, nullable=False)
+    name = Column(String(120), nullable=False)
+    group_type = Column(String(32), default="custom", nullable=False)
+    is_default = Column(Boolean, default=False, nullable=False)
+    sort_order = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_stock_pool_group_user_name"),
+    )
+
+
+class StockPoolItemDB(Base):
+    """Stocks inside a persisted stock pool group."""
+    __tablename__ = "stock_pool_items"
+
+    id = Column(String(36), primary_key=True)
+    user_id = Column(String(64), index=True, nullable=False)
+    group_id = Column(String(36), index=True, nullable=False)
+    symbol = Column(String(20), nullable=False)
+    name = Column(String(120), nullable=True)
+    source = Column(String(40), default="manual", nullable=False)
+    sort_order = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        UniqueConstraint("group_id", "symbol", name="uq_stock_pool_item_group_symbol"),
+    )
 
 
 class ScheduledAnalysisDB(Base):

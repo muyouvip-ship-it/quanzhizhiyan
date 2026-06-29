@@ -4129,7 +4129,7 @@ def _realtime_feedback_kind(event_type: str) -> str:
     if event_type in REALTIME_SYMBOL_FEEDBACK_EVENT_TYPES:
         return "intraday_signal_confirmed"
     if event_type == "approval_created":
-        return "manual_approval_gate"
+        return "legacy_manual_gate"
     if event_type in {"signal_blocked", "order_rejected", "order_error"}:
         return "risk_gate_block"
     return "realtime_execution_feedback"

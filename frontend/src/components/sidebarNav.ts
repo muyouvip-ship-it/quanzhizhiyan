@@ -17,6 +17,7 @@ import {
     Radio,
     LineChart,
     Search,
+    FolderOpen,
 } from 'lucide-react'
 
 export interface SidebarNavItem {
@@ -30,6 +31,7 @@ export const navItems: SidebarNavItem[] = [
     { path: '/news-eye', icon: Newspaper, label: '资讯之眼' },
     { path: '/selection-center', icon: Search, label: '选股中心' },
     { path: '/stock-market', icon: LineChart, label: '股票市场' },
+    { path: '/stock-pool', icon: FolderOpen, label: '股票池' },
     { path: '/analysis', icon: Activity, label: '智能分析' },
     { path: '/reports', icon: FileText, label: '历史报告' },
     { path: '/daily-review', icon: ClipboardList, label: '每日复盘' },

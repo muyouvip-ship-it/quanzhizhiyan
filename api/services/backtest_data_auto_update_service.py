@@ -697,6 +697,7 @@ def _effective_subscription_data_source(data_type: str, preferred: str | None) -
         "index_data": {"tdx", "qmt", "akshare", "quantclass", "baostock", "tushare", "eastmoney"},
         "index_minute_kline": {"tdx", "qmt", "akshare"},
         "chip_data": {"quantclass"},
+        "money_flow": {"quantclass"},
         "financial_data": {"quantclass"},
         "research_reports": {"eastmoney"},
     }
@@ -707,7 +708,7 @@ def _effective_subscription_data_source(data_type: str, preferred: str | None) -
         return DEFAULT_MARKET_CLOSE_DATA_SOURCE
     if normalized_type == "research_reports":
         return "eastmoney"
-    if normalized_type in {"chip_data", "financial_data"}:
+    if normalized_type in {"chip_data", "money_flow", "financial_data"}:
         return "quantclass"
     return preferred_source
 

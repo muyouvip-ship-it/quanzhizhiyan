@@ -506,6 +506,7 @@ def test_fetch_external_news_collects_general_and_symbol_sources(monkeypatch):
     monkeypatch.setattr(ak, "stock_info_global_sina", lambda: pd.DataFrame())
     monkeypatch.setattr(ak, "stock_info_global_futu", lambda: pd.DataFrame())
     monkeypatch.setattr(ak, "stock_info_cjzc_em", lambda: pd.DataFrame())
+    monkeypatch.setattr(news_eye_service, "OFFICIAL_NOTICE_SOURCE_SPECS", ())
     monkeypatch.setattr(news_eye_service, "NOTICE_SOURCE_SPECS", ())
     monkeypatch.setattr(
         news_eye_service,

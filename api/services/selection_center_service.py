@@ -18,6 +18,8 @@ from api.core.strategy_db import get_strategy_db_ctx
 from api.core.stock_map import get_reverse_stock_map
 from api.database import get_db_ctx
 from api.models.strategy_models import SelectionCenterTaskDB
+from api.services.market_data_pipeline_service import preferred_daily_kline_table
+from api.services.minute_data_service import _aggregate_minute_frame, _compute_first_day_band, _try_load_minute_frame_range
 from api.services.strategy_compute_backend import compute_daily_features
 from api.services.strategy_dsl_compiler import CompiledStrategy, compile_strategy_dsl
 from api.services.strategy_platform_repository import get_platform_strategy
@@ -103,6 +105,77 @@ def get_task(strategy_db: Session, user_id: str, task_id: str) -> dict[str, Any]
     return task
 
 
+def get_task_confirmation_filters(
+    strategy_db: Session,
+    user_id: str,
+    task_id: str,
+    *,
+    timeframe: str = "30m",
+) -> dict[str, Any] | None:
+    task = get_task(strategy_db, user_id, task_id)
+    if task is None:
+        return None
+    candidates = list(task.get("candidates") or [])
+    symbol_dates = _candidate_confirmation_symbol_dates(candidates, fallback_date=_parse_trade_date(task.get("completed_at") or task.get("created_at")))
+    symbols = sorted({symbol for symbol, _ in symbol_dates})
+    if not symbols or not symbol_dates:
+        return {
+            "task_id": task_id,
+            "timeframe": _normalize_confirmation_timeframe(timeframe),
+            "total": len(candidates),
+            "items": [],
+            "criteria": _selection_confirmation_criteria(),
+        }
+
+    min_date = min(trade_date for _, trade_date in symbol_dates)
+    max_date = max(trade_date for _, trade_date in symbol_dates)
+    normalized_timeframe = _normalize_confirmation_timeframe(timeframe)
+    daily_rows: list[dict[str, Any]] = []
+    minute_frame: pd.DataFrame | None = None
+    try:
+        with get_db_ctx() as db:
+            daily_start = min_date - timedelta(days=180) if normalized_timeframe == "1d" else min_date
+            daily_rows = _load_confirmation_daily_rows(db, symbols, daily_start, max_date + timedelta(days=14))
+        if normalized_timeframe != "1d":
+            minute_start = (min_date - timedelta(days=14)).isoformat()
+            minute_end = (max_date + timedelta(days=3)).isoformat()
+            minute_frame = _try_load_minute_frame_range(symbols, start_date=minute_start, end_date=minute_end)
+    except Exception:
+        logger.exception("Failed to load selection confirmation data task=%s", task_id)
+
+    breakout_by_symbol = _evaluate_next_day_breakout(candidates, daily_rows)
+    no_reverse_by_symbol = (
+        _evaluate_daily_no_immediate_dead_cross(candidates, daily_rows)
+        if normalized_timeframe == "1d"
+        else _evaluate_intraday_no_immediate_dead_cross(candidates, minute_frame, normalized_timeframe)
+    )
+    no_reverse_missing_reason = "缺少日K，无法判断下一根日线是否反叉" if normalized_timeframe == "1d" else "缺少分钟K线，无法判断金叉后一根K线"
+    items = []
+    for candidate in candidates:
+        symbol = str(candidate.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        items.append(
+            {
+                "symbol": symbol,
+                "name": candidate.get("name") or "",
+                "selected_date": _candidate_selected_date(candidate).isoformat() if _candidate_selected_date(candidate) else None,
+                "checks": {
+                    "no_immediate_dead_cross": no_reverse_by_symbol.get(symbol) or _confirmation_status("missing", no_reverse_missing_reason),
+                    "break_previous_high": breakout_by_symbol.get(symbol) or _confirmation_status("missing", "缺少日K，无法判断次日是否突破前高"),
+                },
+            }
+        )
+
+    return {
+        "task_id": task_id,
+        "timeframe": normalized_timeframe,
+        "total": len(items),
+        "criteria": _selection_confirmation_criteria(),
+        "items": items,
+    }
+
+
 def create_task(
     strategy_db: Session,
     user_id: str,
@@ -147,6 +220,7 @@ def _json_dict(value: Any) -> dict[str, Any]:
 
 def _selection_task_summary(row: Any) -> dict[str, Any]:
     getter = row.get if hasattr(row, "get") else lambda key, default=None: getattr(row, key, default)
+    config = _json_dict(getter("config_json"))
     return {
         "id": getter("id"),
         "user_id": getter("user_id"),
@@ -156,8 +230,8 @@ def _selection_task_summary(row: Any) -> dict[str, Any]:
         "progress": float(getter("progress") or 0.0),
         "universe": getter("universe") or "",
         "rule": getter("rule") or "",
-        "filters": _json_list(getter("filters_json")),
-        "config": _json_dict(getter("config_json")),
+        "filters": _summary_filter_labels(config, getter("filters_json")),
+        "config": config,
         "candidate_count": int(getter("candidate_count") or 0),
         "candidates": [],
         "error_message": getter("error_message"),
@@ -189,6 +263,13 @@ def _selection_task_summary_from_model(row: SelectionCenterTaskDB) -> dict[str, 
             "updated_at": row.updated_at,
         }
     )
+
+
+def _summary_filter_labels(config: dict[str, Any], stored_filters: Any) -> list[str]:
+    filter_config = config.get("filter_config") if isinstance(config.get("filter_config"), dict) else None
+    if filter_config:
+        return _build_filter_labels(filter_config)
+    return _json_list(stored_filters)
 
 
 def execute_task(task_id: str) -> None:
@@ -385,6 +466,20 @@ def _build_filter_labels(filter_config: dict[str, Any]) -> list[str]:
     return labels
 
 
+def _trend_ma_period(value: Any) -> int:
+    try:
+        period = int(float(value or 20))
+    except (TypeError, ValueError):
+        period = 20
+    return period if period > 0 else 20
+
+
+def _passes_trend_ma(row: dict[str, Any], close: float | None, period: int) -> bool:
+    ma_value = _num(row.get(f"ma{period}"))
+    window_count = _num(row.get(f"ma{period}_window_count"))
+    return close is not None and ma_value is not None and window_count is not None and window_count >= period and close >= ma_value
+
+
 def _generate_candidates(
     market_db: Session,
     config: dict[str, Any],
@@ -452,10 +547,8 @@ def _generate_candidates(
         ma20 = _num(row.get("ma20"))
         amount_ma20 = _num(row.get("amount_ma20"))
         if bool(filter_config.get("trend_up")):
-            trend_ma = int(filter_config.get("trend_ma") or 20)
-            ma_col = f"ma{trend_ma}"
-            ma_value = _num(row.get(ma_col))
-            if close is not None and ma_value is not None and close < ma_value:
+            trend_ma = _trend_ma_period(filter_config.get("trend_ma"))
+            if not _passes_trend_ma(row, close, trend_ma):
                 continue
         if bool(filter_config.get("volume_up")) and amount is not None and amount_ma20 is not None and amount < amount_ma20 * 1.1:
             continue
@@ -780,31 +873,61 @@ def _load_latest_market_rows(db: Session, *, target_trade_date: date) -> list[di
                     ORDER BY trade_date
                     ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
                 ) AS ma5,
+                COUNT(close) OVER (
+                    PARTITION BY symbol
+                    ORDER BY trade_date
+                    ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+                ) AS ma5_window_count,
                 AVG(close) OVER (
                     PARTITION BY symbol
                     ORDER BY trade_date
                     ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
                 ) AS ma10,
+                COUNT(close) OVER (
+                    PARTITION BY symbol
+                    ORDER BY trade_date
+                    ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
+                ) AS ma10_window_count,
                 AVG(close) OVER (
                     PARTITION BY symbol
                     ORDER BY trade_date
                     ROWS BETWEEN 14 PRECEDING AND CURRENT ROW
                 ) AS ma15,
+                COUNT(close) OVER (
+                    PARTITION BY symbol
+                    ORDER BY trade_date
+                    ROWS BETWEEN 14 PRECEDING AND CURRENT ROW
+                ) AS ma15_window_count,
                 AVG(close) OVER (
                     PARTITION BY symbol
                     ORDER BY trade_date
                     ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
                 ) AS ma20,
+                COUNT(close) OVER (
+                    PARTITION BY symbol
+                    ORDER BY trade_date
+                    ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                ) AS ma20_window_count,
                 AVG(close) OVER (
                     PARTITION BY symbol
                     ORDER BY trade_date
                     ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
                 ) AS ma30,
+                COUNT(close) OVER (
+                    PARTITION BY symbol
+                    ORDER BY trade_date
+                    ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+                ) AS ma30_window_count,
                 AVG(close) OVER (
                     PARTITION BY symbol
                     ORDER BY trade_date
                     ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
                 ) AS ma60,
+                COUNT(close) OVER (
+                    PARTITION BY symbol
+                    ORDER BY trade_date
+                    ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+                ) AS ma60_window_count,
                 AVG(amount) OVER (
                     PARTITION BY symbol
                     ORDER BY trade_date
@@ -815,7 +938,7 @@ def _load_latest_market_rows(db: Session, *, target_trade_date: date) -> list[di
                     ORDER BY trade_date DESC
                 ) AS rn
             FROM stock_daily_kline
-            WHERE trade_date >= CAST(:target_trade_date AS DATE) - INTERVAL '90 days'
+            WHERE trade_date >= CAST(:target_trade_date AS DATE) - INTERVAL '260 days'
               AND trade_date <= CAST(:target_trade_date AS DATE)
         ),
         latest AS (
@@ -840,11 +963,17 @@ def _load_latest_market_rows(db: Session, *, target_trade_date: date) -> list[di
             latest.sw_industry_l1,
             latest.sw_industry_l2,
             latest.ma5,
+            latest.ma5_window_count,
             latest.ma10,
+            latest.ma10_window_count,
             latest.ma15,
+            latest.ma15_window_count,
             latest.ma20,
+            latest.ma20_window_count,
             latest.ma30,
+            latest.ma30_window_count,
             latest.ma60,
+            latest.ma60_window_count,
             latest.amount_ma20,
             latest.rn
         FROM latest
@@ -1017,6 +1146,10 @@ def _apply_selected_day_factor_metrics(metrics: dict[str, Any], row: dict[str, A
         value = _num(row.get(key))
         if value is not None:
             metrics[f"selected_{key}"] = _round_or_none(value, 4 if key.startswith("ma") else 2)
+        if key.startswith("ma"):
+            count = _num(row.get(f"{key}_window_count"))
+            if count is not None:
+                metrics[f"selected_{key}_window_count"] = int(count)
 
     for key in ("close_lag3", "close_lag5"):
         value = _num(row.get(key))
@@ -1201,6 +1334,313 @@ def _prioritize_recommendation_reasons(reasons: list[str]) -> list[str]:
     return [reason for _, reason in sorted(enumerate(reasons), key=lambda item: (priority.get(item[1], 50), item[0]))]
 
 
+def _selection_confirmation_criteria() -> list[dict[str, str]]:
+    return [
+        {
+            "key": "no_immediate_dead_cross",
+            "name": "下一根K线不立刻死叉",
+            "description": "按确认周期找到入选日最后一次首日波段金叉，下一根K线不能立刻死叉。分钟周期偏当日确认，日线偏次日跟踪。",
+        },
+        {
+            "key": "break_previous_high",
+            "name": "次日突破入选日前高",
+            "description": "入选后第一个交易日最高价必须突破入选日最高价；下一交易日日K未入库前显示待确认。",
+        },
+    ]
+
+
+def _normalize_confirmation_timeframe(value: Any) -> str:
+    text_value = str(value or "30m").strip().lower()
+    cn_map = {
+        "1分钟": "1m",
+        "5分钟": "5m",
+        "15分钟": "15m",
+        "30分钟": "30m",
+        "60分钟": "60m",
+        "日线": "1d",
+        "日k": "1d",
+        "日K": "1d",
+    }
+    text_value = cn_map.get(str(value or "").strip(), text_value)
+    return text_value if text_value in {"1m", "5m", "15m", "30m", "60m", "1d"} else "30m"
+
+
+def _candidate_selected_date(candidate: dict[str, Any]) -> date | None:
+    metrics = candidate.get("metrics") if isinstance(candidate.get("metrics"), dict) else {}
+    return _parse_trade_date((metrics or {}).get("trade_date") or (metrics or {}).get("selected_at"))
+
+
+def _candidate_confirmation_symbol_dates(candidates: list[dict[str, Any]], fallback_date: date | None = None) -> list[tuple[str, date]]:
+    pairs: set[tuple[str, date]] = set()
+    for item in candidates:
+        symbol = str(item.get("symbol") or "").upper()
+        selected_date = _candidate_selected_date(item) or fallback_date
+        if symbol and selected_date:
+            pairs.add((symbol, selected_date))
+    return sorted(pairs)
+
+
+def _confirmation_status(status: str, reason: str, **extra: Any) -> dict[str, Any]:
+    payload = {"status": status, "reason": reason}
+    payload.update({key: value for key, value in extra.items() if value is not None})
+    return payload
+
+
+def _safe_iso_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.isoformat()
+
+
+def _evaluate_next_day_breakout(candidates: list[dict[str, Any]], rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    rows_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        symbol = str(row.get("symbol") or "").upper()
+        trade_date = _parse_trade_date(row.get("trade_date"))
+        if not symbol or trade_date is None:
+            continue
+        normalized = dict(row)
+        normalized["trade_date"] = trade_date
+        rows_by_symbol.setdefault(symbol, []).append(normalized)
+    for symbol_rows in rows_by_symbol.values():
+        symbol_rows.sort(key=lambda item: item["trade_date"])
+
+    result: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        symbol = str(candidate.get("symbol") or "").upper()
+        selected_date = _candidate_selected_date(candidate)
+        symbol_rows = rows_by_symbol.get(symbol) or []
+        selected_row = next((row for row in symbol_rows if row["trade_date"] == selected_date), None)
+        if not symbol:
+            continue
+        if selected_date is None:
+            result[symbol] = _confirmation_status("missing", "缺少入选日期，无法判断次日突破")
+            continue
+        if selected_row is None:
+            result[symbol] = _confirmation_status("missing", "缺少入选日日K，无法判断前高", selected_date=selected_date.isoformat())
+            continue
+        selected_high = _num(selected_row.get("high"))
+        if selected_high is None:
+            result[symbol] = _confirmation_status("missing", "入选日日K缺少最高价", selected_date=selected_date.isoformat())
+            continue
+        next_row = next((row for row in symbol_rows if row["trade_date"] > selected_date), None)
+        if next_row is None:
+            result[symbol] = _confirmation_status(
+                "pending",
+                "下一交易日日K尚未入库，等待确认",
+                selected_date=selected_date.isoformat(),
+                selected_high=_round_or_none(selected_high, 4),
+            )
+            continue
+        next_high = _num(next_row.get("high"))
+        if next_high is None:
+            result[symbol] = _confirmation_status(
+                "missing",
+                "下一交易日日K缺少最高价",
+                selected_date=selected_date.isoformat(),
+                selected_high=_round_or_none(selected_high, 4),
+                next_trade_date=next_row["trade_date"].isoformat(),
+            )
+            continue
+        passed = next_high > selected_high
+        result[symbol] = _confirmation_status(
+            "pass" if passed else "fail",
+            "次日高点已突破入选日前高" if passed else "次日高点未突破入选日前高",
+            selected_date=selected_date.isoformat(),
+            selected_high=_round_or_none(selected_high, 4),
+            next_trade_date=next_row["trade_date"].isoformat(),
+            next_high=_round_or_none(next_high, 4),
+        )
+    return result
+
+
+def _evaluate_intraday_no_immediate_dead_cross(
+    candidates: list[dict[str, Any]],
+    minute_frame: pd.DataFrame | None,
+    timeframe: str,
+) -> dict[str, dict[str, Any]]:
+    symbols = sorted({str(item.get("symbol") or "").upper() for item in candidates if item.get("symbol")})
+    if minute_frame is None or minute_frame.empty:
+        return {symbol: _confirmation_status("missing", "缺少分钟K线，无法判断金叉后一根K线") for symbol in symbols}
+
+    selected_dates = {str(item.get("symbol") or "").upper(): _candidate_selected_date(item) for item in candidates}
+    try:
+        aggregated = _aggregate_minute_frame(minute_frame, timeframe).sort_values(["symbol", "bar_end"]).reset_index(drop=True)
+    except Exception:
+        logger.exception("Failed to aggregate minute frame for selection confirmation timeframe=%s", timeframe)
+        return {symbol: _confirmation_status("missing", "分钟K线聚合失败，无法判断金叉后一根K线") for symbol in symbols}
+
+    result: dict[str, dict[str, Any]] = {}
+    for symbol, group in aggregated.groupby("symbol", sort=False):
+        normalized_symbol = str(symbol or "").upper()
+        selected_date = selected_dates.get(normalized_symbol)
+        if selected_date is None:
+            result[normalized_symbol] = _confirmation_status("missing", "缺少入选日期，无法判断金叉后一根K线")
+            continue
+        try:
+            computed = _compute_first_day_band(group.copy())
+        except Exception:
+            logger.exception("Failed to compute first-day-band confirmation symbol=%s timeframe=%s", normalized_symbol, timeframe)
+            result[normalized_symbol] = _confirmation_status("missing", "该股票分钟K线计算失败，无法判断金叉后一根K线")
+            continue
+        if computed.empty:
+            result[normalized_symbol] = _confirmation_status("missing", "分钟K线不足，无法计算首日波段")
+            continue
+        computed = computed.sort_values("bar_end").reset_index(drop=True)
+        computed["bar_end"] = pd.to_datetime(computed["bar_end"])
+        band = pd.to_numeric(computed["first_day_band"], errors="coerce")
+        b1 = pd.to_numeric(computed["first_day_band_b1"], errors="coerce")
+        prev_band = band.shift(1)
+        prev_b1 = b1.shift(1)
+        computed["cross_above"] = (band > b1) & ((prev_band <= prev_b1) | prev_band.isna() | prev_b1.isna())
+        computed["cross_below"] = (band < b1) & (prev_band >= prev_b1)
+        selected_hits = computed[
+            (computed["bar_end"].dt.date == selected_date)
+            & computed["cross_above"].fillna(False)
+        ]
+        if selected_hits.empty:
+            result[normalized_symbol] = _confirmation_status(
+                "missing",
+                "入选日未找到对应周期首日波段金叉",
+                selected_date=selected_date.isoformat(),
+                timeframe=timeframe,
+            )
+            continue
+        hit_index = int(selected_hits.index[-1])
+        hit_row = computed.iloc[hit_index]
+        next_index = hit_index + 1
+        if next_index >= len(computed):
+            result[normalized_symbol] = _confirmation_status(
+                "pending",
+                "金叉后一根K线尚未出现，等待确认",
+                selected_date=selected_date.isoformat(),
+                timeframe=timeframe,
+                signal_bar_end=_safe_iso_value(hit_row.get("bar_end")),
+            )
+            continue
+        next_row = computed.iloc[next_index]
+        failed = bool(next_row.get("cross_below"))
+        result[normalized_symbol] = _confirmation_status(
+            "fail" if failed else "pass",
+            "金叉后一根K线立刻死叉" if failed else "金叉后一根K线未立刻死叉",
+            selected_date=selected_date.isoformat(),
+            timeframe=timeframe,
+            signal_bar_end=_safe_iso_value(hit_row.get("bar_end")),
+            next_bar_end=_safe_iso_value(next_row.get("bar_end")),
+        )
+
+    for symbol in symbols:
+        result.setdefault(symbol, _confirmation_status("missing", "缺少该股票分钟K线，无法判断金叉后一根K线"))
+    return result
+
+
+def _evaluate_daily_no_immediate_dead_cross(candidates: list[dict[str, Any]], rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    symbols = sorted({str(item.get("symbol") or "").upper() for item in candidates if item.get("symbol")})
+    if not rows:
+        return {symbol: _confirmation_status("missing", "缺少日K，无法判断下一根日线是否反叉") for symbol in symbols}
+
+    frame = pd.DataFrame(rows)
+    if frame.empty or "symbol" not in frame.columns or "trade_date" not in frame.columns:
+        return {symbol: _confirmation_status("missing", "缺少日K，无法判断下一根日线是否反叉") for symbol in symbols}
+    frame = frame.copy()
+    frame["symbol"] = frame["symbol"].map(lambda value: str(value or "").upper())
+    frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+    frame = frame.dropna(subset=["symbol", "trade_date"])
+    frame["bar_end"] = frame["trade_date"]
+    frame["bar_start"] = frame["trade_date"]
+    selected_dates = {str(item.get("symbol") or "").upper(): _candidate_selected_date(item) for item in candidates}
+
+    result: dict[str, dict[str, Any]] = {}
+    for symbol, group in frame.groupby("symbol", sort=False):
+        normalized_symbol = str(symbol or "").upper()
+        if normalized_symbol not in symbols:
+            continue
+        selected_date = selected_dates.get(normalized_symbol)
+        if selected_date is None:
+            result[normalized_symbol] = _confirmation_status("missing", "缺少入选日期，无法判断下一根日线")
+            continue
+        try:
+            computed = _compute_first_day_band(group.sort_values("bar_end").reset_index(drop=True))
+        except Exception:
+            logger.exception("Failed to compute daily first-day-band confirmation symbol=%s", normalized_symbol)
+            result[normalized_symbol] = _confirmation_status("missing", "该股票日K计算失败，无法判断下一根日线")
+            continue
+        if computed.empty:
+            result[normalized_symbol] = _confirmation_status("missing", "日K不足，无法计算首日波段")
+            continue
+        computed = computed.sort_values("bar_end").reset_index(drop=True)
+        computed["bar_end"] = pd.to_datetime(computed["bar_end"])
+        band = pd.to_numeric(computed["first_day_band"], errors="coerce")
+        b1 = pd.to_numeric(computed["first_day_band_b1"], errors="coerce")
+        prev_band = band.shift(1)
+        prev_b1 = b1.shift(1)
+        computed["cross_above"] = (band > b1) & ((prev_band <= prev_b1) | prev_band.isna() | prev_b1.isna())
+        computed["cross_below"] = (band < b1) & (prev_band >= prev_b1)
+        selected_hits = computed[
+            (computed["bar_end"].dt.date == selected_date)
+            & computed["cross_above"].fillna(False)
+        ]
+        if selected_hits.empty:
+            result[normalized_symbol] = _confirmation_status(
+                "missing",
+                "入选日未找到日线首日波段金叉",
+                selected_date=selected_date.isoformat(),
+                timeframe="1d",
+            )
+            continue
+        hit_index = int(selected_hits.index[-1])
+        hit_row = computed.iloc[hit_index]
+        next_index = hit_index + 1
+        if next_index >= len(computed):
+            result[normalized_symbol] = _confirmation_status(
+                "pending",
+                "下一交易日日K尚未入库，等待确认日线是否反叉",
+                selected_date=selected_date.isoformat(),
+                timeframe="1d",
+                signal_bar_end=_safe_iso_value(hit_row.get("bar_end")),
+            )
+            continue
+        next_row = computed.iloc[next_index]
+        failed = bool(next_row.get("cross_below"))
+        result[normalized_symbol] = _confirmation_status(
+            "fail" if failed else "pass",
+            "下一根日线立刻死叉" if failed else "下一根日线未立刻死叉",
+            selected_date=selected_date.isoformat(),
+            timeframe="1d",
+            signal_bar_end=_safe_iso_value(hit_row.get("bar_end")),
+            next_bar_end=_safe_iso_value(next_row.get("bar_end")),
+        )
+
+    for symbol in symbols:
+        result.setdefault(symbol, _confirmation_status("missing", "缺少该股票日K，无法判断下一根日线"))
+    return result
+
+
+def _load_confirmation_daily_rows(db: Session, symbols: list[str], start_date: date, end_date: date) -> list[dict[str, Any]]:
+    if not symbols:
+        return []
+    table_name = preferred_daily_kline_table()
+    sql = text(
+        f"""
+        SELECT symbol, trade_date, open, high, low, close, pre_close, volume, amount
+        FROM {table_name}
+        WHERE symbol IN :symbols
+          AND trade_date >= :start_date
+          AND trade_date <= :end_date
+        ORDER BY symbol, trade_date
+        """
+    ).bindparams(bindparam("symbols", expanding=True))
+    return [
+        dict(row)
+        for row in db.execute(sql, {"symbols": symbols, "start_date": start_date, "end_date": end_date}).mappings().all()
+    ]
+
+
 def _load_rows_for_symbol_dates(db: Session, symbol_dates: list[tuple[str, date]]) -> list[dict[str, Any]]:
     if not symbol_dates:
         return []
@@ -1225,31 +1665,61 @@ def _load_rows_for_symbol_dates(db: Session, symbol_dates: list[tuple[str, date]
                     ORDER BY trade_date
                     ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
                 ) AS ma5,
+                COUNT(close) OVER (
+                    PARTITION BY symbol
+                    ORDER BY trade_date
+                    ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+                ) AS ma5_window_count,
                 AVG(close) OVER (
                     PARTITION BY symbol
                     ORDER BY trade_date
                     ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
                 ) AS ma10,
+                COUNT(close) OVER (
+                    PARTITION BY symbol
+                    ORDER BY trade_date
+                    ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
+                ) AS ma10_window_count,
                 AVG(close) OVER (
                     PARTITION BY symbol
                     ORDER BY trade_date
                     ROWS BETWEEN 14 PRECEDING AND CURRENT ROW
                 ) AS ma15,
+                COUNT(close) OVER (
+                    PARTITION BY symbol
+                    ORDER BY trade_date
+                    ROWS BETWEEN 14 PRECEDING AND CURRENT ROW
+                ) AS ma15_window_count,
                 AVG(close) OVER (
                     PARTITION BY symbol
                     ORDER BY trade_date
                     ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
                 ) AS ma20,
+                COUNT(close) OVER (
+                    PARTITION BY symbol
+                    ORDER BY trade_date
+                    ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                ) AS ma20_window_count,
                 AVG(close) OVER (
                     PARTITION BY symbol
                     ORDER BY trade_date
                     ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
                 ) AS ma30,
+                COUNT(close) OVER (
+                    PARTITION BY symbol
+                    ORDER BY trade_date
+                    ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+                ) AS ma30_window_count,
                 AVG(close) OVER (
                     PARTITION BY symbol
                     ORDER BY trade_date
                     ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
                 ) AS ma60,
+                COUNT(close) OVER (
+                    PARTITION BY symbol
+                    ORDER BY trade_date
+                    ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+                ) AS ma60_window_count,
                 AVG(amount) OVER (
                     PARTITION BY symbol
                     ORDER BY trade_date
@@ -1275,7 +1745,7 @@ def _load_rows_for_symbol_dates(db: Session, symbol_dates: list[tuple[str, date]
                 ) AS close_lag5
             FROM stock_daily_kline
             WHERE symbol IN :symbols
-              AND trade_date >= CAST(:min_trade_date AS DATE) - INTERVAL '90 days'
+              AND trade_date >= CAST(:min_trade_date AS DATE) - INTERVAL '260 days'
               AND trade_date <= CAST(:max_trade_date AS DATE)
         )
         SELECT
@@ -1289,11 +1759,17 @@ def _load_rows_for_symbol_dates(db: Session, symbol_dates: list[tuple[str, date]
             float_market_cap,
             total_market_cap,
             ma5,
+            ma5_window_count,
             ma10,
+            ma10_window_count,
             ma15,
+            ma15_window_count,
             ma20,
+            ma20_window_count,
             ma30,
+            ma30_window_count,
             ma60,
+            ma60_window_count,
             high60,
             low60,
             close_lag3,

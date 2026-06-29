@@ -138,6 +138,21 @@ def _queue_event_drop_oldest(queue: asyncio.Queue[dict[str, Any]], payload: dict
     queue.put_nowait(payload)
 
 
+def _validate_live_auto_trading_gate(
+    *,
+    account_role: str,
+    execution_mode: str,
+    live_trading_enabled: bool,
+    live_confirmed: bool,
+) -> None:
+    if str(account_role or "").strip().lower() != "live":
+        return
+    if live_trading_enabled and not live_confirmed:
+        raise ValueError("实盘自动交易必须显式确认 live_confirmed=true")
+    if str(execution_mode or "").strip().lower() == "auto" and not (live_trading_enabled and live_confirmed):
+        raise ValueError("实盘自动交易必须显式确认 live_trading_enabled=true 且 live_confirmed=true")
+
+
 def create_monitor(strategy_db: Session, main_db: Session, user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     strategy = _require_strategy(strategy_db, str(payload.get("strategy_id") or ""))
     compiled = _compile_strategy_payload(strategy)
@@ -148,8 +163,12 @@ def create_monitor(strategy_db: Session, main_db: Session, user_id: str, payload
     account_role = _account_role(account_key, db=main_db, user_id=user_id)
     live_trading_enabled = bool(payload.get("live_trading_enabled", False))
     execution_mode = str(payload.get("execution_mode") or "auto").strip() or "auto"
-    if account_role == "live" and live_trading_enabled and not bool(payload.get("live_confirmed")):
-        raise ValueError("实盘自动交易必须显式确认 live_confirmed=true")
+    _validate_live_auto_trading_gate(
+        account_role=account_role,
+        execution_mode=execution_mode,
+        live_trading_enabled=live_trading_enabled,
+        live_confirmed=bool(payload.get("live_confirmed")),
+    )
 
     pool_config = dict(payload.get("monitor_pool") or {})
     pool_config.setdefault("mode", "strategy_positions_watchlist")
@@ -177,7 +196,7 @@ def create_monitor(strategy_db: Session, main_db: Session, user_id: str, payload
             "timeframes_required": _config_timeframes(config, compiled.timeframes_required),
             "minute_requirements": compiled.minute_requirements,
             "latest_cycle": None,
-            "stats": {"signals": 0, "orders": 0, "rejections": 0, "approvals": 0},
+            "stats": {"signals": 0, "orders": 0, "rejections": 0},
         },
         created_at=_now_dt(),
         updated_at=_now_dt(),
@@ -215,8 +234,12 @@ def update_monitor(
         if "live_trading_enabled" in payload
         else monitor.live_trading_enabled
     )
-    if next_account_role == "live" and next_live_trading_enabled and not bool(payload.get("live_confirmed")):
-        raise ValueError("实盘自动交易必须显式确认 live_confirmed=true")
+    _validate_live_auto_trading_gate(
+        account_role=next_account_role,
+        execution_mode=next_execution_mode,
+        live_trading_enabled=next_live_trading_enabled,
+        live_confirmed=bool(payload.get("live_confirmed")),
+    )
 
     if "monitor_pool" in payload:
         pool_config = dict(payload.get("monitor_pool") or {})
@@ -234,7 +257,11 @@ def update_monitor(
     state["compiled_status"] = compiled.status
     state["timeframes_required"] = _config_timeframes(config, compiled.timeframes_required)
     state["minute_requirements"] = compiled.minute_requirements
-    state.setdefault("stats", {"signals": 0, "orders": 0, "rejections": 0, "approvals": 0})
+    stats = dict(state.get("stats") or {})
+    for key in ("signals", "orders", "rejections"):
+        stats.setdefault(key, 0)
+    stats.pop("approvals", None)
+    state["stats"] = stats
     state["last_updated_at"] = _now_dt().isoformat()
 
     if "name" in payload:
@@ -290,7 +317,7 @@ def delete_monitor_records(db: Session, monitor_ids: list[str], *, user_id: str 
 def _delete_monitor_records(db: Session, monitor_ids: list[str], *, user_id: str | None = None) -> dict[str, int]:
     ids = [str(monitor_id) for monitor_id in monitor_ids if str(monitor_id or "").strip()]
     if not ids:
-        return {"monitors": 0, "events": 0, "approvals": 0, "signal_executions": 0}
+        return {"monitors": 0, "events": 0, "legacy_approvals": 0, "signal_executions": 0}
 
     monitor_filter = [RealtimeMonitorDB.id.in_(ids)]
     event_filter = [RealtimeEventDB.monitor_id.in_(ids)]
@@ -309,7 +336,7 @@ def _delete_monitor_records(db: Session, monitor_ids: list[str], *, user_id: str
     return {
         "monitors": monitor_count,
         "events": event_count,
-        "approvals": approval_count,
+        "legacy_approvals": approval_count,
         "signal_executions": signal_count,
     }
 
@@ -818,11 +845,21 @@ def _performance_trade_cashflows(
     rows = query.order_by(RealtimeEventDB.created_at.asc(), RealtimeEventDB.id.asc()).all()
     cashflows: dict[str, dict[str, Any]] = {}
     seen_trade_ids: set[str] = set()
+    parsed_rows: list[tuple[RealtimeEventDB, dict[str, Any], datetime | None, bool]] = []
+    has_exact_trade_date = False
     for row in rows:
         trade = row.broker_result if isinstance(row.broker_result, dict) else {}
-        trade_dt = _event_trade_datetime(row)
+        broker_trade_dt = _broker_trade_datetime(row)
+        trade_dt = broker_trade_dt or _event_trade_datetime(row)
+        matches_trade_date = _cn_date_text(trade_dt) == trade_date
+        if matches_trade_date:
+            has_exact_trade_date = True
+        parsed_rows.append((row, trade, trade_dt, broker_trade_dt is not None))
+
+    for row, trade, trade_dt, has_broker_trade_time in parsed_rows:
         if _cn_date_text(trade_dt) != trade_date:
-            continue
+            if has_exact_trade_date or has_broker_trade_time:
+                continue
         symbol = _normalize_symbol(row.symbol or trade.get("symbol"))
         if not symbol:
             continue
@@ -953,6 +990,15 @@ def _event_trade_datetime(row: RealtimeEventDB) -> datetime | None:
         or row.created_at
     )
     return parsed
+
+
+def _broker_trade_datetime(row: RealtimeEventDB) -> datetime | None:
+    trade = row.broker_result if isinstance(row.broker_result, dict) else {}
+    return _parse_datetime(
+        trade.get("trade_time")
+        or trade.get("traded_time")
+        or trade.get("business_time")
+    )
 
 
 def _cn_date_text(value: datetime | date | None) -> str:
@@ -2436,14 +2482,18 @@ def _route_signal_payload(
 ) -> dict[str, Any]:
     action = _normalize_route_action(route.get("action"), side, timeframe)
     position_pct = _route_position_pct(route)
+    trade_amount = _route_trade_amount(route)
+    share_quantity = _route_share_quantity(route)
     payload = {
         "symbol": symbol,
         "side": side,
         "price": price,
         "reason": reason,
         "target_position_pct": _target_position_pct(strategy) if side == "buy" else 0.0,
-        "buy_cash_pct": position_pct if side == "buy" else None,
+        "buy_cash_pct": position_pct if side == "buy" and action == "buy_or_add" else None,
         "sell_position_pct": position_pct if side == "sell" and action == "reduce_position" else None,
+        "trade_amount": trade_amount if side == "buy" and action == "buy_amount" else None,
+        "share_quantity": share_quantity if action in {"buy_quantity", "sell_quantity"} else None,
         "strategy_id": str(route.get("strategy_id") or strategy.get("id") or monitor.strategy_id),
         "strategy_version_id": route.get("strategy_version_id") or strategy.get("current_version_id") or monitor.strategy_version_id,
         "source": source,
@@ -2457,7 +2507,7 @@ def _route_signal_payload(
         "require_approval": False,
         "priority": int(float(route.get("priority") or _default_route_priority(side, timeframe))),
     }
-    if side == "buy" and position_pct is not None:
+    if side == "buy" and action == "buy_or_add" and position_pct is not None:
         payload["target_position_pct"] = position_pct
         payload["buy_cash_pct"] = position_pct
     if action == "clear_position":
@@ -2697,8 +2747,11 @@ def _default_route_action(side: str, timeframe: str) -> str:
 
 def _normalize_route_action(value: Any, side: str, timeframe: str) -> str:
     action = str(value or "").strip().lower()
-    allowed = {"buy_or_add", "reduce_position", "clear_position", "notify_only"}
-    if action in allowed:
+    allowed_by_side = {
+        "buy": {"buy_or_add", "buy_amount", "buy_quantity", "notify_only"},
+        "sell": {"reduce_position", "sell_quantity", "clear_position", "notify_only"},
+    }
+    if action in allowed_by_side.get(side, set()):
         return action
     return _default_route_action(side, timeframe)
 
@@ -2717,6 +2770,24 @@ def _route_position_pct(route: dict[str, Any]) -> float | None:
     if value is None or value <= 0:
         return None
     return value / 100 if value > 1 else value
+
+
+def _route_trade_amount(route: dict[str, Any]) -> float | None:
+    value = _to_float(route.get("trade_amount"), route.get("buy_amount"), route.get("amount"))
+    if value is None or value <= 0:
+        return None
+    return value
+
+
+def _route_share_quantity(route: dict[str, Any]) -> int | None:
+    value = _to_float(route.get("share_quantity"), route.get("quantity"), route.get("shares"))
+    if value is None or value <= 0:
+        return None
+    return int(value)
+
+
+def _round_lot_quantity(value: float, lot_size: int) -> int:
+    return int(max(value, 0) // lot_size) * lot_size
 
 
 def _signal_bar_clock_key_for_config(
@@ -3235,60 +3306,93 @@ def _build_order_intent(monitor: RealtimeMonitorDB, overview: dict[str, Any], si
     available_position = float(position.get("available_position") or 0.0)
     current_position = float(position.get("current_position") or 0.0)
     if side == "sell":
-        sell_pct = _to_float(signal.get("sell_position_pct"))
-        if sell_pct is not None and sell_pct > 1:
-            sell_pct = sell_pct / 100
-        if execution_action == "reduce_position" and sell_pct is not None:
-            sell_pct = max(min(sell_pct, 1.0), 0.0)
-            quantity_basis = available_position * sell_pct
+        fixed_quantity = _to_float(signal.get("share_quantity"), signal.get("quantity")) if execution_action == "sell_quantity" else None
+        if fixed_quantity is not None and fixed_quantity > 0:
+            quantity_basis = min(float(fixed_quantity), available_position)
         else:
-            quantity_basis = available_position
-        quantity = int(quantity_basis // lot_size) * lot_size
+            sell_pct = _to_float(signal.get("sell_position_pct"))
+            if sell_pct is not None and sell_pct > 1:
+                sell_pct = sell_pct / 100
+            if execution_action == "reduce_position" and sell_pct is not None:
+                sell_pct = max(min(sell_pct, 1.0), 0.0)
+                quantity_basis = available_position * sell_pct
+            else:
+                quantity_basis = available_position
+        quantity = _round_lot_quantity(quantity_basis, lot_size)
     else:
         total_asset = float(account.get("total_asset") or account.get("available_cash") or 0.0)
         available_cash = float(account.get("available_cash") or account.get("cash") or total_asset)
-        reentry_anchor_quantity = _resolve_reentry_buy_quantity(
-            monitor,
-            overview,
-            symbol=symbol,
-            price=price,
-            lot_size=lot_size,
-        )
-        if reentry_anchor_quantity is not None:
-            quantity = reentry_anchor_quantity
+        cash_buffer_pct = _monitor_buy_cash_buffer_pct(monitor)
+        price_buffer_pct = _monitor_buy_price_buffer_pct(monitor)
+        effective_price = max(price * (1 + price_buffer_pct), 0.01)
+        fixed_quantity = _to_float(signal.get("share_quantity"), signal.get("quantity")) if execution_action == "buy_quantity" else None
+        fixed_amount = _to_float(signal.get("trade_amount"), signal.get("buy_amount")) if execution_action == "buy_amount" else None
+        if fixed_quantity is not None and fixed_quantity > 0:
+            affordable_quantity = _round_lot_quantity(available_cash / effective_price, lot_size)
+            quantity = min(_round_lot_quantity(fixed_quantity, lot_size), affordable_quantity)
             sizing = {
-                "mode": "reentry_anchor",
+                "mode": "fixed_share_quantity",
+                "requested_quantity": int(fixed_quantity),
+                "affordable_quantity": affordable_quantity,
                 "available_cash": round(available_cash, 2),
                 "reference_price": round(price, 4),
+                "effective_price": round(effective_price, 4),
+                "price_buffer_pct": price_buffer_pct,
             }
-        else:
-            buy_cash_pct = _normalize_pct(signal.get("buy_cash_pct"), signal.get("target_position_pct"), default=0.02)
-            cash_budget = max(available_cash, 0.0) * buy_cash_pct
-            max_position_pct = _monitor_max_single_position_pct(monitor)
-            current_market_value = _to_float(
-                position.get("market_value"),
-                float(position.get("current_position") or 0.0) * price if price > 0 else None,
-            ) or 0.0
-            max_position_cash = max(total_asset * max_position_pct - current_market_value, 0.0) if max_position_pct > 0 else cash_budget
-            cash_buffer_pct = _monitor_buy_cash_buffer_pct(monitor)
-            price_buffer_pct = _monitor_buy_price_buffer_pct(monitor)
-            effective_cash = max(min(cash_budget, max_position_cash, available_cash) * (1 - cash_buffer_pct), 0.0)
-            effective_price = max(price * (1 + price_buffer_pct), 0.01)
-            quantity = int((effective_cash / effective_price) // lot_size) * lot_size
+        elif fixed_amount is not None and fixed_amount > 0:
+            cash_budget = min(max(fixed_amount, 0.0), available_cash)
+            effective_cash = max(cash_budget * (1 - cash_buffer_pct), 0.0)
+            quantity = _round_lot_quantity(effective_cash / effective_price, lot_size)
             sizing = {
-                "mode": "available_cash_pct",
-                "buy_cash_pct": buy_cash_pct,
-                "max_single_position_pct": max_position_pct,
+                "mode": "fixed_trade_amount",
+                "trade_amount": round(fixed_amount, 2),
                 "available_cash": round(available_cash, 2),
-                "cash_budget": round(cash_budget, 2),
-                "max_position_cash": round(max_position_cash, 2),
                 "effective_cash": round(effective_cash, 2),
                 "reference_price": round(price, 4),
                 "effective_price": round(effective_price, 4),
                 "cash_buffer_pct": cash_buffer_pct,
                 "price_buffer_pct": price_buffer_pct,
-                "current_market_value": round(current_market_value, 2),
             }
+        else:
+            reentry_anchor_quantity = _resolve_reentry_buy_quantity(
+                monitor,
+                overview,
+                symbol=symbol,
+                price=price,
+                lot_size=lot_size,
+            )
+            if reentry_anchor_quantity is not None:
+                quantity = reentry_anchor_quantity
+                sizing = {
+                    "mode": "reentry_anchor",
+                    "available_cash": round(available_cash, 2),
+                    "reference_price": round(price, 4),
+                }
+            else:
+                buy_cash_pct = _normalize_pct(signal.get("buy_cash_pct"), signal.get("target_position_pct"), default=0.02)
+                cash_budget = max(available_cash, 0.0) * buy_cash_pct
+                max_position_pct = _monitor_max_single_position_pct(monitor)
+                current_market_value = _to_float(
+                    position.get("market_value"),
+                    float(position.get("current_position") or 0.0) * price if price > 0 else None,
+                ) or 0.0
+                max_position_cash = max(total_asset * max_position_pct - current_market_value, 0.0) if max_position_pct > 0 else cash_budget
+                effective_cash = max(min(cash_budget, max_position_cash, available_cash) * (1 - cash_buffer_pct), 0.0)
+                quantity = _round_lot_quantity(effective_cash / effective_price, lot_size)
+                sizing = {
+                    "mode": "available_cash_pct",
+                    "buy_cash_pct": buy_cash_pct,
+                    "max_single_position_pct": max_position_pct,
+                    "available_cash": round(available_cash, 2),
+                    "cash_budget": round(cash_budget, 2),
+                    "max_position_cash": round(max_position_cash, 2),
+                    "effective_cash": round(effective_cash, 2),
+                    "reference_price": round(price, 4),
+                    "effective_price": round(effective_price, 4),
+                    "cash_buffer_pct": cash_buffer_pct,
+                    "price_buffer_pct": price_buffer_pct,
+                    "current_market_value": round(current_market_value, 2),
+                }
     intent = {
         "account_key": monitor.account_key,
         "symbol": symbol,
@@ -3314,6 +3418,8 @@ def _build_order_intent(monitor: RealtimeMonitorDB, overview: dict[str, Any], si
         "strategy_id": signal.get("strategy_id") or monitor.strategy_id,
         "strategy_version_id": signal.get("strategy_version_id") or monitor.strategy_version_id,
         "sell_position_pct": signal.get("sell_position_pct"),
+        "trade_amount": signal.get("trade_amount"),
+        "share_quantity": signal.get("share_quantity"),
     }
     if side == "buy":
         intent["sizing"] = _json_safe(sizing)
@@ -3650,6 +3756,8 @@ def _signal_payload_from_order_intent(intent: dict[str, Any] | None) -> dict[str
         "target_position_pct": intent.get("target_position_pct"),
         "buy_cash_pct": sizing.get("buy_cash_pct") if side == "buy" else None,
         "sell_position_pct": intent.get("sell_position_pct") if side == "sell" else None,
+        "trade_amount": intent.get("trade_amount"),
+        "share_quantity": intent.get("share_quantity"),
         "source": intent.get("signal_source") or "order_intent",
     }
     return _json_safe({key: value for key, value in payload.items() if value not in (None, "")})
@@ -4240,6 +4348,14 @@ def _clear_reentry_anchor(monitor: RealtimeMonitorDB, symbol: str, *, reason: st
 
 def _monitor_payload(monitor: RealtimeMonitorDB) -> dict[str, Any]:
     payload = monitor.to_dict()
+    state = dict(payload.get("state") or {})
+    stats = dict(state.get("stats") or {})
+    stats.pop("approvals", None)
+    if stats:
+        state["stats"] = stats
+    elif "stats" in state:
+        state.pop("stats", None)
+    payload["state"] = state
     pool = dict(payload.get("monitor_pool") or {})
     manual_symbols = _dedupe_normalized_symbols(pool.get("manual_symbols") or pool.get("symbols") or [])
     resolved_symbols = _dedupe_normalized_symbols(pool.get("resolved_symbols") or [])
@@ -4571,6 +4687,7 @@ def _today_order_count(db: Session, monitor: RealtimeMonitorDB) -> int:
 def _bump_stat(monitor: RealtimeMonitorDB, key: str, amount: int = 1) -> None:
     state = dict(monitor.state_json or {})
     stats = dict(state.get("stats") or {})
+    stats.pop("approvals", None)
     stats[key] = int(stats.get(key) or 0) + amount
     state["stats"] = stats
     monitor.state_json = state

@@ -12,5 +12,6 @@ __all__ = [
     "qmt_market_sync_service",
     "qmt_virtual_account_service",
     "qmt_sync_scheduler_service",
+    "stock_pool_service",
     "tracking_board_service",
 ]
